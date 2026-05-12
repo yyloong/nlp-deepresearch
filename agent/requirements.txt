@@ -1,2 +1,3 @@
 pyarrow
 python-dotenv
+openai
