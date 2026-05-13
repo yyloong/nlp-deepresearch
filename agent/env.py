@@ -41,23 +41,27 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 DEFAULT_SYSTEM_PROMPT = """\
 You are a Deep Research Agent. Your task is to find the correct answer to a complex \
-question by thoroughly searching a document corpus. You MUST conduct a multi-round \
-investigation — a single search is never sufficient for these questions.
+question by searching a document corpus.
 
-Required research process:
-1. Decompose the question: identify all entities, events, and relationships mentioned.
-2. Search for each clue independently — different phrasings, different angles.
-3. When snippets look promising, call `get_document` to read the full text.
-4. Cross-check: verify each finding against at least one other document.
-5. Only after evidence from 3+ distinct searches converges, provide the final answer.
+CRITICAL RULES — you MUST follow these:
+1. ALWAYS call `search` or `get_document` on your first turn. Never output a final \
+answer without first using at least one tool. You do NOT know the answer in advance.
+2. Keep your thinking concise — plan your next tool call in 1-2 sentences max. \
+Long analysis without acting is forbidden. Act first, then think about results.
+3. Conduct multi-round investigation: use DIFFERENT search queries with DIFFERENT \
+phrasings. A single search is never enough. Aim for 3+ distinct searches.
+4. When snippets look relevant, call `get_document` to read the full document.
+5. Cross-check every finding against at least one other independent source.
 
 Available tools:
 - `search`: BM25 index lookup (returns docid, score, snippet).
 - `get_document`: retrieve a full document by docid.
 
-Answer format:
-Explanation: <step-by-step reasoning citing specific documents and evidence>
-Exact Answer: <concise final answer>\
+Answer format (on your FINAL turn — when you are ready to answer):
+YOU MUST output exactly in this format, with both sections present:
+Explanation: <step-by-step reasoning citing specific docids and evidence>
+Exact Answer: <your final concise answer>
+Do NOT include anything after "Exact Answer:" — no extra commentary.\
 """
 
 
@@ -397,14 +401,25 @@ class DeepResearchEnv:
 
     @staticmethod
     def _strip_think(text: str) -> str:
-        """Remove ``<think>...</think>`` blocks from assistant content."""
+        """Remove ``<think>...</think>`` blocks from assistant content.
+
+        Also handles unclosed ``<think>`` tags (truncated output).
+        """
         import re
-        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        # Remove properly closed <think>...</think> blocks
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        # Remove unclosed <think> (truncated output) — everything after the opening tag
+        text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
+        return text.strip()
 
     # ── Inspection ─────────────────────────────
     def get_active_messages(self) -> List[List[Dict[str, Any]]]:
         """Return the current message history for each non-done instance."""
         return [inst.messages for inst in self._instances if not inst.done]
+
+    def set_messages(self, instance_id: int, messages: List[Dict[str, Any]]) -> None:
+        """Replace conversation history for an instance (used after condensation)."""
+        self._instances[instance_id].messages = messages
 
     def all_done(self) -> bool:
         return all(inst.done for inst in self._instances)

@@ -15,99 +15,90 @@ import argparse
 import asyncio
 import json
 import logging
-import re
+import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+from transformers import AutoTokenizer
+
+_TOKENIZER_PATH = "Qwen/Qwen3-8B"
+_tok: Any = AutoTokenizer.from_pretrained(
+    _TOKENIZER_PATH, trust_remote_code=True, local_files_only=True,
+)
 
 from .browsecomp_searcher import BrowseCompBM25Searcher
 from .env import DeepResearchEnv
+from .eval_async import evaluate_trajectories
 from .tools import build_searcher, get_agent_tool_specs_and_registry
+from .utils import (
+    RETRY_NUDGE,
+    count_tokens_messages,
+    extract_final_answer,
+    hard_truncate_tail_tool_messages,
+    is_truncated_think_response,
+)
 from .vllm_client_async import VLLMClientAsync
 
 logger = logging.getLogger(__name__)
 
-# ── Tokenizer (lazy load, shared across calls) ──
-_tokenizer: Any = None
-
-
-def _get_tokenizer(model_path: str = "Qwen/Qwen3-8B") -> Any:
-    global _tokenizer
-    if _tokenizer is None:
-        import os
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        from transformers import AutoTokenizer
-        _tokenizer = AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=True, local_files_only=True,
-        )
-    return _tokenizer
-
-
-def count_tokens(obj: Union[str, List[Dict[str, Any]]], model_path: str = "Qwen/Qwen3-8B") -> int:
-    """Count tokens using the actual tokenizer."""
-    tok = _get_tokenizer(model_path)
-    if isinstance(obj, list):
-        text = tok.apply_chat_template(obj, tokenize=False, add_generation_prompt=False)
-    else:
-        text = obj
-    return len(tok.encode(text))
-
 DEFAULT_SYSTEM_PROMPT = """\
 You are a Deep Research Agent. Your task is to find the correct answer to a complex \
-question by thoroughly searching a document corpus. You MUST conduct a multi-round \
-investigation — a single search is never sufficient for these questions.
+question by searching a document corpus.
 
-Required research process:
-1. Decompose the question: identify all entities, events, and relationships mentioned.
-2. Search for each clue independently — different phrasings, different angles.
-3. When snippets look promising, call `get_document` to read the full text.
-4. Cross-check: verify each finding against at least one other document.
+CRITICAL RULES — you MUST follow these:
+1. ALWAYS call `search` or `get_document` on your first turn. Never output a final \
+answer without first using at least one tool. You do NOT know the answer in advance.
+2. Keep your thinking concise — plan your next tool call in 1-2 sentences max. \
+Long analysis without acting is forbidden. Act first, then think about results.
+3. Conduct multi-round investigation: use DIFFERENT search queries with DIFFERENT \
+phrasings. A single search is never enough. Aim for 3+ distinct searches.
+4. When snippets look relevant, call `get_document` to read the full document.
+5. Cross-check every finding against at least one other independent source.
 
 Available tools:
 - `search`: BM25 index lookup (returns docid, score, snippet).
 - `get_document`: retrieve a full document by docid.
 
-Answer format:
-Explanation: <step-by-step reasoning citing specific documents and evidence>
-Exact Answer: <concise final answer>\
+Answer format (on your FINAL turn — when you are ready to answer):
+YOU MUST output exactly in this format, with both sections present:
+Explanation: <step-by-step reasoning citing specific docids and evidence>
+Exact Answer: <your final concise answer>
+Do NOT include anything after "Exact Answer:" — no extra commentary.\
 """
-
-# Model function protocol: (messages, tools) -> assistant_msg (dict)
-ModelFn = Callable[[List[Dict[str, Any]], List[Dict[str, Any]]], Any]
 
 # ── Context condensation ──────────────────────
 
 CONDENSE_PROMPT = """\
 You are a research progress summarizer. Compress the conversation history into a \
-concise progress record. Keep all facts, names, dates, numbers, and document IDs \
-that are relevant to answering the question. Be thorough on facts, concise in wording.
+concise but complete progress record. Preserve ALL factual details — names, dates, \
+numbers, document IDs, and key snippets. Do NOT summarize or paraphrase evidence; \
+copy important findings verbatim. Be thorough on facts, concise in wording.
 
-Include:
+Structure your output as follows:
+
 1. **Original question** (verbatim)
-2. **Tools called**: every tool invocation with its arguments, in order
-3. **Key findings**: specific evidence gathered, with document IDs
-4. **What remains to be found**"""
+2. **Searches performed** (list every search query with the docids it returned)
+3. **Documents retrieved** (for each docid read via get_document, keep the full \
+   document text or at minimum all factual claims, names, dates, and numbers)
+4. **Key findings** (specific evidence gathered, cross-references verified)
+5. **What remains to be found** (specific missing pieces needed to answer)
 
-
-_TOKENIZER_PATH = "Qwen/Qwen3-8B"
-
-
-def _init_tokenizer(path: str) -> None:
-    global _TOKENIZER_PATH
-    _TOKENIZER_PATH = path
-    _get_tokenizer(path)  # eager load
-
-
-def _count_tokens(msg_list: List[Dict[str, Any]]) -> int:
-    return count_tokens(msg_list, model_path=_TOKENIZER_PATH)
+CRITICAL: Do NOT lose any document ID or factual detail. If a document contains a \
+name, date, or number that might be relevant, keep it verbatim."""
 
 
 async def _condense_context(
+    tok: Any,
     messages: List[Dict[str, Any]],
-    model_fn: ModelFn,
+    client: VLLMClientAsync,
+    model: str,
+    temperature: float,
     max_tokens: int,
     max_context: int,
+    extra_payload: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Condense conversation history using token-accurate truncation.
 
@@ -136,8 +127,16 @@ async def _condense_context(
         {"role": "user", "content": f"Compress:\n\n{transcript}"},
     ]
 
-    resp = await model_fn(condense_messages, tools=[])
-    summary = resp.get("content", "")
+    resp = await client.simple_chat(
+        model=model,
+        messages=condense_messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=[],
+        tool_choice="auto",
+        extra_payload=extra_payload,
+    )
+    summary = resp["choices"][0]["message"].get("content", "")
 
     # Summary goes into a user message — it's new context for the agent
     summary_msg: Dict[str, Any] = {
@@ -154,124 +153,10 @@ async def _condense_context(
         summary_msg,   # user: summary of everything so far
     ]
 
-    before = _count_tokens(messages)
-    after = _count_tokens(condensed)
+    before = count_tokens_messages(tok, messages)
+    after = count_tokens_messages(tok, condensed)
     print(f"  [condense] {before} → {after} tokens ({len(messages)} → {len(condensed)} messages)", flush=True)
     return condensed
-
-
-# ═══════════════════════════════════════════════════════════════
-# Classic agent loop (模型推理 + 工具执行内部耦合)
-# ═══════════════════════════════════════════════════════════════
-
-async def run_agent_loop(
-    question: str,
-    searcher: BrowseCompBM25Searcher,
-    client: VLLMClientAsync,
-    model: str,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-    max_turns: int = 10,
-    temperature: float = 0.0,
-    max_tokens: int = 4096,
-    search_k: int = 5,
-    snippet_max_chars: int = 1200,
-    extra_payload: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    tools, registry = get_agent_tool_specs_and_registry(
-        searcher=searcher, k=search_k, snippet_max_chars=snippet_max_chars
-    )
-
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": question},
-    ]
-
-    for turn in range(max_turns):
-        logger.debug("Turn %d: sending %d messages", turn + 1, len(messages))
-
-        response = await client.simple_chat(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            tool_choice="auto",
-            extra_payload=extra_payload,
-        )
-
-        choice = response["choices"][0]
-        if "message" not in choice:
-            logger.warning("Turn %d: no message in response", turn + 1)
-            break
-
-        assistant_msg: Dict[str, Any] = choice["message"]
-        messages.append(assistant_msg)
-
-        tool_calls = assistant_msg.get("tool_calls")
-        if not tool_calls:
-            logger.debug("Turn %d: agent finished (finish_reason=%s)", turn + 1, choice.get("finish_reason", ""))
-            break
-
-        for tc in tool_calls:
-            fn = tc["function"]
-            name = fn["name"]
-            args = json.loads(fn["arguments"])
-            call_id: str = tc.get("id", "")
-
-            if name not in registry:
-                logger.warning("Turn %d: unknown tool %r", turn + 1, name)
-                tool_result = json.dumps({"error": f"unknown tool: {name}"})
-            else:
-                try:
-                    raw = registry[name](**args)
-                    tool_result = json.dumps(raw, ensure_ascii=False)
-                except Exception as exc:
-                    logger.warning("Turn %d: tool %r failed: %s", turn + 1, name, exc)
-                    tool_result = json.dumps({"error": str(exc)})
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": tool_result,
-            })
-    else:
-        logger.warning("Agent reached max_turns (%d) without finishing", max_turns)
-
-    return messages
-
-
-async def run_agent(
-    question: str,
-    index_path: str,
-    model: str,
-    base_url: str = "http://127.0.0.1:8000/v1",
-    api_key: str = "dummy",
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-    max_turns: int = 10,
-    temperature: float = 0.0,
-    max_tokens: int = 4096,
-    search_k: int = 5,
-    snippet_max_chars: int = 1200,
-    extra_payload: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    searcher = build_searcher(index_path)
-    client = VLLMClientAsync(base_url=base_url, api_key=api_key)
-    try:
-        return await run_agent_loop(
-            question=question,
-            searcher=searcher,
-            client=client,
-            model=model,
-            system_prompt=system_prompt,
-            max_turns=max_turns,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            search_k=search_k,
-            snippet_max_chars=snippet_max_chars,
-            extra_payload=extra_payload,
-        )
-    finally:
-        await client._client.close()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -280,15 +165,18 @@ async def run_agent(
 
 async def run_agent_with_env(
     env: DeepResearchEnv,
-    model_fn: ModelFn,
+    client: VLLMClientAsync,
+    model: str,
     questions: List[str],
     max_context: int = 40960,
     max_tokens: int = 4096,
+    temperature: float = 0.0,
+    extra_payload: Optional[Dict[str, Any]] = None,
 ) -> List[List[Dict[str, Any]]]:
     """使用 DeepResearchEnv 运行 agent loop。
 
-    每轮对所有活跃实例并行调用模型（asyncio.gather），最大化 GPU 利用率。
-    使用 tokenizer 精确计数，上下文余量不足时自动压缩。
+    每轮：模型推理 → env.step（追加 assistant + tool）→ token 检查 → 压缩。
+    压缩在 env.step 之后，避免提前压缩导致的 len guard 死锁。
     """
     obs, infos = env.reset(questions)
     tools = env.tool_specs
@@ -299,42 +187,48 @@ async def run_agent_with_env(
         if not active:
             break
 
-        # 检查 + 压缩：超过半满就压缩，保证 condense 调用自身不溢出
-        async def _prepare(idx: int, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            used = _count_tokens(msgs)
-            if used > max_context // 2 and len(msgs) > 4:
-                print(f"  [condense] instance {idx}: {used}/{max_context} tokens → condensing", flush=True)
-                return await _condense_context(msgs, model_fn, max_tokens, max_context)
-            return msgs
-
-        messages_list = await asyncio.gather(*[
-            _prepare(i, m) for i, m in active
-        ])
-
-        # 每条消息的 token 数（用于日志）
-        for idx, (i, _) in enumerate(active):
-            tc = _count_tokens(messages_list[idx])
-            if tc > max_context * 0.8:
-                print(f"  [warn] instance {i}: {tc} input tokens, close to limit {max_context}", flush=True)
-
-        # 并行调用模型
-        async def _call_with_retry(msgs: List[Dict[str, Any]], idx: int) -> Dict[str, Any]:
-            try:
-                return await model_fn(msgs, tools)
-            except Exception as e:
-                err = str(e)
-                if "context length" in err.lower() or "input_tokens" in err.lower():
-                    # Context overflow — condense aggressively and retry once
-                    print(f"  [overflow] instance {idx}: condensing and retrying...", flush=True)
-                    condensed = await _condense_context(msgs, model_fn, max_tokens, max_context)
-                    return await model_fn(condensed, tools)
-                raise
-
+        # 1. 并行模型调用
         indices, msgs_list = zip(*active)
-        responses = await asyncio.gather(*[
-            _call_with_retry(m, i) for m, i in zip(messages_list, indices)
+        raw = await asyncio.gather(*[
+            client.simple_chat(
+                model=model,
+                messages=m,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice="auto",
+                extra_payload=extra_payload,
+            )
+            for m in msgs_list
         ])
+        responses = [r["choices"][0]["message"] for r in raw]
 
+        # 1.5 截断检测与重试（防止模型输出超长 <think> 块导致无工具调用）
+        for i in range(len(responses)):
+            resp = responses[i]
+            content = resp.get("content", "") or ""
+            tool_calls = resp.get("tool_calls")
+            idx = indices[i]
+            if is_truncated_think_response(content, tool_calls):
+                msgs = list(obs[idx]) if obs[idx] is not None else []
+                msgs.append({
+                    "role": "user",
+                    "content": RETRY_NUDGE,
+                })
+                retry_raw = await client.simple_chat(
+                    model=model,
+                    messages=msgs,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice="auto",
+                    extra_payload=extra_payload,
+                )
+                retry_resp = retry_raw["choices"][0]["message"]
+                responses[i] = retry_resp
+                print(f"  [retry] instance {idx}: truncated think detected, nudging model to call tools", flush=True)
+
+        # 2. env.step — 追加 assistant 消息 + tool 结果
         actions: List[Any] = [None] * len(obs)
         for idx, resp in zip(indices, responses):
             actions[idx] = resp
@@ -343,36 +237,50 @@ async def run_agent_with_env(
 
         if all(dones):
             break
-        obs = next_obs
+
+        # 3. 检查 + 压缩（在 env.step 之后，消息数自然 > 2）
+        async def _maybe_condense(
+            idx: int, msgs: Optional[List[Dict[str, Any]]]
+        ) -> Optional[List[Dict[str, Any]]]:
+            if msgs is None:
+                return None
+            used = count_tokens_messages(_tok, msgs)
+            if used > max_context // 2:
+                last = msgs[-1] if msgs else None
+                is_tool_tail = last is not None and last.get("role") == "tool"
+                if not is_tool_tail:
+                    raise RuntimeError(
+                        f"instance {idx}: context at {used} tokens (>"
+                        f"{max_context // 2}) but last message role is "
+                        f"{last.get('role') if isinstance(last, dict) else last!r}; "
+                        "expected tool messages at tail after env.step — this should not happen."
+                    )
+                hard_truncate_tail_tool_messages(_tok, msgs, max_context)
+                used_after = count_tokens_messages(_tok, msgs)
+                if used_after > max_context:
+                    raise RuntimeError(
+                        f"instance {idx}: {used_after} tokens still exceed max_context="
+                        f"{max_context} after hard-truncating the trailing tool block; "
+                        "likely oversized older tool/assistant payloads or missing prior "
+                        "condense — this should not happen."
+                    )
+                print(
+                    f"  [condense] instance {idx}: {used}/{max_context} tokens "
+                    f"(after tool hard-cap {used_after}) → condensing",
+                    flush=True,
+                )
+                condensed = await _condense_context(
+                    _tok, msgs, client, model, temperature, max_tokens, max_context, extra_payload,
+                )
+                env.set_messages(idx, condensed)
+                return condensed
+            return msgs
+
+        obs = await asyncio.gather(*[
+            _maybe_condense(i, o) for i, o in enumerate(next_obs)
+        ])
 
     return env.get_trajectories()
-
-
-def make_vllm_model_fn(
-    client: VLLMClientAsync,
-    model: str,
-    temperature: float = 0.0,
-    max_tokens: int = 4096,
-    extra_payload: Optional[Dict[str, Any]] = None,
-) -> ModelFn:
-    """创建适配 DeepResearchEnv 的 model_fn（基于 VLLMClientAsync）。"""
-
-    async def _fn(
-        messages: List[Dict[str, Any]],
-        tools: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        response = await client.simple_chat(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            tool_choice="auto",
-            extra_payload=extra_payload,
-        )
-        return response["choices"][0]["message"]
-
-    return _fn
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -403,11 +311,6 @@ async def generate_trajectories(
     rows = load_jsonl(dataset_path, limit=limit)
     total = len(rows)
     client = VLLMClientAsync(base_url=base_url, api_key=api_key)
-    model_fn = make_vllm_model_fn(
-        client=client, model=model,
-        temperature=temperature, max_tokens=max_tokens,
-        extra_payload=extra_payload,
-    )
 
     env = DeepResearchEnv(
         index_path=index_path,
@@ -428,8 +331,14 @@ async def generate_trajectories(
             batch_questions = [r["query"] for r in batch_rows]
 
             trajs = await run_agent_with_env(
-                env=env, model_fn=model_fn, questions=batch_questions,
-                max_context=max_context, max_tokens=max_tokens,
+                env=env,
+                client=client,
+                model=model,
+                questions=batch_questions,
+                max_context=max_context,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                extra_payload=extra_payload,
             )
 
             for row, traj in zip(batch_rows, trajs):
@@ -456,191 +365,6 @@ async def generate_trajectories(
         print(f"[generate] saved {len(records)} trajectories → {output_path}", flush=True)
 
     return records
-
-
-# ═══════════════════════════════════════════════════════════════
-# 异步批量评估
-# ═══════════════════════════════════════════════════════════════
-
-EVAL_SYSTEM_PROMPT = """You are an expert evaluator for question-answering systems.
-Your task is to judge whether a predicted answer is semantically equivalent to the gold (reference) answer.
-
-Rules:
-- Ignore case differences, punctuation variations, and extra whitespace.
-- Treat abbreviations and full forms as equivalent (e.g., "US" = "United States").
-- If the predicted answer contains the gold answer as a substring (or vice versa) and the extra content does not change the meaning, treat as CORRECT.
-- If the predicted answer is a valid alternative phrasing of the gold answer, treat as CORRECT.
-- If the predicted answer is clearly wrong, incomplete in a meaningful way, or contradicts the gold answer, treat as INCORRECT.
-
-Reply in exactly this format:
-Judgment: CORRECT
-Reasoning: <one sentence explaining your decision>"""
-
-
-def _parse_eval_judgment(text: str) -> Tuple[str, str]:
-    m = re.search(r'Judgment:\s*(CORRECT|INCORRECT)', text, re.IGNORECASE)
-    judgment = m.group(1).upper() if m else "INCORRECT"
-    m2 = re.search(r'Reasoning:\s*(.+?)$', text, re.IGNORECASE | re.DOTALL)
-    reasoning = m2.group(1).strip() if m2 else ""
-    return judgment, reasoning
-
-
-async def evaluate_trajectories(
-    records: List[Dict[str, Any]],
-    dataset_path: str,
-    model: str,
-    base_url: str = "http://127.0.0.1:8000/v1",
-    api_key: str = "dummy",
-    eval_batch_size: int = 16,
-    temperature: float = 0.0,
-    max_tokens: int = 256,
-    output_path: Optional[str] = None,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """异步批量评估 — 使用 asyncio.gather 并行调用 eval 模型，打满 GPU。"""
-    from .dataset_utils import load_jsonl
-
-    dataset = load_jsonl(dataset_path)
-    gold_map = {row["query_id"]: row["answer"] for row in dataset}
-    question_map = {row["query_id"]: row.get("query", "") for row in dataset}
-
-    client = VLLMClientAsync(base_url=base_url, api_key=api_key)
-    details: List[Dict[str, Any]] = []
-    correct = 0
-    total = 0
-
-    async def _eval_one(sub: Dict[str, Any]) -> Dict[str, Any]:
-        qid = sub.get("query_id", "")
-        gold = gold_map.get(qid, "")
-        question = question_map.get(qid, "")
-        pred = sub.get("predicted_answer", "")
-
-        if not pred:
-            pred = extract_final_answer(sub.get("messages", [])) or ""
-
-        if not gold:
-            return {
-                "query_id": qid, "question": question,
-                "gold_answer": "", "predicted_answer": pred,
-                "eval_judgment": "INCORRECT",
-                "eval_reasoning": "No gold answer found.",
-                "eval_model_response": "",
-                "trajectory_stats": {},
-                "status": sub.get("status", "unknown"),
-            }
-
-        if not pred:
-            return {
-                "query_id": qid, "question": question,
-                "gold_answer": gold, "predicted_answer": "",
-                "eval_judgment": "INCORRECT",
-                "eval_reasoning": "No predicted answer.",
-                "eval_model_response": "",
-                "trajectory_stats": _trajectory_stats(sub.get("messages", [])),
-                "status": sub.get("status", "unknown"),
-            }
-
-        eval_msgs = [
-            {"role": "system", "content": EVAL_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Question: {question}\nGold answer: {gold}\nPredicted answer: {pred}"},
-        ]
-
-        try:
-            resp = await client.simple_chat(
-                model=model, messages=eval_msgs,
-                temperature=temperature, max_tokens=max_tokens,
-            )
-            eval_text = resp["choices"][0]["message"]["content"]
-            judgment, reasoning = _parse_eval_judgment(eval_text)
-        except Exception as e:
-            eval_text = f"ERROR: {e}"
-            judgment, reasoning = "INCORRECT", str(e)
-
-        return {
-            "query_id": qid, "question": question,
-            "gold_answer": gold, "predicted_answer": pred,
-            "eval_judgment": judgment,
-            "eval_reasoning": reasoning,
-            "eval_model_response": eval_text,
-            "trajectory_stats": _trajectory_stats(sub.get("messages", [])),
-            "status": sub.get("status", "unknown"),
-        }
-
-    try:
-        for batch_start in range(0, len(records), eval_batch_size):
-            batch = records[batch_start:batch_start + eval_batch_size]
-            results = await asyncio.gather(*[_eval_one(r) for r in batch])
-            for d in results:
-                if d["eval_judgment"] == "CORRECT":
-                    correct += 1
-                total += 1
-                details.append(d)
-
-            done = min(batch_start + eval_batch_size, len(records))
-            print(f"[eval] {done}/{len(records)} done", flush=True)
-    finally:
-        await client._client.close()
-
-    accuracy = correct / total if total > 0 else 0.0
-    all_tc = [d["trajectory_stats"].get("num_tool_calls", 0) for d in details]
-    all_docs = [d["trajectory_stats"].get("num_retrieved_docs", 0) for d in details]
-
-    summary: Dict[str, Any] = {
-        "total_queries": total,
-        "correct": correct,
-        "incorrect": total - correct,
-        "accuracy": round(accuracy, 4),
-        "avg_tool_calls_per_query": round(sum(all_tc) / total, 2) if total > 0 else 0,
-        "avg_retrieved_docs_per_query": round(sum(all_docs) / total, 2) if total > 0 else 0,
-        "total_tool_calls": sum(all_tc),
-        "total_retrieved_docs": sum(all_docs),
-        "eval_model": model,
-    }
-
-    if output_path:
-        output_file = Path(output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        with output_file.open("w", encoding="utf-8") as f:
-            f.write(json.dumps({"type": "summary", **summary}, ensure_ascii=False) + "\n")
-            for d in details:
-                f.write(json.dumps(d, ensure_ascii=False) + "\n")
-        print(f"[eval] saved results → {output_path}", flush=True)
-
-    return summary, details
-
-
-def _trajectory_stats(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    tc = 0
-    docids: List[str] = []
-    for msg in messages:
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            tc += len(msg["tool_calls"])
-        if msg.get("role") == "tool":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                try:
-                    parsed = json.loads(content)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(parsed, list):
-                    for item in parsed:
-                        if isinstance(item, dict) and "docid" in item:
-                            docids.append(item["docid"])
-                elif isinstance(parsed, dict) and "docid" in parsed:
-                    docids.append(parsed["docid"])
-    return {
-        "num_tool_calls": tc,
-        "num_assistant_messages": sum(1 for m in messages if m.get("role") == "assistant"),
-        "num_tool_messages": sum(1 for m in messages if m.get("role") == "tool"),
-        "num_retrieved_docs": len(docids),
-        "unique_retrieved_docids": len(set(docids)),
-    }
-
-
-def extract_final_answer(messages: List[Dict[str, Any]]) -> Optional[str]:
-    for msg in reversed(messages):
-        if msg.get("role") == "assistant" and msg.get("content"):
-            return msg["content"]
-    return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -687,7 +411,12 @@ Examples:
 
 
 async def _main_async(args: argparse.Namespace) -> None:
-    _init_tokenizer(args.tokenizer_path)
+    global _TOKENIZER_PATH, _tok
+    if args.tokenizer_path != _TOKENIZER_PATH:
+        _TOKENIZER_PATH = args.tokenizer_path
+        _tok = AutoTokenizer.from_pretrained(
+            _TOKENIZER_PATH, trust_remote_code=True, local_files_only=True,
+        )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
