@@ -48,28 +48,57 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_RETRIES = 2  # max retries per turn when tool call validation fails
 
 DEFAULT_SYSTEM_PROMPT = """\
-You are a Deep Research Agent. Your task is to find the correct answer to a complex \
-question by searching a document corpus.
+You are a Deep Research Agent. Your task is to answer complex questions by searching \
+a document corpus. Your final answer must be grounded in evidence retrieved through tools.
 
-CRITICAL RULES — you MUST follow these:
-1. ALWAYS call `search` or `get_document` on your first turn. Never output a final \
-answer without first using at least one tool. You do NOT know the answer in advance.
-2. Keep your thinking concise — plan your next tool call in 1-2 sentences max. \
-Long analysis without acting is forbidden. Act first, then think about results.
-3. Conduct multi-round investigation: use DIFFERENT search queries with DIFFERENT \
-phrasings. A single search is never enough. Aim for 3+ distinct searches.
-4. When snippets look relevant, call `get_document` to read the full document.
-5. Cross-check every finding against at least one other independent source.
+You operate in a loop:
+  1. Call tools (`search` or `get_document`) to gather evidence.
+  2. Process the tool results — extract relevant facts, names, dates, numbers.
+  3. Assess whether the evidence is sufficient to answer. If not, go back to step 1.
+  4. When the evidence is sufficient, output your final answer.
 
-Available tools:
-- `search`: BM25 index lookup (returns docid, score, snippet).
-- `get_document`: retrieve a full document by docid.
+─── ASSESSMENT (step 3) — be thorough and granular ───
 
-Answer format (on your FINAL turn — when you are ready to answer):
-YOU MUST output exactly in this format, with both sections present:
-Explanation: <step-by-step reasoning citing specific docids and evidence>
-Exact Answer: <your final concise answer>
-Do NOT include anything after "Exact Answer:" — no extra commentary.\
+Before deciding you have enough, examine each part of the question:
+
+• For every factual claim you intend to make: is it explicitly stated in a retrieved \
+  document, or are you inferring it?  Inference is not enough — you need explicit evidence.
+• For every constraint in the question (dates, numbers, names, relationships): does \
+  a specific document directly address it?  A document that merely mentions a keyword \
+  without confirming the constraint does not count.
+• For every entity you identify: can you point to a document that links that entity to \
+  the specific properties described in the question?  Partial matches are not matches.
+• Are there gaps between what the evidence shows and what the question demands?  \
+  If a sub-question has no supporting document yet, you have a gap.
+• Does any finding rely on a single source?  Seek a second, independent document to \
+  corroborate it before treating it as settled.
+
+If the assessment reveals any gap, ambiguity, or unsupported inference → call tools \
+again to fill it.  Target the specific missing piece with a precise query.
+
+If a search returns documents that look relevant but fail the granular checks above \
+(e.g., they mention a keyword but don't confirm the constraint, or they match only \
+partially), do not give up — rewrite the query from a different angle.  Change \
+keywords, try synonyms, or search for a related entity that might lead to the target \
+information.
+
+─── WHEN TO ANSWER ───
+
+Output your final answer only when, for every part of the question, you can cite at \
+least one document that directly and explicitly supports your conclusion.  If, after \
+thorough searching, some parts genuinely lack evidence in the corpus, acknowledge \
+this in your answer rather than fabricating or guessing.
+
+─── TOOLS ───
+
+• `search(query)` → returns [{docid, score, snippet}]
+• `get_document(docid)` → returns full document text
+
+─── ANSWER FORMAT ───
+
+Explanation: <step-by-step reasoning, citing docids, showing how each part of the \
+question was resolved with evidence>
+Exact Answer: <concise final answer>\
 """
 
 # ── Context condensation ──────────────────────
@@ -83,14 +112,17 @@ copy important findings verbatim. Be thorough on facts, concise in wording.
 Structure your output as follows:
 
 1. **Original question** (verbatim)
-2. **Searches performed** (list every search query with the docids it returned)
-3. **Documents retrieved** (for each docid read via get_document, keep the full \
+2. **Clues from question** (list every distinct clue / constraint that needs verification)
+3. **Clue verification status** (for each clue: ✓ verified by docid X, or ✗ still unknown)
+4. **Searches performed** (list every search query with the docids it returned)
+5. **Documents retrieved** (for each docid read via get_document, keep the full \
    document text or at minimum all factual claims, names, dates, and numbers)
-4. **Key findings** (specific evidence gathered, cross-references verified)
-5. **What remains to be found** (specific missing pieces needed to answer)
+6. **Key findings** (specific evidence gathered, cross-references verified)
+7. **What remains to be found** (specific missing pieces needed to answer)
 
 CRITICAL: Do NOT lose any document ID or factual detail. If a document contains a \
-name, date, or number that might be relevant, keep it verbatim."""
+name, date, or number that might be relevant, keep it verbatim. The clue verification \
+status is the most important section — it tells the agent what still needs work."""
 
 
 async def _condense_context(
@@ -357,6 +389,382 @@ async def run_agent_with_env(
 
 
 # ═══════════════════════════════════════════════════════════════
+# Router-based agent loop — 保持所有 env slot 满载
+# ═══════════════════════════════════════════════════════════════
+
+async def run_agent_router(
+    env: DeepResearchEnv,
+    client: VLLMClientAsync,
+    model: str,
+    questions: List[str],
+    max_context: int = 40960,
+    max_tokens: int = 4096,
+    temperature: float = 0.0,
+    extra_payload: Optional[Dict[str, Any]] = None,
+) -> List[List[Dict[str, Any]]]:
+    """Router-based agent loop — keeps all env slots filled.
+
+    When an instance finishes, it immediately starts the next pending question
+    in that slot, maximising parallel throughput.
+
+    Returns trajectories in the same order as *questions*.
+    """
+    n_envs: int = env.n_envs
+    n_total: int = len(questions)
+    n_initial: int = min(n_envs, n_total)
+    tools: List[Dict[str, Any]] = env.tool_specs
+
+    # ── Per-slot bookkeeping ──
+    slot_qidx: Dict[int, int] = {}                # slot → original question index
+    trajectories: Dict[int, List[Dict[str, Any]]] = {}  # qidx → completed trajectory
+    next_qidx: int = 0                             # next question to assign
+
+    # ── Fill initial slots ──
+    initial_qs = questions[:n_initial]
+    for slot in range(n_initial):
+        slot_qidx[slot] = slot
+    next_qidx = n_initial
+
+    obs, _infos = env.reset(initial_qs)
+
+    # Expand obs to full n_envs (unused slots are None)
+    obs = list(obs) + [None] * (n_envs - n_initial)
+
+    while slot_qidx or (next_qidx < n_total):
+        # ── 1. Collect active instances ──
+        active = [(i, o) for i, o in enumerate(obs) if o is not None]
+        if not active:
+            # All current instances done but more questions pending — start fresh batch
+            fresh_qs: List[str] = []
+            fresh_slots: List[int] = []
+            for slot in range(n_envs):
+                if next_qidx < n_total:
+                    fresh_qs.append(questions[next_qidx])
+                    fresh_slots.append(slot)
+                    slot_qidx[slot] = next_qidx
+                    next_qidx += 1
+            if not fresh_qs:
+                break
+            env.reset(fresh_qs)
+            obs = [None] * n_envs
+            for slot in fresh_slots:
+                obs[slot] = env.get_slot_messages(slot)
+            continue
+
+        indices, msgs_list = zip(*active)
+
+        # ── 2. Parallel model calls ──
+        raw = await asyncio.gather(*[
+            client.simple_chat(
+                model=model,
+                messages=m,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice="auto",
+                extra_payload=extra_payload,
+            )
+            for m in msgs_list
+        ])
+        responses = [r["choices"][0]["message"] for r in raw]
+
+        # ── 2.5 Think truncation retry ──
+        for i in range(len(responses)):
+            resp = responses[i]
+            content = resp.get("content", "") or ""
+            tool_calls = resp.get("tool_calls")
+            idx = indices[i]
+            if is_truncated_think_response(content, tool_calls):
+                msgs = list(obs[idx]) if obs[idx] is not None else []
+                msgs.append({"role": "user", "content": RETRY_NUDGE})
+                retry_raw = await client.simple_chat(
+                    model=model, messages=msgs,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, tool_choice="auto", extra_payload=extra_payload,
+                )
+                responses[i] = retry_raw["choices"][0]["message"]
+
+        # ── 2.6 Tool call validation retry ──
+        for i in range(len(responses)):
+            resp = responses[i]
+            idx = indices[i]
+            tool_calls = resp.get("tool_calls")
+            if not tool_calls:
+                continue
+            for retry_num in range(MAX_TOOL_RETRIES):
+                all_errors: List[Dict[str, str]] = []
+                for tc in tool_calls:
+                    err = validate_tool_call(tc, tools)
+                    if err:
+                        all_errors.append({
+                            "tool_name": tc.get("function", {}).get("name", "?"),
+                            "message": err,
+                        })
+                if not all_errors:
+                    break
+                msgs = list(obs[idx]) if obs[idx] is not None else []
+                msgs.append(resp)
+                error_lines = [f"- `{e['tool_name']}`: {e['message']}" for e in all_errors]
+                nudge = (
+                    "Your tool call(s) failed validation:\n\n"
+                    + "\n".join(error_lines)
+                    + "\n\nPlease correct the error(s) and try again."
+                )
+                msgs.append({"role": "user", "content": nudge})
+                retry_raw = await client.simple_chat(
+                    model=model, messages=msgs,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, tool_choice="auto", extra_payload=extra_payload,
+                )
+                resp = retry_raw["choices"][0]["message"]
+                responses[i] = resp
+                tool_calls = resp.get("tool_calls")
+                if not tool_calls:
+                    break
+
+        # ── 3. env.step ──
+        actions: List[Any] = [None] * n_envs
+        for idx, resp in zip(indices, responses):
+            actions[idx] = resp
+        next_obs, _rewards, dones, _infos = env.step(actions)
+
+        # ── 4. Handle completions + refill ──
+        for slot in range(n_envs):
+            if dones[slot] and slot in slot_qidx:
+                qidx = slot_qidx.pop(slot)
+                trajectories[qidx] = env.extract_slot_trajectory(slot)
+
+                if next_qidx < n_total:
+                    # Refill this slot immediately
+                    slot_qidx[slot] = next_qidx
+                    next_obs[slot] = env.reset_slot(slot, questions[next_qidx])
+                    next_qidx += 1
+
+        # ── 5. Context condensation (per active instance) ──
+        async def _maybe_condense(
+            idx: int, msgs: Optional[List[Dict[str, Any]]]
+        ) -> Optional[List[Dict[str, Any]]]:
+            if msgs is None:
+                return None
+            used = count_tokens_messages(_tok, msgs)
+            if used <= max_context // 2:
+                return msgs
+
+            last = msgs[-1] if msgs else None
+            is_tool_tail = last is not None and last.get("role") == "tool"
+            if not is_tool_tail:
+                return msgs  # don't condense if tail isn't tool messages
+
+            hard_truncate_tail_tool_messages(_tok, msgs, max_context)
+            used_after = count_tokens_messages(_tok, msgs)
+            if used_after <= max_context // 2:
+                return msgs  # truncation sufficed
+
+            condensed = await _condense_context(
+                _tok, msgs, client, model, temperature, max_tokens, max_context, extra_payload,
+            )
+            env.set_messages(idx, condensed)
+            return condensed
+
+        obs = await asyncio.gather(*[
+            _maybe_condense(i, o) for i, o in enumerate(next_obs)
+        ])
+
+    # ── Return in original order ──
+    return [trajectories[i] for i in range(n_total)]
+
+
+# ═══════════════════════════════════════════════════════════════
+# Async per-slot router — 每个 slot 独立协程，一问结束立刻补下一问
+# ═══════════════════════════════════════════════════════════════
+
+async def _run_one_question_async(
+    slot_id: int,
+    qidx: int,
+    question: str,
+    env: DeepResearchEnv,
+    client: VLLMClientAsync,
+    model: str,
+    tools: List[Dict[str, Any]],
+    max_tokens: int,
+    temperature: float,
+    max_context: int,
+    extra_payload: Optional[Dict[str, Any]],
+    result_queue: "asyncio.Queue[tuple[int, List[Dict[str, Any]]]]",
+    *,
+    done_counter: Optional[List[int]] = None,
+    n_total: int = 0,
+    done_lock: Optional["asyncio.Lock"] = None,
+) -> None:
+    """Run a single question to completion in one slot.
+
+    The slot's lifecycle: model → retries → step_single → condense → loop.
+    When done, pushes ``(qidx, trajectory)`` into *result_queue*.
+    If *done_counter* / *done_lock* / *n_total* are provided, prints
+    progress every 10 completions.
+    """
+    import asyncio as _asyncio
+
+    obs: List[Dict[str, Any]] = env.reset_slot(slot_id, question)
+
+    for _ in range(env.max_turns):
+        # ── Model call ──
+        raw = await client.simple_chat(
+            model=model, messages=obs,
+            temperature=temperature, max_tokens=max_tokens,
+            tools=tools, tool_choice="auto", extra_payload=extra_payload,
+        )
+        resp: Dict[str, Any] = raw["choices"][0]["message"]
+
+        # ── Think truncation retry ──
+        content = resp.get("content", "") or ""
+        tc = resp.get("tool_calls")
+        if is_truncated_think_response(content, tc):
+            msgs = list(obs) + [{"role": "user", "content": RETRY_NUDGE}]
+            raw = await client.simple_chat(
+                model=model, messages=msgs,
+                temperature=temperature, max_tokens=max_tokens,
+                tools=tools, tool_choice="auto", extra_payload=extra_payload,
+            )
+            resp = raw["choices"][0]["message"]
+            tc = resp.get("tool_calls")
+
+        # ── Tool validation retry ──
+        if tc:
+            for _retry_num in range(MAX_TOOL_RETRIES):
+                all_errors: List[Dict[str, str]] = []
+                for tc_item in tc:
+                    err = validate_tool_call(tc_item, tools)
+                    if err:
+                        all_errors.append({
+                            "tool_name": tc_item.get("function", {}).get("name", "?"),
+                            "message": err,
+                        })
+                if not all_errors:
+                    break
+                msgs = list(obs) + [resp]
+                error_lines = [f"- `{e['tool_name']}`: {e['message']}" for e in all_errors]
+                nudge = (
+                    "Your tool call(s) failed validation:\n\n"
+                    + "\n".join(error_lines)
+                    + "\n\nPlease correct the error(s) and try again."
+                )
+                msgs.append({"role": "user", "content": nudge})
+                raw = await client.simple_chat(
+                    model=model, messages=msgs,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, tool_choice="auto", extra_payload=extra_payload,
+                )
+                resp = raw["choices"][0]["message"]
+                tc = resp.get("tool_calls")
+                if not tc:
+                    break
+
+        # ── env.step_single ──
+        obs, done = env.step_single(slot_id, resp)
+
+        if done:
+            break
+
+        # ── Context condensation ──
+        used = count_tokens_messages(_tok, obs)
+        if used > max_context // 2:
+            last = obs[-1] if obs else None
+            is_tool_tail = last is not None and last.get("role") == "tool"
+            if is_tool_tail:
+                hard_truncate_tail_tool_messages(_tok, obs, max_context)
+                used_after = count_tokens_messages(_tok, obs)
+                if used_after > max_context // 2:
+                    condensed = await _condense_context(
+                        _tok, obs, client, model, temperature,
+                        max_tokens, max_context, extra_payload,
+                    )
+                    env.set_messages(slot_id, condensed)
+                    obs = condensed
+
+    # ── Report result ──
+    traj = env.extract_slot_trajectory(slot_id)
+    await result_queue.put((qidx, traj))
+
+    if done_counter is not None and done_lock is not None and n_total > 0:
+        async with done_lock:
+            done_counter[0] += 1
+            cur = done_counter[0]
+        if cur % 10 == 0 or cur == n_total:
+            print(f"  [router] {cur}/{n_total} queries done", flush=True)
+
+
+async def run_agent_async_router(
+    env: DeepResearchEnv,
+    client: VLLMClientAsync,
+    model: str,
+    questions: List[str],
+    max_context: int = 40960,
+    max_tokens: int = 4096,
+    temperature: float = 0.0,
+    extra_payload: Optional[Dict[str, Any]] = None,
+) -> List[List[Dict[str, Any]]]:
+    """Fully-async per-slot router — no idle time between questions.
+
+    Each env slot runs as an independent coroutine.  When a slot finishes
+    one question it immediately pulls the next from the queue.  Model calls
+    and tool execution never block sibling slots.
+
+    Returns trajectories in the same order as *questions*.
+    """
+    import asyncio as _asyncio
+
+    n_total = len(questions)
+    n_workers = min(env.n_envs, n_total)
+    tools = env.tool_specs
+
+    pending: "_asyncio.Queue[tuple[int, str]]" = _asyncio.Queue()
+    results: "_asyncio.Queue[tuple[int, List[Dict[str, Any]]]]" = _asyncio.Queue()
+
+    for qidx, q in enumerate(questions):
+        await pending.put((qidx, q))
+
+    # Shared progress counter so workers can print incrementally
+    done_counter: List[int] = [0]
+    done_lock = _asyncio.Lock()
+
+    async def _worker(slot_id: int) -> None:
+        while True:
+            try:
+                qidx, q = pending.get_nowait()
+            except _asyncio.QueueEmpty:
+                return
+            await _run_one_question_async(
+                slot_id=slot_id,
+                qidx=qidx,
+                question=q,
+                env=env,
+                client=client,
+                model=model,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                max_context=max_context,
+                extra_payload=extra_payload,
+                result_queue=results,
+                done_counter=done_counter,
+                n_total=n_total,
+                done_lock=done_lock,
+            )
+
+    workers = [_worker(i) for i in range(n_workers)]
+    await _asyncio.gather(*workers)
+
+    # Collect results in original order
+    result_dict: Dict[int, List[Dict[str, Any]]] = {}
+    for _ in range(n_total):
+        qidx, traj = await results.get()
+        result_dict[qidx] = traj
+
+    return [result_dict[i] for i in range(n_total)]
+
+
+# ═══════════════════════════════════════════════════════════════
 # 批量轨迹生成
 # ═══════════════════════════════════════════════════════════════
 
@@ -383,7 +791,7 @@ async def generate_trajectories(
 
     rows = load_jsonl(dataset_path, limit=limit)
     total = len(rows)
-    client = VLLMClientAsync(base_url=base_url, api_key=api_key)
+    client = VLLMClientAsync(base_url=base_url, api_key=api_key, max_concurrent=n_envs)
 
     env = DeepResearchEnv(
         index_path=index_path,
@@ -399,32 +807,30 @@ async def generate_trajectories(
     records: List[Dict[str, Any]] = []
 
     try:
-        for batch_start in range(0, total, n_envs):
-            batch_rows = rows[batch_start:batch_start + n_envs]
-            batch_questions = [r["query"] for r in batch_rows]
+        all_questions = [r["query"] for r in rows]
+        all_qids = [r["query_id"] for r in rows]
 
-            trajs = await run_agent_with_env(
-                env=env,
-                client=client,
-                model=model,
-                questions=batch_questions,
-                max_context=max_context,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                extra_payload=extra_payload,
-            )
+        trajs = await run_agent_async_router(
+            env=env,
+            client=client,
+            model=model,
+            questions=all_questions,
+            max_context=max_context,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            extra_payload=extra_payload,
+        )
 
-            for row, traj in zip(batch_rows, trajs):
-                answer = extract_final_answer(traj) or ""
-                records.append({
-                    "query_id": row["query_id"],
-                    "status": "completed",
-                    "predicted_answer": answer,
-                    "messages": traj,
-                })
+        for row, traj in zip(rows, trajs):
+            answer = extract_final_answer(traj) or ""
+            records.append({
+                "query_id": row["query_id"],
+                "status": "completed",
+                "predicted_answer": answer,
+                "messages": traj,
+            })
 
-            done = batch_start + len(batch_rows)
-            print(f"[generate] {done}/{total} queries done", flush=True)
+        print(f"[generate] {len(records)}/{total} queries done", flush=True)
     finally:
         env.close()
         await client._client.close()

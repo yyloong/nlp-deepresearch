@@ -390,6 +390,92 @@ class DeepResearchEnv:
 
         return next_obs, rewards, dones, infos
 
+    def step_single(
+        self, slot_id: int, assistant_msg: Dict[str, Any]
+    ) -> Tuple[Optional[List[Dict[str, Any]]], bool]:
+        """Process one step for a single instance.
+
+        Returns ``(observation, done)`` where *observation* is the updated
+        message list (or ``None`` if the instance is done).
+        """
+        inst = self._instances[slot_id]
+        if inst.done:
+            return (None, True)
+
+        # 1. Append assistant message
+        msg: Dict[str, Any] = dict(assistant_msg)
+        msg.setdefault("role", "assistant")
+        if self.strip_thinking and "content" in msg:
+            msg["content"] = self._strip_think(msg["content"])
+        inst.messages.append(msg)
+        inst.turn += 1
+
+        tool_calls = msg.get("tool_calls")
+
+        # 2. Determine if done
+        if not tool_calls:
+            inst.done = True
+        elif inst.turn >= self.max_turns:
+            inst.done = True
+
+        # 3. Execute tool calls (if any, and not done via max_turns)
+        if tool_calls and not inst.done:
+            for tc in tool_calls:
+                fn = tc["function"]
+                name = fn["name"]
+                call_id: str = tc.get("id", "")
+                args_str: str = fn.get("arguments", "")
+
+                try:
+                    args = json.loads(args_str)
+                except (json.JSONDecodeError, TypeError) as exc:
+                    tool_result = json.dumps({
+                        "error": f"Failed to parse arguments as JSON: {exc}. "
+                                 f"Received (truncated): {args_str[:300]}",
+                    })
+                    inst.messages.append({
+                        "role": "tool", "tool_call_id": call_id,
+                        "content": tool_result,
+                    })
+                    continue
+
+                if name not in self._registry:
+                    available = list(self._registry.keys())
+                    tool_result = json.dumps({
+                        "error": f"Unknown tool '{name}'. "
+                                 f"Available tools: {', '.join(available)}.",
+                    })
+                else:
+                    try:
+                        raw = self._registry[name](**args)
+                        tool_result = json.dumps(raw, ensure_ascii=False)
+                    except TypeError as exc:
+                        import inspect
+                        sig = inspect.signature(self._registry[name])
+                        tool_result = json.dumps({
+                            "error": f"Invalid arguments for '{name}': {exc}. "
+                                     f"Expected signature: {name}{sig}.",
+                        })
+                    except Exception as exc:
+                        logger.warning(
+                            "Slot %d turn %d: tool %r failed: %s",
+                            slot_id, inst.turn, name, exc,
+                        )
+                        tool_result = json.dumps({
+                            "error": f"Tool '{name}' execution failed: {exc}.",
+                        })
+
+                inst.messages.append({
+                    "role": "tool", "tool_call_id": call_id,
+                    "content": tool_result,
+                })
+
+        # 4. Record trajectory if episode ended
+        if inst.done and self.record_trajectory:
+            self._finished_trajectories[slot_id] = list(inst.messages)
+
+        return (list(inst.messages) if not inst.done else None, inst.done)
+
     # ── Trajectory & reward helpers ────────────
     def get_trajectories(self) -> List[List[Dict[str, Any]]]:
         """Return completed trajectories in instance order and clear the buffer."""
@@ -454,6 +540,33 @@ class DeepResearchEnv:
     def set_messages(self, instance_id: int, messages: List[Dict[str, Any]]) -> None:
         """Replace conversation history for an instance (used after condensation)."""
         self._instances[instance_id].messages = messages
+
+    def reset_slot(self, slot_id: int, question: str) -> List[Dict[str, Any]]:
+        """Reset a single slot with a new question (for router-based scheduling).
+
+        Returns the initial observation (messages) for the slot.
+        """
+        msgs: List[Dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": question},
+        ]
+        # Ensure lists are large enough (router may skip env.reset())
+        needed = slot_id + 1
+        if len(self._instances) < needed:
+            self._instances.extend([EnvInstance() for _ in range(needed - len(self._instances))])
+        if len(self._finished_trajectories) < needed:
+            self._finished_trajectories.extend([None] * (needed - len(self._finished_trajectories)))
+        self._instances[slot_id] = EnvInstance(messages=msgs)
+        self._finished_trajectories[slot_id] = None
+        return list(msgs)
+
+    def get_slot_messages(self, slot_id: int) -> List[Dict[str, Any]]:
+        """Return a shallow copy of the current message list for a slot."""
+        return list(self._instances[slot_id].messages)
+
+    def extract_slot_trajectory(self, slot_id: int) -> List[Dict[str, Any]]:
+        """Extract and return the full trajectory for a slot."""
+        return list(self._instances[slot_id].messages)
 
     def all_done(self) -> bool:
         return all(inst.done for inst in self._instances)

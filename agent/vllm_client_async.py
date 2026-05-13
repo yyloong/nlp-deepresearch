@@ -1,17 +1,36 @@
+import asyncio
 from typing import Any, Dict, Optional
 
+import httpx
 from openai import AsyncOpenAI
 
 
 class VLLMClientAsync:
-    def __init__(self, base_url: str, api_key: str = "dummy") -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "dummy",
+        max_concurrent: int = 5,
+    ) -> None:
+        # Limit concurrent requests to vLLM to avoid "Already borrowed" errors
+        # caused by the async engine being overwhelmed.
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        http_client = httpx.AsyncClient(
+            http2=False,
+            limits=httpx.Limits(
+                max_keepalive_connections=0,
+                max_connections=max_concurrent + 10,
+            ),
+        )
         self._client = AsyncOpenAI(
             base_url=base_url.rstrip("/"),
             api_key=api_key,
+            http_client=http_client,
         )
 
     async def chat_completions(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        response = await self._client.chat.completions.create(**payload)
+        async with self._semaphore:
+            response = await self._client.chat.completions.create(**payload)
         return response.model_dump()
 
     async def simple_chat(
