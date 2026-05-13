@@ -320,6 +320,16 @@ async def run_agent_with_env(
                     )
                 hard_truncate_tail_tool_messages(_tok, msgs, max_context)
                 used_after = count_tokens_messages(_tok, msgs)
+
+                # If truncation alone brought us back under threshold, skip condensation
+                if used_after <= max_context // 2:
+                    print(
+                        f"  [condense] instance {idx}: {used}→{used_after}/{max_context} tokens "
+                        f"(after tool hard-cap, under threshold → skip)",
+                        flush=True,
+                    )
+                    return msgs
+
                 if used_after > max_context:
                     raise RuntimeError(
                         f"instance {idx}: {used_after} tokens still exceed max_context="
