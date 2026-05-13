@@ -131,8 +131,8 @@ class DeepResearchEnv:
         # Per-instance state
         self._instances: List[EnvInstance] = []
 
-        # Accumulated trajectories (flushed after each episode ends)
-        self._finished_trajectories: List[List[Dict[str, Any]]] = []
+        # Accumulated trajectories, indexed by instance_id (not completion order)
+        self._finished_trajectories: List[Optional[List[Dict[str, Any]]]] = []
 
     # ── Tool registry ──────────────────────────
     def _build_tool_specs(self) -> Tuple[List[Dict[str, Any]], Dict[str, Callable[..., Any]]]:
@@ -221,6 +221,7 @@ class DeepResearchEnv:
 
         self._active_n = n  # effective batch size for this episode
         self._instances = []
+        self._finished_trajectories = [None] * n  # per-instance slots
         observations: List[List[Dict[str, Any]]] = []
         infos: List[Dict[str, Any]] = []
 
@@ -322,21 +323,54 @@ class DeepResearchEnv:
                 for tc in tool_calls:
                     fn = tc["function"]
                     name = fn["name"]
-                    args = json.loads(fn["arguments"])
                     call_id: str = tc.get("id", "")
+                    args_str: str = fn.get("arguments", "")
+
+                    # Parse arguments (model may produce malformed JSON)
+                    try:
+                        args = json.loads(args_str)
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        tool_result = json.dumps({
+                            "error": f"Failed to parse arguments as JSON: {exc}. "
+                                     f"Arguments must be valid JSON. "
+                                     f"Received (truncated): {args_str[:300]}",
+                        })
+                        inst.messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": tool_result,
+                        })
+                        continue
 
                     if name not in self._registry:
-                        tool_result = json.dumps({"error": f"unknown tool: {name}"})
+                        available = list(self._registry.keys())
+                        tool_result = json.dumps({
+                            "error": f"Unknown tool '{name}'. "
+                                     f"Available tools: {', '.join(available)}. "
+                                     f"Please use one of the available tools.",
+                        })
                     else:
                         try:
                             raw = self._registry[name](**args)
                             tool_result = json.dumps(raw, ensure_ascii=False)
+                        except TypeError as exc:
+                            # Wrong argument names or counts
+                            import inspect
+                            sig = inspect.signature(self._registry[name])
+                            tool_result = json.dumps({
+                                "error": f"Invalid arguments for '{name}': {exc}. "
+                                         f"Expected signature: {name}{sig}. "
+                                         f"Please check the parameter names and types.",
+                            })
                         except Exception as exc:
                             logger.warning(
                                 "Instance %d turn %d: tool %r failed: %s",
                                 i, inst.turn, name, exc,
                             )
-                            tool_result = json.dumps({"error": str(exc)})
+                            tool_result = json.dumps({
+                                "error": f"Tool '{name}' execution failed: {exc}. "
+                                         f"Please try with different arguments or a different approach.",
+                            })
 
                     inst.messages.append({
                         "role": "tool",
@@ -346,7 +380,7 @@ class DeepResearchEnv:
 
             # 4. Record trajectory if episode ended
             if inst.done and self.record_trajectory:
-                self._finished_trajectories.append(list(inst.messages))
+                self._finished_trajectories[i] = list(inst.messages)
 
             # 5. Build return values
             next_obs.append(list(inst.messages) if not inst.done else None)
@@ -358,8 +392,8 @@ class DeepResearchEnv:
 
     # ── Trajectory & reward helpers ────────────
     def get_trajectories(self) -> List[List[Dict[str, Any]]]:
-        """Return completed trajectories and clear the internal buffer."""
-        trajs = list(self._finished_trajectories)
+        """Return completed trajectories in instance order and clear the buffer."""
+        trajs = [t for t in self._finished_trajectories if t is not None]
         self._finished_trajectories = []
         return trajs
 

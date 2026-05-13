@@ -39,10 +39,13 @@ from .utils import (
     extract_final_answer,
     hard_truncate_tail_tool_messages,
     is_truncated_think_response,
+    validate_tool_call,
 )
 from .vllm_client_async import VLLMClientAsync
 
 logger = logging.getLogger(__name__)
+
+MAX_TOOL_RETRIES = 2  # max retries per turn when tool call validation fails
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are a Deep Research Agent. Your task is to find the correct answer to a complex \
@@ -227,6 +230,66 @@ async def run_agent_with_env(
                 retry_resp = retry_raw["choices"][0]["message"]
                 responses[i] = retry_resp
                 print(f"  [retry] instance {idx}: truncated think detected, nudging model to call tools", flush=True)
+
+        # 1.6 工具调用校验 + 重试（检测未知工具名 / 缺失必填参数，省一轮 turn）
+        for i in range(len(responses)):
+            resp = responses[i]
+            idx = indices[i]
+            tool_calls = resp.get("tool_calls")
+            if not tool_calls:
+                continue
+
+            for retry_num in range(MAX_TOOL_RETRIES):
+                all_errors: List[Dict[str, str]] = []
+                for tc in tool_calls:
+                    err = validate_tool_call(tc, tools)
+                    if err:
+                        all_errors.append({
+                            "tool_name": tc.get("function", {}).get("name", "?"),
+                            "message": err,
+                        })
+
+                if not all_errors:
+                    break
+
+                # 构建带错误信息的 nudge
+                msgs = list(obs[idx]) if obs[idx] is not None else []
+                msgs.append(resp)  # 失败的那条 assistant 消息
+
+                error_lines = []
+                for e in all_errors:
+                    error_lines.append(f"- `{e['tool_name']}`: {e['message']}")
+
+                nudge = (
+                    f"Your tool call(s) failed validation with the following error(s):\n\n"
+                    + "\n".join(error_lines)
+                    + "\n\nPlease correct the error(s) and call the tool(s) again "
+                    "with valid arguments."
+                )
+                msgs.append({"role": "user", "content": nudge})
+
+                print(
+                    f"  [tool-retry] instance {idx} attempt {retry_num + 1}/{MAX_TOOL_RETRIES}: "
+                    f"{len(all_errors)} validation error(s)",
+                    flush=True,
+                )
+
+                retry_raw = await client.simple_chat(
+                    model=model,
+                    messages=msgs,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice="auto",
+                    extra_payload=extra_payload,
+                )
+                resp = retry_raw["choices"][0]["message"]
+                responses[i] = resp
+                tool_calls = resp.get("tool_calls")
+
+                if not tool_calls:
+                    # 模型放弃调用工具 — 交给 env.step 处理
+                    break
 
         # 2. env.step — 追加 assistant 消息 + tool 结果
         actions: List[Any] = [None] * len(obs)

@@ -222,6 +222,72 @@ RETRY_NUDGE = (
 )
 
 
+def validate_tool_call(
+    tc: Dict[str, Any],
+    tool_specs: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Validate a single tool call against the tool specifications.
+
+    Checks:
+    1. Tool name exists in the spec list.
+    2. ``arguments`` is valid JSON.
+    3. All required parameters (declared in the spec) are present.
+
+    Returns an error message string if validation fails, or ``None`` if valid.
+    """
+    fn = tc.get("function", {})
+    name = fn.get("name", "")
+    args_str = fn.get("arguments", "")
+
+    # 1. Tool name exists
+    tool_spec = None
+    for t in tool_specs:
+        if t.get("function", {}).get("name") == name:
+            tool_spec = t["function"]
+            break
+
+    if tool_spec is None:
+        available = [t["function"]["name"] for t in tool_specs]
+        return (
+            f"Unknown tool '{name}'. "
+            f"Available tools: {', '.join(available)}. "
+            f"Please use one of the available tools."
+        )
+
+    # 2. Valid JSON
+    try:
+        args = json.loads(args_str)
+    except json.JSONDecodeError as e:
+        return (
+            f"Invalid JSON in arguments: {e}. "
+            f"Arguments must be valid JSON. "
+            f"Received (truncated): {args_str[:200]}"
+        )
+
+    # 3. Required parameters present
+    if not isinstance(args, dict):
+        return (
+            f"Arguments must be a JSON object (dict), got {type(args).__name__}. "
+            f"Received: {args_str[:200]}"
+        )
+
+    required = tool_spec.get("parameters", {}).get("required", [])
+    missing = [p for p in required if p not in args or args[p] is None or args[p] == ""]
+
+    if missing:
+        param_info = tool_spec.get("parameters", {}).get("properties", {})
+        hints = []
+        for p in missing:
+            desc = param_info.get(p, {}).get("description", "")
+            hints.append(f"'{p}' ({desc})" if desc else f"'{p}'")
+        return (
+            f"Missing required parameter(s): {', '.join(hints)}. "
+            f"Please provide values for: {', '.join(missing)}."
+        )
+
+    return None
+
+
 def extract_final_answer(messages: List[Dict[str, Any]]) -> Optional[str]:
     """Extract the final predicted answer from the trajectory.
 
