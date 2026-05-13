@@ -1,8 +1,14 @@
 import asyncio
+import logging
 from typing import Any, Dict, Optional
 
 import httpx
 from openai import AsyncOpenAI
+
+logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2.0  # seconds
 
 
 class VLLMClientAsync:
@@ -29,9 +35,31 @@ class VLLMClientAsync:
         )
 
     async def chat_completions(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        async with self._semaphore:
-            response = await self._client.chat.completions.create(**payload)
-        return response.model_dump()
+        last_exc = None
+        for attempt in range(MAX_RETRIES):
+            async with self._semaphore:
+                try:
+                    response = await self._client.chat.completions.create(**payload)
+                    return response.model_dump()
+                except Exception as exc:
+                    last_exc = exc
+                    msg = str(exc)
+                    # Only retry on transient errors (vLLM race condition,
+                    # server overload, rate limits).  Genuine 4xx format
+                    # errors should fail immediately.
+                    is_transient = (
+                        "Already borrowed" in msg
+                        or getattr(exc, "status_code", None) in (429, 500, 502, 503, 504)
+                    )
+                    if not is_transient or attempt >= MAX_RETRIES - 1:
+                        raise
+                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
+                    logger.warning(
+                        "vLLM request failed (attempt %d/%d): %s. Retrying in %.1fs…",
+                        attempt + 1, MAX_RETRIES, msg, delay,
+                    )
+                    await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     async def simple_chat(
         self,

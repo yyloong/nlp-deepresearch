@@ -26,6 +26,7 @@ Typical training loop::
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from dataclasses import dataclass, field
@@ -45,20 +46,40 @@ question by searching a document corpus.
 
 CRITICAL RULES — you MUST follow these:
 1. ALWAYS call `search` or `get_document` on your first turn. Never output a final \
-answer without first using at least one tool. You do NOT know the answer in advance.
-2. Keep your thinking concise — plan your next tool call in 1-2 sentences max. \
-Long analysis without acting is forbidden. Act first, then think about results.
-3. Conduct multi-round investigation: use DIFFERENT search queries with DIFFERENT \
-phrasings. A single search is never enough. Aim for 3+ distinct searches.
-4. When snippets look relevant, call `get_document` to read the full document.
-5. Cross-check every finding against at least one other independent source.
+answer without first using at least one tool.
+2. Search for specific entities (names, places, dates) rather than long phrases. \
+Use DIFFERENT queries from DIFFERENT angles.
+3. After every search, extract entities from results and use them for your next search.
+4. When a snippet looks even partially relevant, call get_document to read the full text.
+
+─── SELF-CHECK RULE ───
+
+Before outputting your final answer, complete the Self-Check section honestly. \
+If any item is NO, continue searching instead of answering.
 
 Available tools:
 - `search`: BM25 index lookup (returns docid, score, snippet).
 - `get_document`: retrieve a full document by docid.
 
 Answer format (on your FINAL turn — when you are ready to answer):
-YOU MUST output exactly in this format, with both sections present:
+YOU MUST output exactly in this format:
+
+Self-Check:
+  [READ]      YES/NO — Did I read the full text of any document via get_document?
+  [ANGLES]    YES/NO — Did I try multiple different search angles (not just rephrase)?
+  [CHAIN]     YES/NO — Did I use entities found in results to guide my next searches?
+  [GROUNDED]  YES/NO — Is every factual statement in my answer directly supported by \
+text retrieved through tools (not inference, not prior knowledge)?
+  [QUOTABLE]  YES/NO — For each claim, can I point to a docid and quote the exact \
+supporting sentence?
+  [EXHAUST]   YES/NO — (only if giving up) Did I search for different clues before concluding?
+
+Evidence Mapping (list each claim and its source):
+  Claim 1: <what I assert>
+    → Source: docid=<X>, quote="<exact supporting text>"
+  Claim 2: ...
+  (add more claims as needed)
+
 Explanation: <step-by-step reasoning citing specific docids and evidence>
 Exact Answer: <your final concise answer>
 Do NOT include anything after "Exact Answer:" — no extra commentary.\
@@ -103,6 +124,10 @@ class DeepResearchEnv:
     strip_thinking : bool
         If True, strip ``<think>...</think>`` blocks from assistant messages before
         storing in the conversation history. Saves context space for subsequent turns.
+    condense_thinking : bool
+        If True, condense ``<think>...</think>`` blocks into concise planning summaries
+        instead of fully stripping them. Preserves core purpose and planning intent.
+        Takes priority over ``strip_thinking`` when both are True.
     """
 
     def __init__(
@@ -115,6 +140,7 @@ class DeepResearchEnv:
         snippet_max_chars: int = 1200,
         record_trajectory: bool = True,
         strip_thinking: bool = True,
+        condense_thinking: bool = False,
     ) -> None:
         self.n_envs = n_envs
         self.system_prompt = system_prompt
@@ -123,6 +149,7 @@ class DeepResearchEnv:
         self.snippet_max_chars = snippet_max_chars
         self.record_trajectory = record_trajectory
         self.strip_thinking = strip_thinking
+        self.condense_thinking = condense_thinking
 
         # Shared searcher (thread-safe for reads; tool calls are synchronous)
         self._searcher: BrowseCompBM25Searcher = build_searcher(index_path)
@@ -230,7 +257,7 @@ class DeepResearchEnv:
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": q},
             ]
-            inst = EnvInstance(messages=msgs)
+            inst = EnvInstance(messages=msgs, trajectory=list(msgs))
             self._instances.append(inst)
             observations.append(list(msgs))  # shallow copy
             infos.append({
@@ -292,8 +319,16 @@ class DeepResearchEnv:
             # 1. Append the assistant message to conversation
             assistant_msg: Dict[str, Any] = dict(action)
             assistant_msg.setdefault("role", "assistant")
-            if self.strip_thinking and "content" in assistant_msg:
+            if self.condense_thinking and "content" in assistant_msg:
+                # Keep original (with thinking) in trajectory log
+                inst.trajectory.append(copy.deepcopy(assistant_msg))
+                assistant_msg["content"] = self._condense_think(assistant_msg["content"])
+            elif self.strip_thinking and "content" in assistant_msg:
+                # Keep original (with thinking) in trajectory log
+                inst.trajectory.append(copy.deepcopy(assistant_msg))
                 assistant_msg["content"] = self._strip_think(assistant_msg["content"])
+            else:
+                inst.trajectory.append(copy.deepcopy(assistant_msg))
             inst.messages.append(assistant_msg)
             inst.turn += 1
 
@@ -340,6 +375,11 @@ class DeepResearchEnv:
                             "tool_call_id": call_id,
                             "content": tool_result,
                         })
+                        inst.trajectory.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": tool_result,
+                        })
                         continue
 
                     if name not in self._registry:
@@ -377,10 +417,15 @@ class DeepResearchEnv:
                         "tool_call_id": call_id,
                         "content": tool_result,
                     })
+                    inst.trajectory.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": tool_result,
+                    })
 
             # 4. Record trajectory if episode ended
             if inst.done and self.record_trajectory:
-                self._finished_trajectories[i] = list(inst.messages)
+                self._finished_trajectories[i] = inst.trajectory
 
             # 5. Build return values
             next_obs.append(list(inst.messages) if not inst.done else None)
@@ -405,8 +450,16 @@ class DeepResearchEnv:
         # 1. Append assistant message
         msg: Dict[str, Any] = dict(assistant_msg)
         msg.setdefault("role", "assistant")
-        if self.strip_thinking and "content" in msg:
+        if self.condense_thinking and "content" in msg:
+            # Keep original (with thinking) in trajectory log
+            inst.trajectory.append(copy.deepcopy(msg))
+            msg["content"] = self._condense_think(msg["content"])
+        elif self.strip_thinking and "content" in msg:
+            # Keep original (with thinking) in trajectory log
+            inst.trajectory.append(copy.deepcopy(msg))
             msg["content"] = self._strip_think(msg["content"])
+        else:
+            inst.trajectory.append(copy.deepcopy(msg))
         inst.messages.append(msg)
         inst.turn += 1
 
@@ -434,6 +487,10 @@ class DeepResearchEnv:
                                  f"Received (truncated): {args_str[:300]}",
                     })
                     inst.messages.append({
+                        "role": "tool", "tool_call_id": call_id,
+                        "content": tool_result,
+                    })
+                    inst.trajectory.append({
                         "role": "tool", "tool_call_id": call_id,
                         "content": tool_result,
                     })
@@ -469,10 +526,14 @@ class DeepResearchEnv:
                     "role": "tool", "tool_call_id": call_id,
                     "content": tool_result,
                 })
+                inst.trajectory.append({
+                    "role": "tool", "tool_call_id": call_id,
+                    "content": tool_result,
+                })
 
         # 4. Record trajectory if episode ended
         if inst.done and self.record_trajectory:
-            self._finished_trajectories[slot_id] = list(inst.messages)
+            self._finished_trajectories[slot_id] = inst.trajectory
 
         return (list(inst.messages) if not inst.done else None, inst.done)
 
@@ -532,6 +593,98 @@ class DeepResearchEnv:
         text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
         return text.strip()
 
+    @staticmethod
+    def _condense_think(text: str) -> str:
+        """Condense ``<think>...</think>`` blocks into concise planning summaries.
+
+        Instead of fully stripping the model's reasoning, this extracts key sentences
+        related to strategy, planning, and core purpose.  The result is a compact
+        ``[Plan]`` marker that preserves context for subsequent turns without wasting
+        token budget on verbose chain-of-thought.
+
+        Also handles unclosed ``<think>`` tags (truncated output).
+        """
+        import re
+
+        # ── sentence-split helper ──
+        def _split_sentences(t: str) -> "List[str]":
+            # Split on ., !, ? followed by whitespace, or on newlines
+            raw = re.split(r"(?<=[.!?])\s+|\n+", t)
+            return [s.strip() for s in raw if s.strip()]
+
+        # ── planning-relevance patterns ──
+        _PLAN_PATTERNS = [
+            r"\b(plan|planning|strategy|approach|goal|objective)\b",
+            r"\b(need to|have to|must|should|will|going to)\b",
+            r"\b(next|first|then|finally|after that)\b",
+            r"\b(search|retrieve|look up|find|check|verify|confirm)\b",
+            r"\b(hypothes|suspect|believe|assume|guess)\b",
+            r"\b(clue|clues|evidence|lead|direction|angle)\b",
+            r"\b(key|critical|important|essential|main|core)\b",
+            r"\b(question asks|trying to answer|need to know|missing)\b",
+            r"\b(let me|I will|I need|I should|we need)\b",
+        ]
+
+        def condense_block(think_content: str) -> str:
+            content = think_content.strip()
+            if not content:
+                return ""
+            content = " ".join(content.split())
+
+            sentences = _split_sentences(content)
+            if not sentences:
+                return ""
+
+            scored: "List[Tuple[str,int]]" = []
+            for sent in sentences:
+                s_lower = sent.lower()
+                score = 0
+                for pat in _PLAN_PATTERNS:
+                    if re.search(pat, s_lower):
+                        score += 1
+                # Small bonus for edge sentences (often carry the gist)
+                if sent is sentences[0] or sent is sentences[-1]:
+                    score += 1
+                if score > 0:
+                    scored.append((sent, score))
+
+            if not scored:
+                # Fallback: keep first + last sentence
+                result_sents: "List[str]" = []
+                if sentences:
+                    result_sents.append(sentences[0][:300])
+                if len(sentences) > 1:
+                    result_sents.append(sentences[-1][:300])
+                summary = " ".join(result_sents)
+            else:
+                scored.sort(key=lambda x: x[1], reverse=True)
+                top = scored[:3]                      # at most 3 sentences
+                # Restore original order
+                top.sort(key=lambda x: sentences.index(x[0]))
+                summary = " ".join(s[0] for s in top)
+
+            max_len = 500
+            if len(summary) > max_len:
+                summary = summary[:max_len - 3] + "..."
+
+            return f"[Plan] {summary}" if summary else ""
+
+        # Replace closed <think>...</think>
+        text = re.sub(
+            r"<think>(.*?)</think>",
+            lambda m: condense_block(m.group(1)),
+            text,
+            flags=re.DOTALL,
+        )
+        # Replace unclosed <think> (truncated output)
+        text = re.sub(
+            r"<think>(.*)$",
+            lambda m: condense_block(m.group(1)),
+            text,
+            flags=re.DOTALL,
+        )
+        return text.strip()
+
     # ── Inspection ─────────────────────────────
     def get_active_messages(self) -> List[List[Dict[str, Any]]]:
         """Return the current message history for each non-done instance."""
@@ -556,7 +709,7 @@ class DeepResearchEnv:
             self._instances.extend([EnvInstance() for _ in range(needed - len(self._instances))])
         if len(self._finished_trajectories) < needed:
             self._finished_trajectories.extend([None] * (needed - len(self._finished_trajectories)))
-        self._instances[slot_id] = EnvInstance(messages=msgs)
+        self._instances[slot_id] = EnvInstance(messages=msgs, trajectory=list(msgs))
         self._finished_trajectories[slot_id] = None
         return list(msgs)
 
@@ -566,7 +719,7 @@ class DeepResearchEnv:
 
     def extract_slot_trajectory(self, slot_id: int) -> List[Dict[str, Any]]:
         """Extract and return the full trajectory for a slot."""
-        return list(self._instances[slot_id].messages)
+        return list(self._instances[slot_id].trajectory)
 
     def all_done(self) -> bool:
         return all(inst.done for inst in self._instances)

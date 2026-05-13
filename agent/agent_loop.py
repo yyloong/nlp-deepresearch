@@ -48,46 +48,33 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_RETRIES = 2  # max retries per turn when tool call validation fails
 
 DEFAULT_SYSTEM_PROMPT = """\
-You are a Deep Research Agent. Your task is to answer complex questions by searching \
-a document corpus. Your final answer must be grounded in evidence retrieved through tools.
+You are a Deep Research Agent. Answer complex questions by searching a document corpus \
+using `search` and `get_document`. Every answer must be grounded in retrieved evidence.
 
-You operate in a loop:
-  1. Call tools (`search` or `get_document`) to gather evidence.
-  2. Process the tool results — extract relevant facts, names, dates, numbers.
-  3. Assess whether the evidence is sufficient to answer. If not, go back to step 1.
-  4. When the evidence is sufficient, output your final answer.
+─── SELF-CHECK RULE (read carefully) ───
 
-─── ASSESSMENT (step 3) — be thorough and granular ───
+Before you output your final answer, you MUST complete the Self-Check section below. \
+Answer each item honestly as YES or NO with a short justification.
 
-Before deciding you have enough, examine each part of the question:
+**If any item is NO, you MUST continue searching instead of outputting an answer.** \
+The Self-Check is your own quality gate — it prevents premature answers.
 
-• For every factual claim you intend to make: is it explicitly stated in a retrieved \
-  document, or are you inferring it?  Inference is not enough — you need explicit evidence.
-• For every constraint in the question (dates, numbers, names, relationships): does \
-  a specific document directly address it?  A document that merely mentions a keyword \
-  without confirming the constraint does not count.
-• For every entity you identify: can you point to a document that links that entity to \
-  the specific properties described in the question?  Partial matches are not matches.
-• Are there gaps between what the evidence shows and what the question demands?  \
-  If a sub-question has no supporting document yet, you have a gap.
-• Does any finding rely on a single source?  Seek a second, independent document to \
-  corroborate it before treating it as settled.
+─── ONE TOOL PER TURN (CRITICAL) ───
 
-If the assessment reveals any gap, ambiguity, or unsupported inference → call tools \
-again to fill it.  Target the specific missing piece with a precise query.
+You MUST call exactly ONE tool per turn. NEVER call both `search` and `get_document` in the
+same assistant message. Reasoning:
+• Calling multiple tools at once floods you with too much information at once, causing you
+  to miss critical details.
+• Call `search` first → review the snippets carefully → on your NEXT turn, pick the single
+  most promising docid and call `get_document` to read it in full.
+• Similarly, when you need multiple searches, do them one at a time, each in a separate turn.
+  Use the results of each search to inform your next query.
 
-If a search returns documents that look relevant but fail the granular checks above \
-(e.g., they mention a keyword but don't confirm the constraint, or they match only \
-partially), do not give up — rewrite the query from a different angle.  Change \
-keywords, try synonyms, or search for a related entity that might lead to the target \
-information.
+─── SEARCH TIPS ───
 
-─── WHEN TO ANSWER ───
-
-Output your final answer only when, for every part of the question, you can cite at \
-least one document that directly and explicitly supports your conclusion.  If, after \
-thorough searching, some parts genuinely lack evidence in the corpus, acknowledge \
-this in your answer rather than fabricating or guessing.
+• Search for specific entities (names, places, dates) rather than long descriptive phrases.
+• After getting results, extract names/entities from them and use those for your next search.
+• If a snippet looks even partially relevant, call get_document to read the full text.
 
 ─── TOOLS ───
 
@@ -96,8 +83,24 @@ this in your answer rather than fabricating or guessing.
 
 ─── ANSWER FORMAT ───
 
-Explanation: <step-by-step reasoning, citing docids, showing how each part of the \
-question was resolved with evidence>
+Self-Check:
+  [READ]      YES/NO — Did I read the full text of any document via get_document?
+  [ANGLES]    YES/NO — Did I try multiple different search angles (not just rephrase)?
+  [CHAIN]     YES/NO — Did I use entities found in results to guide my next searches?
+  [GROUNDED]  YES/NO — Is every factual statement in my answer directly supported by \
+text retrieved through tools (not inference, not prior knowledge)?
+  [QUOTABLE]  YES/NO — For each claim in my answer, can I point to a specific docid \
+and quote the exact sentence that supports it?
+  [EXHAUST]   YES/NO — (only if you cannot find the answer) Did I search for different \
+clues from the question before concluding evidence is insufficient?
+
+Evidence Mapping (list each claim and its source):
+  Claim 1: <what I assert>
+    → Source: docid=<X>, quote="<exact supporting text from the document>"
+  Claim 2: ...
+  (add more claims as needed)
+
+Explanation: <step-by-step reasoning, citing docids for each claim>
 Exact Answer: <concise final answer>\
 """
 
@@ -207,6 +210,7 @@ async def run_agent_with_env(
     max_tokens: int = 4096,
     temperature: float = 0.0,
     extra_payload: Optional[Dict[str, Any]] = None,
+    max_tool_calls_per_turn: int = 1,
 ) -> List[List[Dict[str, Any]]]:
     """使用 DeepResearchEnv 运行 agent loop。
 
@@ -326,6 +330,9 @@ async def run_agent_with_env(
         # 2. env.step — 追加 assistant 消息 + tool 结果
         actions: List[Any] = [None] * len(obs)
         for idx, resp in zip(indices, responses):
+            tc = resp.get("tool_calls")
+            if tc and len(tc) > max_tool_calls_per_turn:
+                resp["tool_calls"] = tc[:max_tool_calls_per_turn]
             actions[idx] = resp
 
         next_obs, rewards, dones, infos = env.step(actions)
@@ -401,6 +408,7 @@ async def run_agent_router(
     max_tokens: int = 4096,
     temperature: float = 0.0,
     extra_payload: Optional[Dict[str, Any]] = None,
+    max_tool_calls_per_turn: int = 1,
 ) -> List[List[Dict[str, Any]]]:
     """Router-based agent loop — keeps all env slots filled.
 
@@ -525,6 +533,9 @@ async def run_agent_router(
         # ── 3. env.step ──
         actions: List[Any] = [None] * n_envs
         for idx, resp in zip(indices, responses):
+            tc = resp.get("tool_calls")
+            if tc and len(tc) > max_tool_calls_per_turn:
+                resp["tool_calls"] = tc[:max_tool_calls_per_turn]
             actions[idx] = resp
         next_obs, _rewards, dones, _infos = env.step(actions)
 
@@ -595,6 +606,7 @@ async def _run_one_question_async(
     done_counter: Optional[List[int]] = None,
     n_total: int = 0,
     done_lock: Optional["asyncio.Lock"] = None,
+    max_tool_calls_per_turn: int = 1,
 ) -> None:
     """Run a single question to completion in one slot.
 
@@ -660,6 +672,11 @@ async def _run_one_question_async(
                 if not tc:
                     break
 
+        # ── Enforce max tool calls per turn ──
+        tc = resp.get("tool_calls")
+        if tc and len(tc) > max_tool_calls_per_turn:
+            resp["tool_calls"] = tc[:max_tool_calls_per_turn]
+
         # ── env.step_single ──
         obs, done = env.step_single(slot_id, resp)
 
@@ -703,6 +720,7 @@ async def run_agent_async_router(
     max_tokens: int = 4096,
     temperature: float = 0.0,
     extra_payload: Optional[Dict[str, Any]] = None,
+    max_tool_calls_per_turn: int = 1,
 ) -> List[List[Dict[str, Any]]]:
     """Fully-async per-slot router — no idle time between questions.
 
@@ -750,6 +768,7 @@ async def run_agent_async_router(
                 done_counter=done_counter,
                 n_total=n_total,
                 done_lock=done_lock,
+                max_tool_calls_per_turn=max_tool_calls_per_turn,
             )
 
     workers = [_worker(i) for i in range(n_workers)]
@@ -786,6 +805,8 @@ async def generate_trajectories(
     extra_payload: Optional[Dict[str, Any]] = None,
     limit: Optional[int] = None,
     strip_thinking: bool = True,
+    condense_thinking: bool = False,
+    max_tool_calls_per_turn: int = 1,
 ) -> List[Dict[str, Any]]:
     from .dataset_utils import load_jsonl
 
@@ -802,6 +823,7 @@ async def generate_trajectories(
         snippet_max_chars=snippet_max_chars,
         record_trajectory=True,
         strip_thinking=strip_thinking,
+        condense_thinking=condense_thinking,
     )
 
     records: List[Dict[str, Any]] = []
@@ -819,6 +841,7 @@ async def generate_trajectories(
             max_tokens=max_tokens,
             temperature=temperature,
             extra_payload=extra_payload,
+            max_tool_calls_per_turn=max_tool_calls_per_turn,
         )
 
         for row, traj in zip(rows, trajs):
@@ -877,6 +900,7 @@ Examples:
     p.add_argument("--max-turns", type=int, default=10, help="最大 tool-calling 轮数")
     p.add_argument("--max-tokens", type=int, default=4096, help="每轮模型最大 token 数")
     p.add_argument("--max-context", type=int, default=40960, help="模型最大上下文长度（用于自动压缩判断）")
+    p.add_argument("--max-tool-calls-per-turn", type=int, default=1, help="每轮最大 tool call 数（超出的会被截断）")
     p.add_argument("--search-k", type=int, default=5, help="search 返回文档数")
     p.add_argument("--snippet-max-chars", type=int, default=1200)
     p.add_argument("--temperature", type=float, default=0.0)
@@ -885,6 +909,7 @@ Examples:
     p.add_argument("--limit", type=int, default=None, help="限制处理条数")
     p.add_argument("--no-eval", action="store_true", help="跳过评估")
     p.add_argument("--no-strip-thinking", action="store_true", help="保留 <think> 块在上下文中（默认 strip）")
+    p.add_argument("--condense-thinking", action="store_true", help="压缩 <think> 块为简洁的计划摘要而非完全 strip（保留核心目的和规划）")
     p.add_argument("--tokenizer-path", default="Qwen/Qwen3-8B", help="Tokenizer 模型路径（用于精确 token 计数）")
     return p
 
@@ -921,6 +946,8 @@ async def _main_async(args: argparse.Namespace) -> None:
         snippet_max_chars=args.snippet_max_chars,
         limit=args.limit,
         strip_thinking=not args.no_strip_thinking,
+        condense_thinking=args.condense_thinking,
+        max_tool_calls_per_turn=args.max_tool_calls_per_turn,
     )
     gen_time = time.time() - t0
     print(f"\n[done] generated {len(records)} trajectories in {gen_time:.1f}s", flush=True)

@@ -21,7 +21,8 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
 OUTPUT_DIR="${ROOT}/runs"
 N_ENVS="${N_ENVS:-10}"
 MAX_TURNS="${MAX_TURNS:-10}"
-MAX_TOKENS="${MAX_TOKENS:-16384}"
+MAX_TOKENS="${MAX_TOKENS:-10240}"
+MAX_TOOL_CALLS="${MAX_TOOL_CALLS:-1}"
 SEARCH_K="${SEARCH_K:-5}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 
@@ -57,6 +58,7 @@ echo "Model:      ${MODEL}"
 echo "Base URL:   ${BASE_URL}"
 echo "n_envs:     ${N_ENVS}"
 echo "max_tokens: ${MAX_TOKENS}"
+echo "max_tool_calls: ${MAX_TOOL_CALLS}"
 echo "Output:     ${OUTPUT_DIR}/"
 echo "==========================="
 echo
@@ -72,6 +74,8 @@ exec python -m agent.agent_loop \
     --n-envs "${N_ENVS}" \
     --max-turns "${MAX_TURNS}" \
     --max-tokens "${MAX_TOKENS}" \
+    --max-tool-calls-per-turn "${MAX_TOOL_CALLS}" \
     --search-k "${SEARCH_K}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
+    --condense-thinking
     "$@"
