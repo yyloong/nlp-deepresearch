@@ -49,6 +49,86 @@ def json_with_empty_strings(obj: Any) -> Any:
     return str(obj)
 
 
+def _is_search_result_list(obj: Any) -> bool:
+    """Check if *obj* is a list of dicts containing ``snippet`` or ``text`` fields
+    (search or get-document results)."""
+    if not isinstance(obj, list) or len(obj) == 0:
+        return False
+    return all(
+        isinstance(item, dict) and ("snippet" in item or "text" in item)
+        for item in obj
+    )
+
+
+def _fit_results_evenly(tok: Any, results: List[Dict[str, Any]], cap_tokens: int) -> str:
+    """Fit a list of search-result dicts under *cap_tokens* by truncating every
+    content field (``snippet`` / ``text``) proportionally, rather than dropping
+    tail items."""
+    n = len(results)
+
+    # ── Build a shell list with all content strings replaced by "" ──
+    shell_list: List[Dict[str, Any]] = []
+    for item in results:
+        shell: Dict[str, Any] = {}
+        for k, v in item.items():
+            if isinstance(v, str) and k in ("snippet", "text"):
+                shell[k] = ""
+            else:
+                shell[k] = v
+        shell_list.append(shell)
+
+    shell_toks = tool_content_token_len(
+        tok, json.dumps(shell_list, ensure_ascii=False)
+    )
+    budget = cap_tokens - shell_toks - _JSON_TOOL_SHELL_SLACK
+
+    if budget <= 0:
+        # Even the structural shell exceeds budget — must drop items
+        while len(results) > 1:
+            results.pop()
+            shell_list.pop()
+            shell_toks = tool_content_token_len(
+                tok, json.dumps(shell_list, ensure_ascii=False)
+            )
+            budget = cap_tokens - shell_toks - _JSON_TOOL_SHELL_SLACK
+            if budget > 0:
+                break
+        # For the last item, aggressively truncate its content field
+        if len(results) == 1 and budget <= 0:
+            item = results[0]
+            for k in ("snippet", "text"):
+                if k in item and isinstance(item[k], str) and item[k]:
+                    item[k] = item[k][:200] + _TOOL_TRUNC_MARKER
+                    break
+            return json.dumps(results, ensure_ascii=False)
+        if len(results) == 0:
+            return "[]"
+
+    # ── Collect content strings with their positions ──
+    # (item_idx, key, content_str)
+    content_entries: List[Tuple[int, str, str]] = []
+    for i, item in enumerate(results):
+        for key in ("snippet", "text"):
+            if key in item and isinstance(item[key], str) and item[key]:
+                content_entries.append((i, key, item[key]))
+                break  # one content field per item
+
+    if not content_entries:
+        return json.dumps(results, ensure_ascii=False)
+
+    # ── Distribute budget proportionally by current content length ──
+    total_chars = sum(len(s) for _, _, s in content_entries)
+    if total_chars == 0:
+        total_chars = 1  # avoid division by zero
+
+    for i, key, s in content_entries:
+        # Proportional budget, but at least 1 token per item
+        share = max(1, int(budget * len(s) / total_chars))
+        results[i][key] = truncate_utf8_prefix_to_token_budget(tok, s, share)
+
+    return json.dumps(results, ensure_ascii=False)
+
+
 def fit_tool_json_under_cap(tok: Any, obj: Any, cap_tokens: int) -> str:
     """Shrink parsed tool JSON so ``json.dumps(obj)`` uses at most ``cap_tokens`` tokens."""
 
@@ -75,6 +155,11 @@ def fit_tool_json_under_cap(tok: Any, obj: Any, cap_tokens: int) -> str:
         return best_cell
 
     obj = json.loads(json.dumps(obj))
+
+    # ── Early path: search-result lists → truncate snippets evenly ──
+    if _is_search_result_list(obj):
+        return _fit_results_evenly(tok, obj, cap_tokens)
+
     for _ in range(4096):
         ser = json.dumps(obj, ensure_ascii=False)
         total = tool_content_token_len(tok, ser)
@@ -91,8 +176,17 @@ def fit_tool_json_under_cap(tok: Any, obj: Any, cap_tokens: int) -> str:
                 obj.pop()
                 continue
             if isinstance(obj, list) and len(obj) == 1:
-                obj.pop()
-                return "[]"
+                # Never drop the last item — aggressively truncate it instead
+                item = obj[0]
+                if isinstance(item, dict):
+                    for k in list(item.keys()):
+                        if isinstance(item[k], str) and item[k]:
+                            item[k] = item[k][:200] + _TOOL_TRUNC_MARKER
+                            break
+                    else:
+                        obj.pop()
+                        return "[]"
+                continue
             cell = _longest_string_cell(obj)
             if cell is not None:
                 parent, key = cell
@@ -115,10 +209,21 @@ def fit_tool_json_under_cap(tok: Any, obj: Any, cap_tokens: int) -> str:
         parent[key] = truncate_utf8_prefix_to_token_budget(tok, s, max(1, room))
         ser2 = json.dumps(obj, ensure_ascii=False)
         if tool_content_token_len(tok, ser2) >= prev_total:
+            # Raw-token truncation didn't shrink the JSON-serialized form enough,
+            # usually due to JSON-escaping inflation (e.g. \n → \\n, \" → \\\").
+            # Retry with progressively smaller budgets rather than blanking.
             if isinstance(obj, list) and len(obj) > 1:
                 obj.pop()
                 continue
-            parent[key] = ""
+            for factor in (0.5, 0.25, 0.1, 0.05):
+                reduced = max(1, int(room * factor))
+                parent[key] = truncate_utf8_prefix_to_token_budget(tok, s, reduced)
+                ser3 = json.dumps(obj, ensure_ascii=False)
+                if tool_content_token_len(tok, ser3) < prev_total:
+                    break  # made progress
+            else:
+                # Extreme case — keep a minimal prefix rather than blank
+                parent[key] = truncate_utf8_prefix_to_token_budget(tok, s, 50)
     return json.dumps(obj, ensure_ascii=False)
 
 
@@ -138,7 +243,7 @@ def hard_truncate_tail_tool_messages(
     tail = list(reversed(tail))
     if not tail:
         return
-    cap_tokens = max(1, max_context // 4)
+    cap_tokens = max(1, max_context // 3)
 
     truncated_count = 0
     for m in tail:
@@ -157,7 +262,7 @@ def hard_truncate_tail_tool_messages(
         after = tool_content_token_len(tok, m["content"])
         truncated_count += 1
         prefix = f"  [truncate] {label}" if label else "  [truncate]"
-        print(f"{prefix} tool msg {before}→{after} tokens (cap={cap_tokens})", flush=True)
+        print(f"{prefix} tool result {before}→{after} tokens (cap={cap_tokens})", flush=True)
 
 
 def trajectory_stats(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
