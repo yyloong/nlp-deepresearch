@@ -450,11 +450,11 @@ class DeepResearchEnv:
         # 1. Append assistant message
         msg: Dict[str, Any] = dict(assistant_msg)
         msg.setdefault("role", "assistant")
-        if self.condense_thinking and "content" in msg:
+        if self.condense_thinking and isinstance(msg.get("content"), str):
             # Keep original (with thinking) in trajectory log
             inst.trajectory.append(copy.deepcopy(msg))
             msg["content"] = self._condense_think(msg["content"])
-        elif self.strip_thinking and "content" in msg:
+        elif self.strip_thinking and isinstance(msg.get("content"), str):
             # Keep original (with thinking) in trajectory log
             inst.trajectory.append(copy.deepcopy(msg))
             msg["content"] = self._strip_think(msg["content"])

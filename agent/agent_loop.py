@@ -51,57 +51,33 @@ DEFAULT_SYSTEM_PROMPT = """\
 You are a Deep Research Agent. Answer complex questions by searching a document corpus \
 using `search` and `get_document`. Every answer must be grounded in retrieved evidence.
 
-─── SELF-CHECK RULE (read carefully) ───
+**Important Rules:**
+1.You are allowed to call one tool per turn.
+2.search tool is used to get the relevant documents,and get_document tool is used to get the detailed information of the document.
 
-Before you output your final answer, you MUST complete the Self-Check section below. \
-Answer each item honestly as YES or NO with a short justification.
+You MUST work in the following order:
 
-**If any item is NO, you MUST continue searching instead of outputting an answer.** \
-The Self-Check is your own quality gate — it prevents premature answers.
+1. Search for specific entities (names, places, dates) rather than long descriptive phrases.
+2. After getting results, extract names/entities from them and use those for your next search.
+3. If a snippet looks even partially relevant, call get_document to read the full text.
+4. When a snippet looks even partially relevant, call get_document to read the full text.
+5. After get the detailed document, find key **relevant** information.
+6. Then if there are other documents that you haven't check detailedly, you should continue to search and get the detailed information.
+7.If you find all documents can not provided enough information,keep searching,refine your search query and consider if you can search from a different angle then rewrite your search query and for more useful documents again.
+8.The answer **MUST** match the question perfectly otherwise you should continue to search.
 
-─── ONE TOOL PER TURN (CRITICAL) ───
+You are not allowed to output the following content unless you are totally confident about your answer:
 
-You MUST call exactly ONE tool per turn. NEVER call both `search` and `get_document` in the
-same assistant message. Reasoning:
-• Calling multiple tools at once floods you with too much information at once, causing you
-  to miss critical details.
-• Call `search` first → review the snippets carefully → on your NEXT turn, pick the single
-  most promising docid and call `get_document` to read it in full.
-• Similarly, when you need multiple searches, do them one at a time, each in a separate turn.
-  Use the results of each search to inform your next query.
-
-─── SEARCH TIPS ───
-
-• Search for specific entities (names, places, dates) rather than long descriptive phrases.
-• After getting results, extract names/entities from them and use those for your next search.
-• If a snippet looks even partially relevant, call get_document to read the full text.
-
-─── TOOLS ───
-
-• `search(query)` → returns [{docid, score, snippet}]
-• `get_document(docid)` → returns full document text
-
-─── ANSWER FORMAT ───
-
-Self-Check:
-  [READ]      YES/NO — Did I read the full text of any document via get_document?
-  [ANGLES]    YES/NO — Did I try multiple different search angles (not just rephrase)?
-  [CHAIN]     YES/NO — Did I use entities found in results to guide my next searches?
-  [GROUNDED]  YES/NO — Is every factual statement in my answer directly supported by \
-text retrieved through tools (not inference, not prior knowledge)?
-  [QUOTABLE]  YES/NO — For each claim in my answer, can I point to a specific docid \
-and quote the exact sentence that supports it?
-  [EXHAUST]   YES/NO — (only if you cannot find the answer) Did I search for different \
-clues from the question before concluding evidence is insufficient?
-
+**I am sure that the answer is totally correct,and the evidence is**
+evidence:
 Evidence Mapping (list each claim and its source):
   Claim 1: <what I assert>
     → Source: docid=<X>, quote="<exact supporting text from the document>"
   Claim 2: ...
   (add more claims as needed)
-
+answer:
 Explanation: <step-by-step reasoning, citing docids for each claim>
-Exact Answer: <concise final answer>\
+Exact Answer: <concise final answer>
 """
 
 # ── Context condensation ──────────────────────
@@ -357,7 +333,7 @@ async def run_agent_with_env(
                         f"{last.get('role') if isinstance(last, dict) else last!r}; "
                         "expected tool messages at tail after env.step — this should not happen."
                     )
-                hard_truncate_tail_tool_messages(_tok, msgs, max_context)
+                hard_truncate_tail_tool_messages(_tok, msgs, max_context, label=f"instance {idx}")
                 used_after = count_tokens_messages(_tok, msgs)
 
                 # If truncation alone brought us back under threshold, skip condensation
@@ -566,7 +542,7 @@ async def run_agent_router(
             if not is_tool_tail:
                 return msgs  # don't condense if tail isn't tool messages
 
-            hard_truncate_tail_tool_messages(_tok, msgs, max_context)
+            hard_truncate_tail_tool_messages(_tok, msgs, max_context, label=f"instance {idx}")
             used_after = count_tokens_messages(_tok, msgs)
             if used_after <= max_context // 2:
                 return msgs  # truncation sufficed
@@ -689,7 +665,7 @@ async def _run_one_question_async(
             last = obs[-1] if obs else None
             is_tool_tail = last is not None and last.get("role") == "tool"
             if is_tool_tail:
-                hard_truncate_tail_tool_messages(_tok, obs, max_context)
+                hard_truncate_tail_tool_messages(_tok, obs, max_context, label=f"slot {slot_id}")
                 used_after = count_tokens_messages(_tok, obs)
                 if used_after > max_context // 2:
                     condensed = await _condense_context(
@@ -910,6 +886,7 @@ Examples:
     p.add_argument("--no-eval", action="store_true", help="跳过评估")
     p.add_argument("--no-strip-thinking", action="store_true", help="保留 <think> 块在上下文中（默认 strip）")
     p.add_argument("--condense-thinking", action="store_true", help="压缩 <think> 块为简洁的计划摘要而非完全 strip（保留核心目的和规划）")
+    p.add_argument("--no-think", action="store_true", help="禁用模型 thinking 模式（通过 extra_payload 传入 chat_template_kwargs）")
     p.add_argument("--tokenizer-path", default="Qwen/Qwen3-8B", help="Tokenizer 模型路径（用于精确 token 计数）")
     return p
 
@@ -923,10 +900,16 @@ async def _main_async(args: argparse.Namespace) -> None:
         )
 
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    submission_path = str(output_dir / f"submission_{ts}.jsonl")
-    eval_path = str(output_dir / f"eval_{ts}.jsonl")
+    run_dir = output_dir / f"run_{ts}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    submission_path = str(run_dir / "submission.jsonl")
+    eval_path = str(run_dir / "eval.jsonl")
+
+    # ── 构建 extra_payload ──
+    extra_payload: Optional[Dict[str, Any]] = None
+    if args.no_think:
+        extra_payload = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
 
     # ── 1. 生成轨迹 ──
     t0 = time.time()
@@ -944,6 +927,7 @@ async def _main_async(args: argparse.Namespace) -> None:
         max_context=args.max_context,
         search_k=args.search_k,
         snippet_max_chars=args.snippet_max_chars,
+        extra_payload=extra_payload,
         limit=args.limit,
         strip_thinking=not args.no_strip_thinking,
         condense_thinking=args.condense_thinking,
@@ -966,7 +950,7 @@ async def _main_async(args: argparse.Namespace) -> None:
         api_key=args.api_key,
         eval_batch_size=args.eval_batch_size,
         temperature=0.0,
-        max_tokens=256,
+        max_tokens=8192,
         output_path=eval_path,
     )
     eval_time = time.time() - t0
@@ -979,12 +963,48 @@ async def _main_async(args: argparse.Namespace) -> None:
     print(f"Avg retrieved docs/query: {summary['avg_retrieved_docs_per_query']}")
     print(f"{'='*50}")
 
-    # 错误案例
-    errors = [d for d in details if d["eval_judgment"] == "INCORRECT"]
-    if errors:
-        print(f"\nIncorrect ({len(errors)}):")
-        for d in errors[:10]:
-            print(f"  [{d['query_id']}] pred={d['predicted_answer'][:80]}...")
+    # ── 4. 拆分保存 correct / incorrect ──
+    eval_map = {d["query_id"]: d["eval_judgment"] for d in details}
+    correct_records = [r for r in records if eval_map.get(r["query_id"]) == "CORRECT"]
+    incorrect_records = [r for r in records if eval_map.get(r["query_id"]) == "INCORRECT"]
+
+    # 轨迹
+    correct_path = run_dir / "correct.json"
+    incorrect_path = run_dir / "incorrect.json"
+    with correct_path.open("w", encoding="utf-8") as f:
+        for rec in correct_records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    with incorrect_path.open("w", encoding="utf-8") as f:
+        for rec in incorrect_records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    # eval 评估详情
+    eval_correct = [d for d in details if d["eval_judgment"] == "CORRECT"]
+    eval_incorrect = [d for d in details if d["eval_judgment"] == "INCORRECT"]
+    eval_correct_path = run_dir / "eval_correct.json"
+    eval_incorrect_path = run_dir / "eval_incorrect.json"
+    with eval_correct_path.open("w", encoding="utf-8") as f:
+        for d in eval_correct:
+            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+    with eval_incorrect_path.open("w", encoding="utf-8") as f:
+        for d in eval_incorrect:
+            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+    print(f"\nSaved: {len(correct_records)} correct → {correct_path}")
+    print(f"Saved: {len(incorrect_records)} incorrect → {incorrect_path}")
+    print(f"Saved: {len(eval_correct)} eval correct → {eval_correct_path}")
+    print(f"Saved: {len(eval_incorrect)} eval incorrect → {eval_incorrect_path}")
+
+    # 错误案例摘要
+    if incorrect_records:
+        print(f"\nIncorrect ({len(incorrect_records)}):")
+        for d in details:
+            if d["eval_judgment"] == "INCORRECT":
+                print(f"  [{d['query_id']}] pred={d['predicted_answer'][:80]}...")
+                if len([x for x in details if x['eval_judgment']=='INCORRECT']) > 10:
+                    if d == [x for x in details if x['eval_judgment']=='INCORRECT'][9]:
+                        print(f"  ... and {len(incorrect_records)-10} more")
+                        break
 
 
 def main():

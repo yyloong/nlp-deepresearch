@@ -25,6 +25,7 @@ MAX_TOKENS="${MAX_TOKENS:-10240}"
 MAX_TOOL_CALLS="${MAX_TOOL_CALLS:-1}"
 SEARCH_K="${SEARCH_K:-5}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
+NO_THINK="${NO_THINK:-0}"
 
 # ── 清理代理变量（vLLM 在 localhost，不能走 proxy）──
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
@@ -65,6 +66,11 @@ echo
 
 cd "${ROOT}"
 
+NO_THINK_FLAG=()
+if [[ -n "${NO_THINK}" && "${NO_THINK}" != "0" && "${NO_THINK}" != "false" ]]; then
+    NO_THINK_FLAG=(--no-think)
+fi
+
 exec python -m agent.agent_loop \
     --dataset "${DATASET}" \
     --index-path "${INDEX_PATH}" \
@@ -77,5 +83,6 @@ exec python -m agent.agent_loop \
     --max-tool-calls-per-turn "${MAX_TOOL_CALLS}" \
     --search-k "${SEARCH_K}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
-    --condense-thinking
+    --condense-thinking \
+    "${NO_THINK_FLAG[@]}" \
     "$@"

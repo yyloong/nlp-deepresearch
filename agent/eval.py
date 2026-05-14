@@ -33,10 +33,21 @@ from .vllm_client import VLLMClient
 
 
 # ── Eval prompt ──────────────────────────────────────────────
-EVAL_SYSTEM_PROMPT = """You are an expert evaluator for question-answering systems.
-Your task is to judge whether a predicted answer is semantically equivalent to the gold (reference) answer.
+EVAL_SYSTEM_PROMPT = """You are an expert evaluator for a document-retrieval question-answering system.
+The system searches a document corpus to answer complex questions. The "gold answer" IS the correct
+answer that CAN be found through searching the corpus. Your task is to judge whether a predicted
+answer is semantically equivalent to the gold answer.
 
-Rules:
+CRITICAL RULES:
+- The gold answer is the ground truth — if the predicted answer differs from it, the prediction is WRONG.
+- If the predicted answer says anything like "cannot be determined", "insufficient evidence",
+  "not explicitly named", "not present in the documents", "information is insufficient",
+  "cannot be answered", or any similar statement that declines to answer, it is ALWAYS INCORRECT
+  (because the gold answer proves that a specific answer does exist in the corpus).
+- Do NOT reason about whether the question itself contains enough information — the task
+  is to retrieve the answer from documents, not from the question text.
+
+Standard matching rules:
 - Ignore case differences, punctuation variations, and extra whitespace.
 - Treat abbreviations and full forms as equivalent (e.g., "US" = "United States").
 - If the predicted answer contains the gold answer as a substring (or vice versa) and the extra content does not change the meaning, treat as CORRECT.
@@ -137,7 +148,7 @@ def run_evaluation(
     api_key: str = "dummy",
     output_path: Optional[str] = None,
     temperature: float = 0.0,
-    max_tokens: int = 256,
+    max_tokens: int = 4096,
     verbose: bool = True,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
@@ -301,7 +312,7 @@ def main():
     parser.add_argument("--api-key", default="dummy", help="API key")
     parser.add_argument("--output", default=None, help="评估结果输出路径")
     parser.add_argument("--temperature", type=float, default=0.0, help="评估模型 temperature")
-    parser.add_argument("--max-tokens", type=int, default=256, help="评估模型 max_tokens")
+    parser.add_argument("--max-tokens", type=int, default=4096, help="评估模型 max_tokens")
     args = parser.parse_args()
 
     if args.output is None:

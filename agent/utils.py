@@ -126,6 +126,7 @@ def hard_truncate_tail_tool_messages(
     tok: Any,
     messages: List[Dict[str, Any]],
     max_context: int,
+    label: str = "",
 ) -> None:
     """Mutates trailing consecutive ``role==tool`` messages in place (see agent loop)."""
     tail: List[Dict[str, Any]] = []
@@ -139,11 +140,13 @@ def hard_truncate_tail_tool_messages(
         return
     cap_tokens = max(1, max_context // 4)
 
+    truncated_count = 0
     for m in tail:
         c = m.get("content")
         if not isinstance(c, str):
             continue
-        if tool_content_token_len(tok, c) <= cap_tokens:
+        before = tool_content_token_len(tok, c)
+        if before <= cap_tokens:
             continue
         try:
             parsed = json.loads(c)
@@ -151,6 +154,10 @@ def hard_truncate_tail_tool_messages(
             m["content"] = truncate_utf8_prefix_to_token_budget(tok, c, cap_tokens)
         else:
             m["content"] = fit_tool_json_under_cap(tok, parsed, cap_tokens)
+        after = tool_content_token_len(tok, m["content"])
+        truncated_count += 1
+        prefix = f"  [truncate] {label}" if label else "  [truncate]"
+        print(f"{prefix} tool msg {before}→{after} tokens (cap={cap_tokens})", flush=True)
 
 
 def trajectory_stats(messages: List[Dict[str, Any]]) -> Dict[str, Any]:

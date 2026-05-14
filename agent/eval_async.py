@@ -21,7 +21,7 @@ async def evaluate_trajectories(
     api_key: str = "dummy",
     eval_batch_size: int = 16,
     temperature: float = 0.0,
-    max_tokens: int = 256,
+    max_tokens: int = 4096,
     output_path: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Parallel eval over ``records`` using ``asyncio.gather``."""
