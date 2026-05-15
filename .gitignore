@@ -6,3 +6,5 @@ indexes/*.sqlite-shm
 indexes/*.sqlite-wal
 
 __pycache__/
+*.pyc
+**/__pycache__/
