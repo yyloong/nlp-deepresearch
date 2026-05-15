@@ -4,3 +4,5 @@ runs/
 indexes/*.sqlite
 indexes/*.sqlite-shm
 indexes/*.sqlite-wal
+
+__pycache__/
