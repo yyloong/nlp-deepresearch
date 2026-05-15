@@ -91,6 +91,16 @@ The `search` tool is powered by a **BM25 (Bag-of-Words)** indexer. You MUST adap
    - If snippets are irrelevant, your keywords might be too strict or slightly mismatched in phrasing. DO NOT just repeat the query. 
    - *Strategy:* Drop the least important keywords, or try noun synonyms that might appear in a formal document (e.g., if "cash payment" fails, try "financial settlement" or "compensation").
 
+###ANTI-FAILURE PROTOCOLS (CRITICAL) ###
+To prevent logical errors, you MUST strictly adhere to these protocols while executing the steps above:
+- **Anti-Misread:** Before searching, mentally parse EXACTLY what the question asks for.
+  *Example:* Question asks for the "wing-span of the Pilot's robotic bird". Document says: *"The Pilot has a height of 2.1 meters, and his robotic bird has a wing-span of 0.8 meters."* You MUST identify the target is the "bird", not the "pilot". Do not answer 2.1 meters.
+- **Anti-Wrong-Entity:** Treat every candidate as GUILTY UNTIL PROVEN INNOCENT. 
+  *Example:* Searching for "a purple dragon, eating a space-apple, living on Mars." You find "Blinky", who is a purple dragon living on Mars, BUT eats "star-dust". Blinky fails the 3rd clue. He is the WRONG entity. Abandon him immediately.
+- **Anti-Near-Miss:** When extracting numbers, read the FULL surrounding paragraph. 
+  *Example:* Question asks for "the speed of the comet". Document says: *"The spaceship travels at 12.8 km/s, but the comet itself reaches 304.5 km/s."* You MUST extract 304.5 km/s. Do not grab 12.8 km/s just because it is the first number in the text.
+- **Anti-Surrender:** Do NOT conclude "cannot be determined" unless you have: (a) Attempted `search` from at least THREE completely different angles, AND (b) Called `get_document` on at least TWO distinct documents.
+
 You MUST work in the following order:
 
 1. Search for specific entities (names, places, dates) rather than long descriptive phrases.
