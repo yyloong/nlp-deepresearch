@@ -274,6 +274,9 @@ async def run_agent_with_env(
             tool_calls = resp.get("tool_calls")
             idx = indices[i]
             if is_truncated_think_response(content, tool_calls):
+                # Record truncated response + nudge in trajectory (model saw these)
+                env.append_to_trajectory(idx, resp)
+                env.append_to_trajectory(idx, {"role": "user", "content": RETRY_NUDGE})
                 msgs = list(obs[idx]) if obs[idx] is not None else []
                 msgs.append(resp)  # keep truncated message in history
                 msgs.append({
@@ -314,6 +317,8 @@ async def run_agent_with_env(
                 if not all_errors:
                     break
 
+                # Record the failed response + error nudge in trajectory
+                env.append_to_trajectory(idx, resp)
                 # 构建带错误信息的 nudge
                 msgs = list(obs[idx]) if obs[idx] is not None else []
                 msgs.append(resp)  # 失败的那条 assistant 消息
@@ -329,6 +334,7 @@ async def run_agent_with_env(
                     "with valid arguments."
                 )
                 msgs.append({"role": "user", "content": nudge})
+                env.append_to_trajectory(idx, {"role": "user", "content": nudge})
 
                 print(
                     f"  [tool-retry] instance {idx} attempt {retry_num + 1}/{MAX_TOOL_RETRIES}: "
@@ -384,6 +390,8 @@ async def run_agent_with_env(
                         "expected tool messages at tail after env.step — this should not happen."
                     )
                 hard_truncate_tail_tool_messages(_tok, msgs, max_context, label=f"instance {idx}")
+                # Sync trajectory tool messages with truncated versions
+                env.sync_trajectory_tool_tail(idx)
                 used_after = count_tokens_messages(_tok, msgs)
 
                 # If truncation alone brought us back under threshold, skip condensation
@@ -411,6 +419,7 @@ async def run_agent_with_env(
                     _tok, msgs, client, model, temperature, max_tokens, max_context, extra_payload,
                 )
                 env.set_messages(idx, condensed)
+                env.replace_trajectory(idx, condensed)
                 return condensed
             return msgs
 
@@ -509,6 +518,9 @@ async def run_agent_router(
             tool_calls = resp.get("tool_calls")
             idx = indices[i]
             if is_truncated_think_response(content, tool_calls):
+                # Record truncated response + nudge in trajectory (model saw these)
+                env.append_to_trajectory(idx, resp)
+                env.append_to_trajectory(idx, {"role": "user", "content": RETRY_NUDGE})
                 msgs = list(obs[idx]) if obs[idx] is not None else []
                 msgs.append(resp)  # keep truncated message in history
                 msgs.append({"role": "user", "content": RETRY_NUDGE})
@@ -537,6 +549,8 @@ async def run_agent_router(
                         })
                 if not all_errors:
                     break
+                # Record the failed response + error nudge in trajectory
+                env.append_to_trajectory(idx, resp)
                 msgs = list(obs[idx]) if obs[idx] is not None else []
                 msgs.append(resp)
                 error_lines = [f"- `{e['tool_name']}`: {e['message']}" for e in all_errors]
@@ -546,6 +560,7 @@ async def run_agent_router(
                     + "\n\nPlease correct the error(s) and try again."
                 )
                 msgs.append({"role": "user", "content": nudge})
+                env.append_to_trajectory(idx, {"role": "user", "content": nudge})
                 retry_raw = await client.simple_chat(
                     model=model, messages=msgs,
                     temperature=temperature, max_tokens=max_tokens,
@@ -594,6 +609,8 @@ async def run_agent_router(
                 return msgs  # don't condense if tail isn't tool messages
 
             hard_truncate_tail_tool_messages(_tok, msgs, max_context, label=f"instance {idx}")
+            # Sync trajectory tool messages with truncated versions
+            env.sync_trajectory_tool_tail(idx)
             used_after = count_tokens_messages(_tok, msgs)
             if used_after <= max_context // 2:
                 return msgs  # truncation sufficed
@@ -602,6 +619,7 @@ async def run_agent_router(
                 _tok, msgs, client, model, temperature, max_tokens, max_context, extra_payload,
             )
             env.set_messages(idx, condensed)
+            env.replace_trajectory(idx, condensed)
             return condensed
 
         obs = await asyncio.gather(*[
@@ -659,6 +677,9 @@ async def _run_one_question_async(
         content = resp.get("content", "") or ""
         tc = resp.get("tool_calls")
         if is_truncated_think_response(content, tc):
+            # Record the truncated response + nudge in trajectory (model saw these)
+            env.append_to_trajectory(slot_id, resp)
+            env.append_to_trajectory(slot_id, {"role": "user", "content": RETRY_NUDGE})
             msgs = list(obs) + [resp, {"role": "user", "content": RETRY_NUDGE}]
             raw = await client.simple_chat(
                 model=model, messages=msgs,
@@ -681,14 +702,16 @@ async def _run_one_question_async(
                         })
                 if not all_errors:
                     break
-                msgs = list(obs) + [resp]
+                # Record the failed response + error nudge in trajectory
+                env.append_to_trajectory(slot_id, resp)
                 error_lines = [f"- `{e['tool_name']}`: {e['message']}" for e in all_errors]
                 nudge = (
                     "Your tool call(s) failed validation:\n\n"
                     + "\n".join(error_lines)
                     + "\n\nPlease correct the error(s) and try again."
                 )
-                msgs.append({"role": "user", "content": nudge})
+                env.append_to_trajectory(slot_id, {"role": "user", "content": nudge})
+                msgs = list(obs) + [resp, {"role": "user", "content": nudge}]
                 raw = await client.simple_chat(
                     model=model, messages=msgs,
                     temperature=temperature, max_tokens=max_tokens,
@@ -717,6 +740,8 @@ async def _run_one_question_async(
             is_tool_tail = last is not None and last.get("role") == "tool"
             if is_tool_tail:
                 hard_truncate_tail_tool_messages(_tok, obs, max_context, label=f"slot {slot_id}")
+                # Sync trajectory tool messages with truncated versions
+                env.sync_trajectory_tool_tail(slot_id)
                 used_after = count_tokens_messages(_tok, obs)
                 if used_after > max_context // 2:
                     condensed = await _condense_context(
@@ -724,6 +749,7 @@ async def _run_one_question_async(
                         max_tokens, max_context, extra_payload,
                     )
                     env.set_messages(slot_id, condensed)
+                    env.replace_trajectory(slot_id, condensed)
                     obs = condensed
 
     # ── Report result ──

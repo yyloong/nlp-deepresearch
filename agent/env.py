@@ -319,14 +319,17 @@ class DeepResearchEnv:
             # 1. Append the assistant message to conversation
             assistant_msg: Dict[str, Any] = dict(action)
             assistant_msg.setdefault("role", "assistant")
-            if self.condense_thinking and "content" in assistant_msg:
-                # Keep original (with thinking) in trajectory log
-                inst.trajectory.append(copy.deepcopy(assistant_msg))
-                assistant_msg["content"] = self._condense_think(assistant_msg["content"])
-            elif self.strip_thinking and "content" in assistant_msg:
-                # Keep original (with thinking) in trajectory log
-                inst.trajectory.append(copy.deepcopy(assistant_msg))
-                assistant_msg["content"] = self._strip_think(assistant_msg["content"])
+            original_content = assistant_msg.get("content", "")
+            if self.condense_thinking and isinstance(original_content, str) and original_content:
+                assistant_msg["content"] = self._condense_think(original_content)
+                traj_msg = copy.deepcopy(assistant_msg)
+                traj_msg["_original_content"] = original_content  # preserve for debugging
+                inst.trajectory.append(traj_msg)
+            elif self.strip_thinking and isinstance(original_content, str) and original_content:
+                assistant_msg["content"] = self._strip_think(original_content)
+                traj_msg = copy.deepcopy(assistant_msg)
+                traj_msg["_original_content"] = original_content  # preserve for debugging
+                inst.trajectory.append(traj_msg)
             else:
                 inst.trajectory.append(copy.deepcopy(assistant_msg))
             inst.messages.append(assistant_msg)
@@ -450,14 +453,17 @@ class DeepResearchEnv:
         # 1. Append assistant message
         msg: Dict[str, Any] = dict(assistant_msg)
         msg.setdefault("role", "assistant")
-        if self.condense_thinking and isinstance(msg.get("content"), str):
-            # Keep original (with thinking) in trajectory log
-            inst.trajectory.append(copy.deepcopy(msg))
-            msg["content"] = self._condense_think(msg["content"])
-        elif self.strip_thinking and isinstance(msg.get("content"), str):
-            # Keep original (with thinking) in trajectory log
-            inst.trajectory.append(copy.deepcopy(msg))
-            msg["content"] = self._strip_think(msg["content"])
+        original_content = msg.get("content", "")
+        if self.condense_thinking and isinstance(original_content, str) and original_content:
+            msg["content"] = self._condense_think(original_content)
+            traj_msg = copy.deepcopy(msg)
+            traj_msg["_original_content"] = original_content  # preserve for debugging
+            inst.trajectory.append(traj_msg)
+        elif self.strip_thinking and isinstance(original_content, str) and original_content:
+            msg["content"] = self._strip_think(original_content)
+            traj_msg = copy.deepcopy(msg)
+            traj_msg["_original_content"] = original_content  # preserve for debugging
+            inst.trajectory.append(traj_msg)
         else:
             inst.trajectory.append(copy.deepcopy(msg))
         inst.messages.append(msg)
@@ -693,6 +699,35 @@ class DeepResearchEnv:
     def set_messages(self, instance_id: int, messages: List[Dict[str, Any]]) -> None:
         """Replace conversation history for an instance (used after condensation)."""
         self._instances[instance_id].messages = messages
+
+    def append_to_trajectory(self, instance_id: int, msg: Dict[str, Any]) -> None:
+        """Append a message to the instance's trajectory log.
+
+        Used during retry loops (think truncation nudge, tool validation errors)
+        to keep the trajectory aligned with what the model actually saw.
+        """
+        self._instances[instance_id].trajectory.append(copy.deepcopy(msg))
+
+    def replace_trajectory(self, instance_id: int, trajectory: List[Dict[str, Any]]) -> None:
+        """Replace the entire trajectory for an instance (used after condensation)."""
+        self._instances[instance_id].trajectory = trajectory
+
+    def sync_trajectory_tool_tail(self, instance_id: int) -> None:
+        """Copy truncated tool message contents from messages to trajectory.
+
+        Called after ``hard_truncate_tail_tool_messages`` mutates
+        ``inst.messages`` in place, to keep the trajectory aligned with
+        what the model actually sees.
+        """
+        inst = self._instances[instance_id]
+        msgs = inst.messages
+        traj = inst.trajectory
+        # Walk from the end, syncing consecutive tool messages
+        for i in range(len(traj) - 1, -1, -1):
+            if traj[i].get("role") != "tool":
+                break
+            if i < len(msgs) and msgs[i].get("role") == "tool":
+                traj[i]["content"] = msgs[i]["content"]
 
     def reset_slot(self, slot_id: int, question: str) -> List[Dict[str, Any]]:
         """Reset a single slot with a new question (for router-based scheduling).
