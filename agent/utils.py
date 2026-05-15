@@ -327,10 +327,10 @@ def is_truncated_think_response(
 
 
 RETRY_NUDGE = (
-    "Your previous response was truncated before you could call any tools. "
-    "You MUST call the `search` tool NOW. Do NOT write a long analysis — "
-    "just pick the most important clue from the question and search for it. "
-    "Be concise: 1-2 sentences of planning, then call the tool."
+    "Your previous response was truncated because it was too long. "
+    "Please do NOT overthink or write overly long analysis. "
+    "Keep your reasoning concise and get to the point quickly. "
+    "If you need to use tools, do so without excessive planning."
 )
 
 

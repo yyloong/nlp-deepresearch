@@ -275,6 +275,7 @@ async def run_agent_with_env(
             idx = indices[i]
             if is_truncated_think_response(content, tool_calls):
                 msgs = list(obs[idx]) if obs[idx] is not None else []
+                msgs.append(resp)  # keep truncated message in history
                 msgs.append({
                     "role": "user",
                     "content": RETRY_NUDGE,
@@ -290,7 +291,7 @@ async def run_agent_with_env(
                 )
                 retry_resp = retry_raw["choices"][0]["message"]
                 responses[i] = retry_resp
-                print(f"  [retry] instance {idx}: truncated think detected, nudging model to call tools", flush=True)
+                print(f"  [retry] instance {idx}: truncated think detected, nudging model to continue", flush=True)
 
         # 1.6 工具调用校验 + 重试（检测未知工具名 / 缺失必填参数，省一轮 turn）
         for i in range(len(responses)):
@@ -509,6 +510,7 @@ async def run_agent_router(
             idx = indices[i]
             if is_truncated_think_response(content, tool_calls):
                 msgs = list(obs[idx]) if obs[idx] is not None else []
+                msgs.append(resp)  # keep truncated message in history
                 msgs.append({"role": "user", "content": RETRY_NUDGE})
                 retry_raw = await client.simple_chat(
                     model=model, messages=msgs,
@@ -657,7 +659,7 @@ async def _run_one_question_async(
         content = resp.get("content", "") or ""
         tc = resp.get("tool_calls")
         if is_truncated_think_response(content, tc):
-            msgs = list(obs) + [{"role": "user", "content": RETRY_NUDGE}]
+            msgs = list(obs) + [resp, {"role": "user", "content": RETRY_NUDGE}]
             raw = await client.simple_chat(
                 model=model, messages=msgs,
                 temperature=temperature, max_tokens=max_tokens,
