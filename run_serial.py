@@ -81,9 +81,10 @@ async def process_one_question(
     max_context: int,
     extra_payload: Optional[Dict[str, Any]],
     max_tool_calls_per_turn: int = 1,
-) -> List[Dict[str, Any]]:
-    """Run one question to completion on slot 0, returning the trajectory."""
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Run one question to completion on slot 0, returning (trajectory, finish_reason)."""
     obs: List[Dict[str, Any]] = env.reset_slot(0, question)
+    finish_reason = "max_turns"  # default if loop exhausts without break
 
     for turn in range(env.max_turns):
         # ── 1. Model call ──
@@ -102,7 +103,10 @@ async def process_one_question(
         content = resp.get("content", "") or ""
         tc = resp.get("tool_calls")
         if is_truncated_think_response(content, tc):
-            msgs = list(obs) + [{"role": "user", "content": RETRY_NUDGE}]
+            # Record the truncated response + nudge in trajectory (model saw these)
+            env.append_to_trajectory(0, resp)
+            env.append_to_trajectory(0, {"role": "user", "content": RETRY_NUDGE})
+            msgs = list(obs) + [resp, {"role": "user", "content": RETRY_NUDGE}]
             raw = await client.simple_chat(
                 model=model, messages=msgs,
                 temperature=temperature, max_tokens=max_tokens,
@@ -126,6 +130,8 @@ async def process_one_question(
                 if not all_errors:
                     break
 
+                # Record the failed response + error nudge in trajectory
+                env.append_to_trajectory(0, resp)
                 msgs = list(obs) + [resp]
                 error_lines = [f"- `{e['tool_name']}`: {e['message']}" for e in all_errors]
                 nudge = (
@@ -134,6 +140,7 @@ async def process_one_question(
                     + "\n\nPlease correct the error(s) and try again."
                 )
                 msgs.append({"role": "user", "content": nudge})
+                env.append_to_trajectory(0, {"role": "user", "content": nudge})
                 print(
                     f"    [retry-tool] attempt {retry_num + 1}/{MAX_TOOL_RETRIES}: "
                     f"{len(all_errors)} error(s)",
@@ -157,6 +164,9 @@ async def process_one_question(
         # ── 5. Execute tools via env.step_single ──
         obs, done = env.step_single(0, resp)
         if done:
+            # Determine finish reason from the final response
+            tc_final = resp.get("tool_calls")
+            finish_reason = "max_turns" if (tc_final and len(tc_final) > 0) else "no_tool_calls"
             break
 
         # ── 6. Context condensation ──
@@ -167,6 +177,8 @@ async def process_one_question(
                 hard_truncate_tail_tool_messages(
                     _tok, obs, max_context, label=f"turn {turn + 1}",
                 )
+                # Sync trajectory tool messages with truncated versions
+                env.sync_trajectory_tool_tail(0)
                 used_after = count_tokens_messages(_tok, obs)
                 if used_after > max_context // 2:
                     condensed = await _condense_context(
@@ -174,9 +186,10 @@ async def process_one_question(
                         max_tokens, max_context, extra_payload,
                     )
                     env.set_messages(0, condensed)
+                    env.replace_trajectory(0, condensed)
                     obs = condensed
 
-    return env.extract_slot_trajectory(0)
+    return env.extract_slot_trajectory(0), finish_reason
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -281,7 +294,7 @@ async def _main_async(args: argparse.Namespace) -> None:
             question = row["query"]
             t0 = time.time()
 
-            traj = await process_one_question(
+            traj, finish_reason = await process_one_question(
                 env=env,
                 client=client,
                 model=args.model,
@@ -297,7 +310,7 @@ async def _main_async(args: argparse.Namespace) -> None:
             answer = extract_final_answer(traj) or ""
             records.append({
                 "query_id": qid,
-                "status": "completed",
+                "status": finish_reason,
                 "predicted_answer": answer,
                 "messages": traj,
             })

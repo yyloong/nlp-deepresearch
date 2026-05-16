@@ -688,6 +688,7 @@ async def _run_one_question_async(
             )
             resp = raw["choices"][0]["message"]
             tc = resp.get("tool_calls")
+            print(f"  [retry] slot {slot_id}: truncated think detected, nudging model to continue", flush=True)
 
         # ── Tool validation retry ──
         if tc:
@@ -899,9 +900,16 @@ async def generate_trajectories(
 
         for row, traj in zip(rows, trajs):
             answer = extract_final_answer(traj) or ""
+            # Infer finish reason from trajectory
+            finish_reason = "unknown"
+            for m in reversed(traj):
+                if m.get("role") == "assistant":
+                    tc = m.get("tool_calls")
+                    finish_reason = "max_turns" if (tc and len(tc) > 0) else "no_tool_calls"
+                    break
             records.append({
                 "query_id": row["query_id"],
-                "status": "completed",
+                "status": finish_reason,
                 "predicted_answer": answer,
                 "messages": traj,
             })
