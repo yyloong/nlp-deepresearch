@@ -83,6 +83,5 @@ exec python -m agent.agent_loop \
     --max-tool-calls-per-turn "${MAX_TOOL_CALLS}" \
     --search-k "${SEARCH_K}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
-    --condense-thinking \
     "${NO_THINK_FLAG[@]}" \
     "$@"
