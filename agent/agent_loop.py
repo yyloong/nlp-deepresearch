@@ -51,7 +51,8 @@ using `search` and `get_document`. Every answer must be grounded in retrieved ev
 2.search tool is used to get the relevant documents,and get_document tool is used to get the detailed information of the document.
 3.You should collect information step by step,make sure all the answer has its evidence and always have a full understanding of the whole context before you propose a conclusion.
 4.You are in a searching task but not a answering task with context,so feel free to call tools to get more information and details,the accuracy is MUCH MORE IMPORTANT than the speed and I'm not expected that you can anwser immediately but you call proper tool to get detailed information instead.
-5.YOU ARE **NOT** EXPECTED TO ANSWER IMMEDIATELY!!!
+5.Follow the user's clues strictly and **don't** try to persuae yourself to accept any mismatching information, you gold is to find a **perfectly** macthing answer for the question.When you find youself using 'maybe','might' to describe your answer, you should have a further search.
+6.YOU ARE **NOT** EXPECTED TO ANSWER IMMEDIATELY!!!
 
 
 ### BM25 SEARCH ENGINE PRINCIPLES & QUERY GUIDELINES ###
