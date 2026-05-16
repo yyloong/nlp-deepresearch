@@ -327,10 +327,8 @@ def is_truncated_think_response(
 
 
 RETRY_NUDGE = (
-    "Your previous response was truncated because it was too long. "
-    "Please do NOT overthink or write overly long analysis. "
-    "Keep your reasoning concise and get to the point quickly. "
-    "If you need to use tools, do so without excessive planning."
+    "You appear to be stuck in a repetitive reasoning loop. "
+    "Try to think in a different way"
 )
 
 

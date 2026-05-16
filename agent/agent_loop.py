@@ -1,10 +1,7 @@
 """
 Deep Research Agent Loop
 
-支持两种模式：
-1. 经典模式：run_agent_loop / run_agent — 内部管理模型调用和工具执行。
-2. 环境模式：run_agent_with_env — 使用 DeepResearchEnv 解耦模型推理和工具执行，
-   适配 RL 训练框架。
+Async per-slot router — 每个 env slot 独立协程，一问结束立刻补下一问。
 
 一键执行：python -m agent.agent_loop --dataset ... --index-path ... --model ...
 """
@@ -29,10 +26,8 @@ _tok: Any = AutoTokenizer.from_pretrained(
     _TOKENIZER_PATH, trust_remote_code=True, local_files_only=True,
 )
 
-from .browsecomp_searcher import BrowseCompBM25Searcher
 from .env import DeepResearchEnv
 from .eval_async import evaluate_trajectories
-from .tools import build_searcher, get_agent_tool_specs_and_registry
 from .utils import (
     RETRY_NUDGE,
     count_tokens_messages,
@@ -223,414 +218,6 @@ async def _condense_context(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Env-based agent loop (模型推理与工具执行解耦)
-# ═══════════════════════════════════════════════════════════════
-
-async def run_agent_with_env(
-    env: DeepResearchEnv,
-    client: VLLMClientAsync,
-    model: str,
-    questions: List[str],
-    max_context: int = 40960,
-    max_tokens: int = 4096,
-    temperature: float = 0.0,
-    extra_payload: Optional[Dict[str, Any]] = None,
-    max_tool_calls_per_turn: int = 1,
-) -> List[List[Dict[str, Any]]]:
-    """使用 DeepResearchEnv 运行 agent loop。
-
-    每轮：模型推理 → env.step（追加 assistant + tool）→ token 检查 → 压缩。
-    压缩在 env.step 之后，避免提前压缩导致的 len guard 死锁。
-    """
-    obs, infos = env.reset(questions)
-    tools = env.tool_specs
-
-    for _ in range(env.max_turns):
-        # 收集活跃实例
-        active = [(i, o) for i, o in enumerate(obs) if o is not None]
-        if not active:
-            break
-
-        # 1. 并行模型调用
-        indices, msgs_list = zip(*active)
-        raw = await asyncio.gather(*[
-            client.simple_chat(
-                model=model,
-                messages=m,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice="auto",
-                extra_payload=extra_payload,
-            )
-            for m in msgs_list
-        ])
-        responses = [r["choices"][0]["message"] for r in raw]
-
-        # 1.5 截断检测与重试（防止模型输出超长 <think> 块导致无工具调用）
-        for i in range(len(responses)):
-            resp = responses[i]
-            content = resp.get("content", "") or ""
-            tool_calls = resp.get("tool_calls")
-            idx = indices[i]
-            if is_truncated_think_response(content, tool_calls):
-                # Record truncated response + nudge in trajectory (model saw these)
-                env.append_to_trajectory(idx, resp)
-                env.append_to_trajectory(idx, {"role": "user", "content": RETRY_NUDGE})
-                msgs = list(obs[idx]) if obs[idx] is not None else []
-                msgs.append(resp)  # keep truncated message in history
-                msgs.append({
-                    "role": "user",
-                    "content": RETRY_NUDGE,
-                })
-                retry_raw = await client.simple_chat(
-                    model=model,
-                    messages=msgs,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    tool_choice="auto",
-                    extra_payload=extra_payload,
-                )
-                retry_resp = retry_raw["choices"][0]["message"]
-                responses[i] = retry_resp
-                print(f"  [retry] instance {idx}: truncated think detected, nudging model to continue", flush=True)
-
-        # 1.6 工具调用校验 + 重试（检测未知工具名 / 缺失必填参数，省一轮 turn）
-        for i in range(len(responses)):
-            resp = responses[i]
-            idx = indices[i]
-            tool_calls = resp.get("tool_calls")
-            if not tool_calls:
-                continue
-
-            for retry_num in range(MAX_TOOL_RETRIES):
-                all_errors: List[Dict[str, str]] = []
-                for tc in tool_calls:
-                    err = validate_tool_call(tc, tools)
-                    if err:
-                        all_errors.append({
-                            "tool_name": tc.get("function", {}).get("name", "?"),
-                            "message": err,
-                        })
-
-                if not all_errors:
-                    break
-
-                # Record the failed response + error nudge in trajectory
-                env.append_to_trajectory(idx, resp)
-                # 构建带错误信息的 nudge
-                msgs = list(obs[idx]) if obs[idx] is not None else []
-                msgs.append(resp)  # 失败的那条 assistant 消息
-
-                error_lines = []
-                for e in all_errors:
-                    error_lines.append(f"- `{e['tool_name']}`: {e['message']}")
-
-                nudge = (
-                    f"Your tool call(s) failed validation with the following error(s):\n\n"
-                    + "\n".join(error_lines)
-                    + "\n\nPlease correct the error(s) and call the tool(s) again "
-                    "with valid arguments."
-                )
-                msgs.append({"role": "user", "content": nudge})
-                env.append_to_trajectory(idx, {"role": "user", "content": nudge})
-
-                print(
-                    f"  [tool-retry] instance {idx} attempt {retry_num + 1}/{MAX_TOOL_RETRIES}: "
-                    f"{len(all_errors)} validation error(s)",
-                    flush=True,
-                )
-
-                retry_raw = await client.simple_chat(
-                    model=model,
-                    messages=msgs,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    tool_choice="auto",
-                    extra_payload=extra_payload,
-                )
-                resp = retry_raw["choices"][0]["message"]
-                responses[i] = resp
-                tool_calls = resp.get("tool_calls")
-
-                if not tool_calls:
-                    # 模型放弃调用工具 — 交给 env.step 处理
-                    break
-
-        # 2. env.step — 追加 assistant 消息 + tool 结果
-        actions: List[Any] = [None] * len(obs)
-        for idx, resp in zip(indices, responses):
-            tc = resp.get("tool_calls")
-            if tc and len(tc) > max_tool_calls_per_turn:
-                resp["tool_calls"] = tc[:max_tool_calls_per_turn]
-            actions[idx] = resp
-
-        next_obs, rewards, dones, infos = env.step(actions)
-
-        if all(dones):
-            break
-
-        # 3. 检查 + 压缩（在 env.step 之后，消息数自然 > 2）
-        async def _maybe_condense(
-            idx: int, msgs: Optional[List[Dict[str, Any]]]
-        ) -> Optional[List[Dict[str, Any]]]:
-            if msgs is None:
-                return None
-            used = count_tokens_messages(_tok, msgs)
-            if used > max_context // 2:
-                last = msgs[-1] if msgs else None
-                is_tool_tail = last is not None and last.get("role") == "tool"
-                if not is_tool_tail:
-                    raise RuntimeError(
-                        f"instance {idx}: context at {used} tokens (>"
-                        f"{max_context // 2}) but last message role is "
-                        f"{last.get('role') if isinstance(last, dict) else last!r}; "
-                        "expected tool messages at tail after env.step — this should not happen."
-                    )
-                hard_truncate_tail_tool_messages(_tok, msgs, max_context, label=f"instance {idx}")
-                # Sync trajectory tool messages with truncated versions
-                env.sync_trajectory_tool_tail(idx)
-                used_after = count_tokens_messages(_tok, msgs)
-
-                # If truncation alone brought us back under threshold, skip condensation
-                if used_after <= max_context // 2:
-                    print(
-                        f"  [condense] instance {idx}: {used}→{used_after}/{max_context} tokens "
-                        f"(after tool hard-cap, under threshold → skip)",
-                        flush=True,
-                    )
-                    return msgs
-
-                if used_after > max_context:
-                    raise RuntimeError(
-                        f"instance {idx}: {used_after} tokens still exceed max_context="
-                        f"{max_context} after hard-truncating the trailing tool block; "
-                        "likely oversized older tool/assistant payloads or missing prior "
-                        "condense — this should not happen."
-                    )
-                print(
-                    f"  [condense] instance {idx}: {used}/{max_context} tokens "
-                    f"(after tool hard-cap {used_after}) → condensing",
-                    flush=True,
-                )
-                condensed = await _condense_context(
-                    _tok, msgs, client, model, temperature, max_tokens, max_context, extra_payload,
-                )
-                env.set_messages(idx, condensed)
-                env.replace_trajectory(idx, condensed)
-                return condensed
-            return msgs
-
-        obs = await asyncio.gather(*[
-            _maybe_condense(i, o) for i, o in enumerate(next_obs)
-        ])
-
-    return env.get_trajectories()
-
-
-# ═══════════════════════════════════════════════════════════════
-# Router-based agent loop — 保持所有 env slot 满载
-# ═══════════════════════════════════════════════════════════════
-
-async def run_agent_router(
-    env: DeepResearchEnv,
-    client: VLLMClientAsync,
-    model: str,
-    questions: List[str],
-    max_context: int = 40960,
-    max_tokens: int = 4096,
-    temperature: float = 0.0,
-    extra_payload: Optional[Dict[str, Any]] = None,
-    max_tool_calls_per_turn: int = 1,
-) -> List[List[Dict[str, Any]]]:
-    """Router-based agent loop — keeps all env slots filled.
-
-    When an instance finishes, it immediately starts the next pending question
-    in that slot, maximising parallel throughput.
-
-    Returns trajectories in the same order as *questions*.
-    """
-    n_envs: int = env.n_envs
-    n_total: int = len(questions)
-    n_initial: int = min(n_envs, n_total)
-    tools: List[Dict[str, Any]] = env.tool_specs
-
-    # ── Per-slot bookkeeping ──
-    slot_qidx: Dict[int, int] = {}                # slot → original question index
-    trajectories: Dict[int, List[Dict[str, Any]]] = {}  # qidx → completed trajectory
-    next_qidx: int = 0                             # next question to assign
-
-    # ── Fill initial slots ──
-    initial_qs = questions[:n_initial]
-    for slot in range(n_initial):
-        slot_qidx[slot] = slot
-    next_qidx = n_initial
-
-    obs, _infos = env.reset(initial_qs)
-
-    # Expand obs to full n_envs (unused slots are None)
-    obs = list(obs) + [None] * (n_envs - n_initial)
-
-    while slot_qidx or (next_qidx < n_total):
-        # ── 1. Collect active instances ──
-        active = [(i, o) for i, o in enumerate(obs) if o is not None]
-        if not active:
-            # All current instances done but more questions pending — start fresh batch
-            fresh_qs: List[str] = []
-            fresh_slots: List[int] = []
-            for slot in range(n_envs):
-                if next_qidx < n_total:
-                    fresh_qs.append(questions[next_qidx])
-                    fresh_slots.append(slot)
-                    slot_qidx[slot] = next_qidx
-                    next_qidx += 1
-            if not fresh_qs:
-                break
-            env.reset(fresh_qs)
-            obs = [None] * n_envs
-            for slot in fresh_slots:
-                obs[slot] = env.get_slot_messages(slot)
-            continue
-
-        indices, msgs_list = zip(*active)
-
-        # ── 2. Parallel model calls ──
-        raw = await asyncio.gather(*[
-            client.simple_chat(
-                model=model,
-                messages=m,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice="auto",
-                extra_payload=extra_payload,
-            )
-            for m in msgs_list
-        ])
-        responses = [r["choices"][0]["message"] for r in raw]
-
-        # ── 2.5 Think truncation retry ──
-        for i in range(len(responses)):
-            resp = responses[i]
-            content = resp.get("content", "") or ""
-            tool_calls = resp.get("tool_calls")
-            idx = indices[i]
-            if is_truncated_think_response(content, tool_calls):
-                # Record truncated response + nudge in trajectory (model saw these)
-                env.append_to_trajectory(idx, resp)
-                env.append_to_trajectory(idx, {"role": "user", "content": RETRY_NUDGE})
-                msgs = list(obs[idx]) if obs[idx] is not None else []
-                msgs.append(resp)  # keep truncated message in history
-                msgs.append({"role": "user", "content": RETRY_NUDGE})
-                retry_raw = await client.simple_chat(
-                    model=model, messages=msgs,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, tool_choice="auto", extra_payload=extra_payload,
-                )
-                responses[i] = retry_raw["choices"][0]["message"]
-
-        # ── 2.6 Tool call validation retry ──
-        for i in range(len(responses)):
-            resp = responses[i]
-            idx = indices[i]
-            tool_calls = resp.get("tool_calls")
-            if not tool_calls:
-                continue
-            for retry_num in range(MAX_TOOL_RETRIES):
-                all_errors: List[Dict[str, str]] = []
-                for tc in tool_calls:
-                    err = validate_tool_call(tc, tools)
-                    if err:
-                        all_errors.append({
-                            "tool_name": tc.get("function", {}).get("name", "?"),
-                            "message": err,
-                        })
-                if not all_errors:
-                    break
-                # Record the failed response + error nudge in trajectory
-                env.append_to_trajectory(idx, resp)
-                msgs = list(obs[idx]) if obs[idx] is not None else []
-                msgs.append(resp)
-                error_lines = [f"- `{e['tool_name']}`: {e['message']}" for e in all_errors]
-                nudge = (
-                    "Your tool call(s) failed validation:\n\n"
-                    + "\n".join(error_lines)
-                    + "\n\nPlease correct the error(s) and try again."
-                )
-                msgs.append({"role": "user", "content": nudge})
-                env.append_to_trajectory(idx, {"role": "user", "content": nudge})
-                retry_raw = await client.simple_chat(
-                    model=model, messages=msgs,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, tool_choice="auto", extra_payload=extra_payload,
-                )
-                resp = retry_raw["choices"][0]["message"]
-                responses[i] = resp
-                tool_calls = resp.get("tool_calls")
-                if not tool_calls:
-                    break
-
-        # ── 3. env.step ──
-        actions: List[Any] = [None] * n_envs
-        for idx, resp in zip(indices, responses):
-            tc = resp.get("tool_calls")
-            if tc and len(tc) > max_tool_calls_per_turn:
-                resp["tool_calls"] = tc[:max_tool_calls_per_turn]
-            actions[idx] = resp
-        next_obs, _rewards, dones, _infos = env.step(actions)
-
-        # ── 4. Handle completions + refill ──
-        for slot in range(n_envs):
-            if dones[slot] and slot in slot_qidx:
-                qidx = slot_qidx.pop(slot)
-                trajectories[qidx] = env.extract_slot_trajectory(slot)
-
-                if next_qidx < n_total:
-                    # Refill this slot immediately
-                    slot_qidx[slot] = next_qidx
-                    next_obs[slot] = env.reset_slot(slot, questions[next_qidx])
-                    next_qidx += 1
-
-        # ── 5. Context condensation (per active instance) ──
-        async def _maybe_condense(
-            idx: int, msgs: Optional[List[Dict[str, Any]]]
-        ) -> Optional[List[Dict[str, Any]]]:
-            if msgs is None:
-                return None
-            used = count_tokens_messages(_tok, msgs)
-            if used <= max_context // 2:
-                return msgs
-
-            last = msgs[-1] if msgs else None
-            is_tool_tail = last is not None and last.get("role") == "tool"
-            if not is_tool_tail:
-                return msgs  # don't condense if tail isn't tool messages
-
-            hard_truncate_tail_tool_messages(_tok, msgs, max_context, label=f"instance {idx}")
-            # Sync trajectory tool messages with truncated versions
-            env.sync_trajectory_tool_tail(idx)
-            used_after = count_tokens_messages(_tok, msgs)
-            if used_after <= max_context // 2:
-                return msgs  # truncation sufficed
-
-            condensed = await _condense_context(
-                _tok, msgs, client, model, temperature, max_tokens, max_context, extra_payload,
-            )
-            env.set_messages(idx, condensed)
-            env.replace_trajectory(idx, condensed)
-            return condensed
-
-        obs = await asyncio.gather(*[
-            _maybe_condense(i, o) for i, o in enumerate(next_obs)
-        ])
-
-    # ── Return in original order ──
-    return [trajectories[i] for i in range(n_total)]
-
-
-# ═══════════════════════════════════════════════════════════════
 # Async per-slot router — 每个 slot 独立协程，一问结束立刻补下一问
 # ═══════════════════════════════════════════════════════════════
 
@@ -652,6 +239,7 @@ async def _run_one_question_async(
     n_total: int = 0,
     done_lock: Optional["asyncio.Lock"] = None,
     max_tool_calls_per_turn: int = 1,
+    think_trunc_no_think: bool = False,
 ) -> None:
     """Run a single question to completion in one slot.
 
@@ -673,22 +261,45 @@ async def _run_one_question_async(
         )
         resp: Dict[str, Any] = raw["choices"][0]["message"]
 
-        # ── Think truncation retry ──
+        # ── Think truncation retry (two-stage: no-think → RETRY_NUDGE) ──
         content = resp.get("content", "") or ""
         tc = resp.get("tool_calls")
         if is_truncated_think_response(content, tc):
-            # Record the truncated response + nudge in trajectory (model saw these)
+            # Truncate content to 1/5 when think block is incomplete,
+            # close the </think> tag and mark it as truncated
+            if content:
+                resp["content"] = content[:len(content) // 10] + "\n...[THINK_TRUNCATED]\n</think>"
+            # Record the truncated response in trajectory
             env.append_to_trajectory(slot_id, resp)
-            env.append_to_trajectory(slot_id, {"role": "user", "content": RETRY_NUDGE})
-            msgs = list(obs) + [resp, {"role": "user", "content": RETRY_NUDGE}]
-            raw = await client.simple_chat(
-                model=model, messages=msgs,
-                temperature=temperature, max_tokens=max_tokens,
-                tools=tools, tool_choice="auto", extra_payload=extra_payload,
-            )
-            resp = raw["choices"][0]["message"]
-            tc = resp.get("tool_calls")
-            print(f"  [retry] slot {slot_id}: truncated think detected, nudging model to continue", flush=True)
+
+            if think_trunc_no_think:
+                # Stage 1: retry with thinking DISABLED (avoids the repetition loop)
+                no_think_extra = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+                msgs_no_think = list(obs) + [resp]
+                raw = await client.simple_chat(
+                    model=model, messages=msgs_no_think,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, tool_choice="auto", extra_payload=no_think_extra,
+                )
+                resp = raw["choices"][0]["message"]
+                tc = resp.get("tool_calls")
+                print(f"  [retry] slot {slot_id}: truncated think → retrying with thinking disabled", flush=True)
+
+            if not tc:
+                # Stage 2 (or direct fallback): RETRY_NUDGE
+                if think_trunc_no_think:
+                    env.append_to_trajectory(slot_id, resp)
+                env.append_to_trajectory(slot_id, {"role": "user", "content": RETRY_NUDGE})
+                msgs = list(obs) + [resp, {"role": "user", "content": RETRY_NUDGE}]
+                raw = await client.simple_chat(
+                    model=model, messages=msgs,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, tool_choice="auto", extra_payload=extra_payload,
+                )
+                resp = raw["choices"][0]["message"]
+                tc = resp.get("tool_calls")
+                tag = "no-think retry also failed → " if think_trunc_no_think else ""
+                print(f"  [retry] slot {slot_id}: {tag}RETRY_NUDGE", flush=True)
 
         # ── Tool validation retry ──
         if tc:
@@ -775,6 +386,7 @@ async def run_agent_async_router(
     temperature: float = 0.0,
     extra_payload: Optional[Dict[str, Any]] = None,
     max_tool_calls_per_turn: int = 1,
+    think_trunc_no_think: bool = False,
 ) -> List[List[Dict[str, Any]]]:
     """Fully-async per-slot router — no idle time between questions.
 
@@ -823,6 +435,7 @@ async def run_agent_async_router(
                 n_total=n_total,
                 done_lock=done_lock,
                 max_tool_calls_per_turn=max_tool_calls_per_turn,
+                think_trunc_no_think=think_trunc_no_think,
             )
 
     workers = [_worker(i) for i in range(n_workers)]
@@ -861,6 +474,7 @@ async def generate_trajectories(
     strip_thinking: bool = True,
     condense_thinking: bool = False,
     max_tool_calls_per_turn: int = 1,
+    think_trunc_no_think: bool = False,
 ) -> List[Dict[str, Any]]:
     from .dataset_utils import load_jsonl
 
@@ -896,6 +510,7 @@ async def generate_trajectories(
             temperature=temperature,
             extra_payload=extra_payload,
             max_tool_calls_per_turn=max_tool_calls_per_turn,
+            think_trunc_no_think=think_trunc_no_think,
         )
 
         for row, traj in zip(rows, trajs):
@@ -972,6 +587,9 @@ Examples:
     p.add_argument("--no-strip-thinking", action="store_true", help="保留 <think> 块在上下文中（默认 strip）")
     p.add_argument("--condense-thinking", action="store_true", help="压缩 <think> 块为简洁的计划摘要而非完全 strip（保留核心目的和规划）")
     p.add_argument("--no-think", action="store_true", help="禁用模型 thinking 模式（通过 extra_payload 传入 chat_template_kwargs）")
+    p.add_argument("--think-trunc-no-think", action="store_true", default=False,
+                   help="When think-block is truncated, first retry with thinking disabled "
+                        "before falling back to RETRY_NUDGE")
     p.add_argument("--tokenizer-path", default="Qwen/Qwen3-8B", help="Tokenizer 模型路径（用于精确 token 计数）")
     return p
 
@@ -1017,6 +635,7 @@ async def _main_async(args: argparse.Namespace) -> None:
         strip_thinking=not args.no_strip_thinking,
         condense_thinking=args.condense_thinking,
         max_tool_calls_per_turn=args.max_tool_calls_per_turn,
+        think_trunc_no_think=args.think_trunc_no_think,
     )
     gen_time = time.time() - t0
     print(f"\n[done] generated {len(records)} trajectories in {gen_time:.1f}s", flush=True)

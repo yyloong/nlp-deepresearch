@@ -81,6 +81,7 @@ async def process_one_question(
     max_context: int,
     extra_payload: Optional[Dict[str, Any]],
     max_tool_calls_per_turn: int = 1,
+    think_trunc_no_think: bool = False,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """Run one question to completion on slot 0, returning (trajectory, finish_reason)."""
     obs: List[Dict[str, Any]] = env.reset_slot(0, question)
@@ -103,18 +104,37 @@ async def process_one_question(
         content = resp.get("content", "") or ""
         tc = resp.get("tool_calls")
         if is_truncated_think_response(content, tc):
-            # Record the truncated response + nudge in trajectory (model saw these)
+            # Record the truncated response in trajectory
             env.append_to_trajectory(0, resp)
-            env.append_to_trajectory(0, {"role": "user", "content": RETRY_NUDGE})
-            msgs = list(obs) + [resp, {"role": "user", "content": RETRY_NUDGE}]
-            raw = await client.simple_chat(
-                model=model, messages=msgs,
-                temperature=temperature, max_tokens=max_tokens,
-                tools=tools, tool_choice="auto", extra_payload=extra_payload,
-            )
-            resp = raw["choices"][0]["message"]
-            tc = resp.get("tool_calls")
-            print(f"    [retry-think] truncated think block detected", flush=True)
+
+            if think_trunc_no_think:
+                # Stage 1: retry with thinking DISABLED (avoids the repetition loop)
+                no_think_extra = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+                msgs_no_think = list(obs) + [resp]
+                raw = await client.simple_chat(
+                    model=model, messages=msgs_no_think,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, tool_choice="auto", extra_payload=no_think_extra,
+                )
+                resp = raw["choices"][0]["message"]
+                tc = resp.get("tool_calls")
+                print(f"    [retry-think] truncated → retrying with thinking disabled", flush=True)
+
+            if not tc:
+                # Stage 2 (or direct fallback): RETRY_NUDGE
+                if think_trunc_no_think:
+                    env.append_to_trajectory(0, resp)
+                env.append_to_trajectory(0, {"role": "user", "content": RETRY_NUDGE})
+                msgs = list(obs) + [resp, {"role": "user", "content": RETRY_NUDGE}]
+                raw = await client.simple_chat(
+                    model=model, messages=msgs,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, tool_choice="auto", extra_payload=extra_payload,
+                )
+                resp = raw["choices"][0]["message"]
+                tc = resp.get("tool_calls")
+                tag = "no-think retry also failed → " if think_trunc_no_think else ""
+                print(f"    [retry-think] {tag}RETRY_NUDGE", flush=True)
 
         # ── 3. Tool-call validation retry ──
         if tc:
@@ -233,6 +253,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-think", action="store_true",
                    default=os.environ.get("NO_THINK", "0") not in ("0", "false", ""),
                    help="Disable model thinking mode (env: NO_THINK)")
+    p.add_argument("--think-trunc-no-think", action="store_true", default=False,
+                   help="When think-block is truncated, first retry with thinking disabled "
+                        "before falling back to RETRY_NUDGE")
     return p
 
 
@@ -305,6 +328,7 @@ async def _main_async(args: argparse.Namespace) -> None:
                 max_context=args.max_context,
                 extra_payload=extra_payload,
                 max_tool_calls_per_turn=args.max_tool_calls_per_turn,
+                think_trunc_no_think=args.think_trunc_no_think,
             )
 
             answer = extract_final_answer(traj) or ""
