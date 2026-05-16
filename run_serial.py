@@ -104,8 +104,13 @@ async def process_one_question(
         content = resp.get("content", "") or ""
         tc = resp.get("tool_calls")
         if is_truncated_think_response(content, tc):
+            # Truncate content to 1/10 when think block is incomplete,
+            # close the </think> tag and mark it as truncated
+            if content:
+                resp["content"] = content[:len(content) // 10] + "\n...[THINK_TRUNCATED]\n</think>"
             # Record the truncated response in trajectory
             env.append_to_trajectory(0, resp)
+            print(f"    [think-trunc] content truncated ({len(content)} → {len(resp['content'])} chars)", flush=True)
 
             if think_trunc_no_think:
                 # Stage 1: retry with thinking DISABLED (avoids the repetition loop)
@@ -241,6 +246,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Eval batch size (default: 1 for serial eval)")
     p.add_argument("--eval-model", default=None, help="Eval model (defaults to --model)")
     p.add_argument("--limit", type=int, default=None, help="Limit number of queries")
+    p.add_argument("--query-ids", type=str, default=None,
+                   help="Comma-separated list of query IDs to run (e.g. '442,26,471')")
     p.add_argument("--no-eval", action="store_true", help="Skip evaluation")
     # ── Serial-only 或额外参数 ──
     p.add_argument("--max-context", type=int, default=40960,
@@ -269,6 +276,10 @@ async def _main_async(args: argparse.Namespace) -> None:
         sys.exit("ERROR: --index-path is required (set INDEX_PATH env var or pass --index-path)")
 
     rows = load_jsonl(args.dataset, limit=args.limit)
+    if args.query_ids:
+        ids = set(args.query_ids.replace(" ", "").split(","))
+        rows = [r for r in rows if r.get("query_id", "") in ids]
+        print(f"Filtered to {len(rows)} queries by --query-ids: {sorted(ids)}", flush=True)
     total = len(rows)
     condense_thinking = not args.no_condense_thinking
 
