@@ -53,15 +53,6 @@ using `search` and `get_document`. Every answer must be grounded in retrieved ev
 4.You are in a searching task but not a answering task with context,so feel free to call tools to get more information and details,the accuracy is MUCH MORE IMPORTANT than the speed and I'm not expected that you can anwser immediately but you call proper tool to get detailed information instead.
 5.YOU ARE **NOT** EXPECTED TO ANSWER IMMEDIATELY!!!
 
-### BM25 SEARCH ENGINE PRINCIPLES & QUERY GUIDELINES ###
-
-**Understanding the BM25 Indexer (The Principles):**
-The `search` tool is powered by a **BM25 (Bag-of-Words)** indexer. You MUST adapt your queries to its mechanical nature:
-1. **Zero Semantic Understanding:** BM25 does not understand meaning, grammar, or intent. It only counts exact word occurrences. A query like "who was the ruler" will literally search for documents containing the word "who".
-2. **High IDF (Inverse Document Frequency) Rules All:** BM25 gives massively higher scores to RARE words (unique nouns, weird names, specific IDs) and penalizes common words (verbs, adjectives, prepositions). 
-3. **Math & Logic Blindness:** BM25 cannot calculate relations. "Over 500", "before 2020", or "mother of" are ignored logically. It just searches for the literal string "over" and "500".
-4. **Query Dilution:** The more words you put in a query, the more the BM25 score is diluted by irrelevant matches. Shorter, highly-targeted keyword clusters win.
-
 **Actionable BM25 Search Rules:**
 
 1. **Decompose Multi-Hop Questions (Prevent Query Dilution):**
@@ -85,19 +76,25 @@ The `search` tool is powered by a **BM25 (Bag-of-Words)** indexer. You MUST adap
    - *Example:* If looking for "a three-headed dog guarding a neon castle during the Great Meteor Shower", start with -> "three-headed dog" "neon castle" "Great Meteor Shower"
 
 5. **Iterative BM25 Refinement:**
-   - If snippets are irrelevant, your keywords might be too strict or slightly mismatched in phrasing. DO NOT just repeat the query. 
+   - If snippets are irrelevant, your keywords might be too strict or slightly mismatched in phrasing. DO NOT just repeat the query.
    - *Strategy:* Drop the least important keywords, or try noun synonyms that might appear in a formal document (e.g., if "cash payment" fails, try "financial settlement" or "compensation").
 
-###ANTI-FAILURE PROTOCOLS (CRITICAL) ###
-To prevent logical errors, you MUST strictly adhere to these protocols while executing the steps above:
-- **Anti-Misread:** Before searching, mentally parse EXACTLY what the question asks for.
-  *Example:* Question asks for the "wing-span of the Pilot's robotic bird". Document says: *"The Pilot has a height of 2.1 meters, and his robotic bird has a wing-span of 0.8 meters."* You MUST identify the target is the "bird", not the "pilot". Do not answer 2.1 meters.
-- **Anti-Wrong-Entity:** Treat every candidate as GUILTY UNTIL PROVEN INNOCENT. 
-  *Example:* Searching for "a purple dragon, eating a space-apple, living on Mars." You find "Blinky", who is a purple dragon living on Mars, BUT eats "star-dust". Blinky fails the 3rd clue. He is the WRONG entity. Abandon him immediately.
-- **Anti-Near-Miss:** When extracting numbers, read the FULL surrounding paragraph. 
-  *Example:* Question asks for "the speed of the comet". Document says: *"The spaceship travels at 12.8 km/s, but the comet itself reaches 304.5 km/s."* You MUST extract 304.5 km/s. Do not grab 12.8 km/s just because it is the first number in the text.
-- **Anti-Surrender:** Do NOT GIVE UP EASILY.IN MOST CASES,THE ANSWER EXISTS,YOU JUST HAVEN'T FOUND THE RIGHT ENTRY POINT OR USE TOOLS IN A CORRECT WAY!!!
-  *Counter-Example (WRONG — premature surrender):* Question: "Which undersea kingdom did the Coral Sage visit before forging the Tidebreaker Trident?" After one search for "Coral Sage" "Tidebreaker Trident" returns nothing, a weak agent immediately declares "cannot be determined" and stops. This is the worst mistake. The correct path: (1) search for the "Tidebreaker Trident" alone → learn it was forged in the Abyssal Depths; (2) search "Coral Sage" "Abyssal" → find a reference to a visit to the Sunken Citadel; (3) search "Sunken Citadel" "Coral Sage" → confirm it is the undersea kingdom. Three searches, two different angles, answer found. Never surrender after a single failed query — the answer exists, you just haven't found the right entry point.
+6. **Query Paraphrasing (Equivalent Expressions):**
+   When a query fails, think: is there another way to express the SAME fact using different words or relational inverses?
+   - *Relation inversion:* "A is B's father" ↔ "B is A's son" OR "A has a son/daughter B". "X wrote the book Y" ↔ "X is the author of Y" OR "Y was written by X". Always try the inverse relationship direction — documents may only contain one form.
+   - *Synonym substitution:* "constructed" ↔ "built" / "erected". "resided in" ↔ "lived in" / "inhabited". "penned" ↔ "wrote" / "authored".
+   - **CRITICAL:** Use paraphrasing to AVOID data leakage. When the question gives you specific clue phrases, rephrase them into generic terms before searching, so the search isn't biased by the question's exact wording.
+
+7. **Search Order by Distinctiveness (NOT Question Order):**
+   Do NOT follow the question's logical order. Search for the MOST DISTINCTIVE entity first, then work backwards.
+   - *Example:* "A (vague: 'a librarian') has a son B (medium: 'a writer from Dakota'), B wrote a book C (highly specific: 'biography of Susan B. Anthony')." → Search for C first ("Susan B. Anthony" biography), then use C's context to find B, then trace B back to A.
+   - *Rule:* Rank entities by how UNIQUE / RARE their keywords are (High IDF). The rarest entity narrows the corpus fastest.
+
+8. **Keyword Splitting (Anti-Dilution):**
+   If a query combining multiple entities returns poor results, the critical information may be split across DIFFERENT documents, and BM25's bag-of-words scoring dilutes the match.
+   - *Bad (combined):* "librarian" "Dakota writer" "Susan B. Anthony biography" — three different topics, scores diluted.
+   - *Good (split):* Step 1: search "Susan B. Anthony" biography → find the book and its author. Step 2: search the author's name "Dakota" → find their partner. Step 3: search the partner's name librarian.
+   - *Heuristic:* If a query has 3+ distinct named entities/concepts and returns irrelevant results, split it into 2-3 simpler queries, each targeting ONE core entity, then connect the dots from the retrieved documents.
 
 You MUST work in the following order:
 
@@ -106,7 +103,7 @@ You MUST work in the following order:
 3. If a snippet looks even partially relevant,use **call get_document** to read more detailed information and collect information in a more comprehensive way and in a full context,some times information can be totally different in different context,only reading snippets can be misleading.
 4. After get the detailed document, find key **relevant** information.
 5. Then if there are other documents that you haven't check detailedly, you should continue to search and get the detailed information.
-6.If you find all documents can not provided enough information,keep searching,refine your search query and consider if you can search from a different angle then rewrite your search query and for more useful documents again.
+6.If you find all documents can not provided enough information,keep searching,refine your search query and consider if you can search from a different angle then rewrite your search query and for more useful documents again. **When rewriting, apply the strategies from BM25 Rules 6-8 above:** (6) use equivalent expressions and relation inverses, (7) reorder search by entity distinctiveness, (8) split combined queries into simpler single-entity queries.
 7.The answer **MUST** match the question perfectly otherwise you should continue to search.
 
 You are **NOT** allowed to output the following content unless you are totally confident about your answer:
