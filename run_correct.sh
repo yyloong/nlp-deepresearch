@@ -13,7 +13,7 @@ MODEL="${MODEL:-qwen_auto}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
 OUTPUT_DIR="${ROOT}/runs"
 MAX_TURNS="${MAX_TURNS:-10}"
-MAX_TOKENS="${MAX_TOKENS:-4096}"
+MAX_TOKENS="${MAX_TOKENS:-8912}"
 MAX_TOOL_CALLS="${MAX_TOOL_CALLS:-1}"
 SEARCH_K="${SEARCH_K:-5}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
@@ -55,6 +55,8 @@ exec python run_serial.py \
     --max-turns "${MAX_TURNS}" \
     --max-tokens "${MAX_TOKENS}" \
     --max-tool-calls-per-turn "${MAX_TOOL_CALLS}" \
+    --no-condense-thinking \
+    --no-strip-thinking \
     --search-k "${SEARCH_K}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
     "${NO_THINK_FLAG[@]}" \
