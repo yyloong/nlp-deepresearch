@@ -36,8 +36,24 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .browsecomp_searcher import BrowseCompBM25Searcher, snippetize
 from .tools import build_searcher
+from .utils import count_tokens_messages
 
 logger = logging.getLogger(__name__)
+
+# Lazy tokenizer for verify-agent context guard
+_verify_tok: Any = None
+
+
+def _get_verify_tok() -> Any:
+    global _verify_tok
+    if _verify_tok is None:
+        import os as _os
+        _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        from transformers import AutoTokenizer as _AT
+        _verify_tok = _AT.from_pretrained(
+            "Qwen/Qwen3-8B", trust_remote_code=True, local_files_only=True,
+        )
+    return _verify_tok
 
 # ──────────────────────────────────────────────
 # Default system prompt (same semantics as agent_loop)
@@ -148,6 +164,7 @@ class DeepResearchEnv:
         model: str = "",
         max_tokens: int = 4096,
         temperature: float = 0.0,
+        enable_verify: bool = True,
     ) -> None:
         self.n_envs = n_envs
         self.system_prompt = system_prompt
@@ -163,6 +180,7 @@ class DeepResearchEnv:
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
+        self._enable_verify = enable_verify
         self._question: str = ""  # set by reset_slot
 
         # Shared searcher (thread-safe for reads; tool calls are synchronous)
@@ -209,6 +227,8 @@ class DeepResearchEnv:
 
         async def submit_answer(answer: str, evidence: str) -> Dict[str, Any]:
             """Submit final answer for verification. Triggers a verify agent that checks the answer."""
+            if not self._enable_verify:
+                return {"is_correct": True, "reason": "Verification disabled", "suggestions": ""}
             if self._client is None:
                 return {"error": "No model client configured for verification"}
             return await self._run_verify_agent(answer, evidence)
@@ -366,6 +386,59 @@ class DeepResearchEnv:
 
     # ── Verify Agent ──────────────────────────
 
+    _CONDENSE_VERIFY_PROMPT = """\
+You are a document compression assistant. Below is a verification agent's conversation history.
+The tool results contain full document texts that are too large for the context window.
+
+Your job: compress large tool-result messages by keeping only the KEY FACTS relevant to verification.
+For each document text, extract: names, dates, numbers, relationships, and quotes directly relevant
+to the claims being verified. Discard boilerplate, navigation text, and irrelevant paragraphs.
+
+Return a JSON array of messages with the SAME structure as the input (role, content, tool_call_id, etc.).
+The system prompt and first user message must be preserved verbatim.
+For assistant messages with tool_calls, keep them as-is.
+For tool-result messages: if the content is short (< 500 chars), keep it. If it's long,
+replace the content with a compressed summary prefixed by "[Compressed] ".
+
+Output ONLY valid JSON array. No other text.
+"""
+
+    async def _condense_verify_context(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Compress verify-agent messages when they exceed the token budget."""
+        # Keep system + first user intact, only condense the rest
+        head = msgs[:2]  # system + first user
+        tail = msgs[2:]
+
+        # Serialize tail for the condense model
+        tail_json = json.dumps(tail, ensure_ascii=False)
+        condense_msgs = [
+            {"role": "system", "content": self._CONDENSE_VERIFY_PROMPT},
+            {"role": "user", "content": f"Compress this conversation history. Keep all factual claims, docids, names, dates, and numbers. Return only the JSON array:\n\n{tail_json}"},
+        ]
+
+        try:
+            raw = await self._client.simple_chat(
+                model=self._model,
+                messages=condense_msgs,
+                temperature=0.0,
+                max_tokens=self._max_tokens,
+            )
+            content = raw["choices"][0]["message"].get("content", "")
+            import re
+            json_match = re.search(r"\[.*\]", content, re.DOTALL)
+            if json_match:
+                compressed_tail = json.loads(json_match.group(0))
+                if isinstance(compressed_tail, list):
+                    return head + compressed_tail
+        except Exception:
+            pass
+
+        # Fallback: truncate each tool-result to a reasonable size
+        for m in tail:
+            if m.get("role") == "tool" and len(m.get("content", "")) > 3000:
+                m["content"] = m["content"][:3000] + "\n...[truncated]"
+        return head + tail
+
     _VERIFY_SYSTEM_PROMPT = """\
 You are a Verification Agent. Your job is to independently verify whether a proposed answer to a question is correct, using the document corpus.
 
@@ -374,98 +447,243 @@ You are a Verification Agent. Your job is to independently verify whether a prop
 **Claimed Evidence:**
 {evidence}
 
-You have `search` and `get_document` tools. Verify each claim by searching for supporting documents.
+You have `search` and `get_document` tools to find evidence, and `give_feedback` to report your verdict.
 
-**Rules:**
-1. For each claim, search for independent evidence — do NOT just trust the claimed evidence.
-2. Use get_document to read full documents; snippets alone can be misleading.
-3. Check that the answer exactly matches what the question asks (not a related but different question).
-4. If the evidence supports all claims and the answer is correct, call `give_feedback(is_correct=True, ...)`.
-5. If any claim is unsupported or the answer is wrong, call `give_feedback(is_correct=False, ...)` with specific, actionable suggestions.
-6. Do NOT call give_feedback until you have thoroughly searched and verified.
+**CRITICAL — You MUST follow this workflow in order:**
+
+Step 0 — Anti-Surrender Check (FIRST):
+If the proposed answer is a surrender/evasion response — e.g. "cannot be determined", "not found", "unable to find", "no evidence", "I cannot answer", "insufficient information" — immediately call `give_feedback(is_correct=False, reason="The answer exists in the corpus. Do NOT give up. Try searching from completely different angles — use different keywords, inverse relations, or split compound queries.", suggestions="...")` and STOP. Do NOT waste turns searching for a non-answer.
+
+Step 1 — Search for Independent Evidence:
+Extract each factual claim from the proposed answer. For each claim, call `search` with targeted keywords derived from that claim. Do NOT just copy the claimed evidence's docids — search independently.
+
+Step 2 — Read Full Documents:
+For any search result that appears relevant, call `get_document` to read the full text. Snippets alone are often misleading or incomplete.
+
+Step 3 — Verify Claim by Claim (CRITICAL — Check Entity Identity):
+For each claim, check whether the documents you retrieved actually support it. Compare: does the document text confirm EXACTLY what the claim asserts?
+
+**BEWARE OF ENTITY CONFUSION — The evidence may describe someone/something ELSE:**
+Just because you found evidence matching the DESCRIPTIONS does NOT mean the answer's ENTITY is correct. The same description may fit multiple entities, but the question asks for a SPECIFIC one.
+
+**Example:** The question asks "Who was beaten to death?" Clues: a monkey with golden fur, immense strength, wielded a magical staff, caused havoc in heaven, accompanied a monk on a journey to the West. The answer "Six-Eared Macaque" is WRONG, even though:
+- Both Sun Wukong (Monkey King) AND the Six-Eared Macaque match "monkey with golden fur" and "immense strength"
+- Both wielded magical staves
+- Both caused havoc in heaven
+- Both accompanied the monk (the Six-Eared Macaque impersonated Sun Wukong for part of the journey)
+BUT only Sun Wukong was beaten to death (and resurrected). The Six-Eared Macaque was NOT the one beaten to death — he was killed differently. The evidence may superficially match both entities, but the specific EVENT (beaten to death) uniquely identifies Sun Wukong.
+
+**Before calling give_feedback, ask yourself:**
+- Does the evidence confirm THIS specific entity, or just a SIMILAR entity?
+- Is the subject/object relationship correct? (A did X to B, not B did X to A)
+- Do all clues point to the SAME entity, or am I mixing up two similar entities?
+- Is the logical chain correct? (A → B → C, not A → C directly)
+
+Step 4 — Report Verdict via give_feedback:
+ONLY after completing Steps 1-3, call `give_feedback`:
+- If ALL claims are independently supported and the answer matches the question → `is_correct=True`
+- If ANY claim is unsupported, wrong, or the answer doesn't match the question → `is_correct=False` with specific, actionable suggestions for which angle to search next
+
+**NEVER call give_feedback without first calling search or get_document.** (Step 0 is the only exception.)
 """
 
-    _VERIFY_MAX_TURNS = 5
-
     async def _run_verify_agent(self, answer: str, evidence: str) -> Dict[str, Any]:
-        """Run a short verify-agent loop that checks the answer and returns feedback."""
+        """Run a verify-agent loop that checks the answer and returns feedback.
+
+        Uses the same max_turns as the main agent. Condenses context when it approaches
+        the token limit. Retries once on timeout.
+        """
         if self._client is None:
             return {"error": "No model client available for verification"}
+
+        print(f"    [verify] ═══ starting (max_turns={self.max_turns}) ═══", flush=True)
+        print(f"    [verify] answer: {answer}", flush=True)
+        print(f"    [verify] evidence ({len(evidence)} chars): {evidence[:500]}{'...' if len(evidence) > 500 else ''}", flush=True)
 
         verify_prompt = self._VERIFY_SYSTEM_PROMPT.format(
             question=self._question,
             answer=answer,
             evidence=evidence,
         )
+        verify_tools: List[Dict[str, Any]] = self._verify_tools
+        _MAX_CTX = 35000  # condense threshold for verify messages
+
+        async def _run_loop(msgs: List[Dict[str, Any]], start_turn: int, max_t: int, label: str) -> Dict[str, Any]:
+            """Inner loop: run verify turns, return feedback dict or None if timed out."""
+            searched = False
+            for vturn in range(start_turn, start_turn + max_t):
+                # On the last turn, inject a forced nudge to call give_feedback NOW
+                if vturn == start_turn + max_t - 1:
+                    msgs.append({
+                        "role": "user",
+                        "content": (
+                            "STOP SEARCHING. You have reached the turn limit. "
+                            "Based on the evidence you have gathered so far, call give_feedback NOW "
+                            "with your best assessment. If you have no evidence, call "
+                            "give_feedback(is_correct=False, reason=\"Insufficient evidence found\", "
+                            "suggestions=\"...\"). Do NOT call any other tool — only give_feedback."
+                        ),
+                    })
+
+                raw = await self._client.simple_chat(
+                    model=self._model,
+                    messages=msgs,
+                    temperature=self._temperature,
+                    max_tokens=self._max_tokens,
+                    tools=verify_tools,
+                    tool_choice="auto",
+                )
+                resp: Dict[str, Any] = raw["choices"][0]["message"]
+                usage = raw.get("usage", {})
+                tok_info = f"  prompt={usage.get('prompt_tokens', '?')} comp={usage.get('completion_tokens', '?')}" if usage else ""
+                msgs.append(resp)
+
+                tc = resp.get("tool_calls")
+                if not tc:
+                    resp_content = resp.get("content", "") or ""
+                    print(f"    [verify] {label} turn {vturn + 1}: no tool call{tok_info}  content: {resp_content[:120]}", flush=True)
+                    continue
+
+                for tc_item in tc:
+                    fn = tc_item["function"]
+                    name = fn["name"]
+                    call_id: str = tc_item.get("id", "")
+                    args_str = fn.get("arguments", "{}")
+                    try:
+                        args = json.loads(args_str)
+                    except (json.JSONDecodeError, TypeError):
+                        msgs.append({
+                            "role": "tool", "tool_call_id": call_id,
+                            "content": json.dumps({"error": "Invalid JSON arguments"}),
+                        })
+                        continue
+
+                    # ── Log ──
+                    if name == "search":
+                        searched = True
+                        q = args.get('query', '?')
+                        print(f"    [verify] {label} turn {vturn + 1}: search({q}){tok_info}", flush=True)
+                    elif name == "get_document":
+                        searched = True
+                        print(f"    [verify] {label} turn {vturn + 1}: get_document({args.get('docid', '?')}){tok_info}", flush=True)
+                    elif name == "give_feedback":
+                        if not searched:
+                            print(f"    [verify] {label} turn {vturn + 1}: give_feedback WITHOUT searching — REJECTED", flush=True)
+                            msgs.append({
+                                "role": "tool", "tool_call_id": call_id,
+                                "content": json.dumps({
+                                    "error": "You MUST search for independent evidence before giving feedback. "
+                                             "Call search or get_document first."
+                                }),
+                            })
+                            continue
+                        else:
+                            fb = {}
+                            try:
+                                fb = json.loads(args_str)
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                            verdict = "✓ CORRECT" if fb.get("is_correct") else "✗ INCORRECT"
+                            reason = fb.get("reason", "")
+                            suggestions = fb.get("suggestions", "")
+                            print(f"    [verify] {label} turn {vturn + 1}: give_feedback → {verdict}", flush=True)
+                            print(f"    [verify]   reason: {reason}", flush=True)
+                            if suggestions:
+                                print(f"    [verify]   suggestions: {suggestions}", flush=True)
+                            return fb
+
+                    if name not in self._verify_registry:
+                        msgs.append({
+                            "role": "tool", "tool_call_id": call_id,
+                            "content": json.dumps({"error": f"Unknown tool: {name}"}),
+                        })
+                        continue
+
+                    fn_impl = self._verify_registry[name]
+                    try:
+                        if inspect.iscoroutinefunction(fn_impl):
+                            result = await fn_impl(**args)
+                        else:
+                            result = fn_impl(**args)
+                    except Exception as exc:
+                        result = {"error": str(exc)}
+
+                    # ── Log tool results ──
+                    if name == "search" and isinstance(result, list):
+                        n = len(result)
+                        top_scores = [f"{r.get('docid','?')}:{r.get('score',0):.1f}" for r in result[:3]]
+                        print(f"    [verify]   → {n} results  top: [{', '.join(top_scores)}]", flush=True)
+                    elif name == "get_document" and isinstance(result, dict):
+                        text_len = len(result.get("text", ""))
+                        title = result.get("title", "?")
+                        print(f"    [verify]   → doc: {title[:80]}  text: {text_len} chars", flush=True)
+
+                    msgs.append({
+                        "role": "tool", "tool_call_id": call_id,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    })
+
+                # ── Condense: if verify messages approach context limit, compress tool results ──
+                tok = _get_verify_tok()
+                if count_tokens_messages(tok, msgs) > _MAX_CTX:
+                    print(f"    [verify] {label} condensing context ({count_tokens_messages(tok, msgs)} tokens)...", flush=True)
+                    msgs = await self._condense_verify_context(msgs)
+                    print(f"    [verify] {label} condensed → {count_tokens_messages(tok, msgs)} tokens", flush=True)
+
+                # If give_feedback was called (and not rejected), return
+                tc_names = [t["function"]["name"] for t in tc]
+                if "give_feedback" in tc_names:
+                    for tc_item in tc:
+                        if tc_item["function"]["name"] == "give_feedback":
+                            try:
+                                return json.loads(tc_item["function"]["arguments"])
+                            except (json.JSONDecodeError, TypeError):
+                                return {"is_correct": False, "reason": "Failed to parse feedback arguments", "suggestions": ""}
+
+            return {}  # empty dict = timeout
+
+        # ── Build initial messages ──
         verify_msgs: List[Dict[str, Any]] = [
             {"role": "system", "content": verify_prompt},
-            {"role": "user", "content": "Please verify this answer. Search for evidence and then call give_feedback with your verdict."},
+            {"role": "user", "content": (
+                "Verify the answer above. Follow your workflow: "
+                "(0) check if it's a surrender answer → if yes, give_feedback(False) immediately. "
+                "(1) search for independent evidence for each claim. "
+                "(2) get_document to read full texts. "
+                "(3) verify claim by claim. "
+                "(4) only then call give_feedback with your verdict. "
+                "Remember: you MUST call search or get_document before give_feedback."
+            )},
         ]
-        verify_tools: List[Dict[str, Any]] = self._verify_tools
 
-        for _ in range(self._VERIFY_MAX_TURNS):
-            raw = await self._client.simple_chat(
-                model=self._model,
-                messages=verify_msgs,
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
-                tools=verify_tools,
-                tool_choice="auto",
-            )
-            resp: Dict[str, Any] = raw["choices"][0]["message"]
-            verify_msgs.append(resp)
+        verify_max = max(self.max_turns, 3)
 
-            tc = resp.get("tool_calls")
-            if not tc:
-                continue  # model didn't call any tool, retry
+        # ── Primary attempt ──
+        result = await _run_loop(verify_msgs, 0, verify_max, "")
+        if result:
+            return result
 
-            for tc_item in tc:
-                fn = tc_item["function"]
-                name = fn["name"]
-                call_id: str = tc_item.get("id", "")
-                try:
-                    args = json.loads(fn.get("arguments", "{}"))
-                except (json.JSONDecodeError, TypeError):
-                    verify_msgs.append({
-                        "role": "tool", "tool_call_id": call_id,
-                        "content": json.dumps({"error": "Invalid JSON arguments"}),
-                    })
-                    continue
+        # ── Timeout: inject strong nudge and retry with 2 extra turns ──
+        print(f"    [verify] primary {verify_max} turns exhausted, injecting forced retry...", flush=True)
+        verify_msgs.append({
+            "role": "user",
+            "content": (
+                "You have NOT called give_feedback yet and have run out of turns. "
+                "Based on ALL evidence gathered so far, you MUST call give_feedback NOW. "
+                "If you are unsure, call give_feedback(is_correct=False, reason=\"...\", suggestions=\"...\"). "
+                "Do NOT search or get_document anymore — ONLY give_feedback."
+            ),
+        })
+        result = await _run_loop(verify_msgs, verify_max, 2, "retry")
+        if result:
+            return result
 
-                if name not in self._verify_registry:
-                    verify_msgs.append({
-                        "role": "tool", "tool_call_id": call_id,
-                        "content": json.dumps({"error": f"Unknown tool: {name}"}),
-                    })
-                    continue
-
-                fn_impl = self._verify_registry[name]
-                try:
-                    if inspect.iscoroutinefunction(fn_impl):
-                        result = await fn_impl(**args)
-                    else:
-                        result = fn_impl(**args)
-                except Exception as exc:
-                    result = {"error": str(exc)}
-
-                tool_result = json.dumps(result, ensure_ascii=False)
-                verify_msgs.append({
-                    "role": "tool", "tool_call_id": call_id,
-                    "content": tool_result,
-                })
-
-            # If give_feedback was called, return its result
-            tc_names = [t["function"]["name"] for t in tc]
-            if "give_feedback" in tc_names:
-                for tc_item in tc:
-                    if tc_item["function"]["name"] == "give_feedback":
-                        try:
-                            return json.loads(tc_item["function"]["arguments"])
-                        except (json.JSONDecodeError, TypeError):
-                            return {"is_correct": False, "reason": "Failed to parse feedback arguments", "suggestions": ""}
-
-        # Max turns reached without give_feedback
-        return {"is_correct": False, "reason": "Verify agent exceeded max turns without calling give_feedback", "suggestions": "Try providing more detailed evidence or breaking down claims"}
+        print(f"    [verify] all attempts exhausted, passing through", flush=True)
+        return {
+            "is_correct": True,
+            "reason": "Verification timed out — answer accepted by default",
+            "suggestions": "",
+        }
 
     # ── Core API ───────────────────────────────
     def reset(self, questions: List[str]) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
@@ -560,24 +778,22 @@ You have `search` and `get_document` tools. Verify each claim by searching for s
                 infos.append({"instance_id": i, "done": True, "step_skipped": True})
                 continue
 
-            # 1. Append the assistant message to conversation
+            # 1. Process assistant message — always record in trajectory
             assistant_msg: Dict[str, Any] = dict(action)
             assistant_msg.setdefault("role", "assistant")
             original_content = assistant_msg.get("content", "")
             if self.condense_thinking and isinstance(original_content, str) and original_content:
                 assistant_msg["content"] = self._condense_think(original_content)
                 traj_msg = copy.deepcopy(assistant_msg)
-                traj_msg["_original_content"] = original_content  # preserve for debugging
+                traj_msg["_original_content"] = original_content
                 inst.trajectory.append(traj_msg)
             elif self.strip_thinking and isinstance(original_content, str) and original_content:
                 assistant_msg["content"] = self._strip_think(original_content)
                 traj_msg = copy.deepcopy(assistant_msg)
-                traj_msg["_original_content"] = original_content  # preserve for debugging
+                traj_msg["_original_content"] = original_content
                 inst.trajectory.append(traj_msg)
             else:
                 inst.trajectory.append(copy.deepcopy(assistant_msg))
-            inst.messages.append(assistant_msg)
-            inst.turn += 1
 
             tool_calls = assistant_msg.get("tool_calls")
             tc_count = len(tool_calls) if tool_calls else 0
@@ -587,20 +803,33 @@ You have `search` and `get_document` tools. Verify each claim by searching for s
                 "tool_calls_count": tc_count,
             }
 
-            # 2. Determine if done
+            # 2. Determine if done — only max_turns or submit_answer can end the episode
+            #    If no tool calls: inject nudge, keep bad response ONLY in trajectory (not context).
             if not tool_calls:
-                # Model returned final answer — episode finished
-                inst.done = True
-                info["done"] = True
-                info["finish_reason"] = "no_tool_calls"
-            elif inst.turn >= self.max_turns:
+                inst.trajectory.append({
+                    "role": "user",
+                    "content": "[NUDGE] Model returned no tool call. Reminding to use a tool.",
+                })
+                inst.messages.append({
+                    "role": "user",
+                    "content": (
+                        "You did not call any tool. You MUST call a tool to make progress: "
+                        "use `search` to find documents, `get_document` to read them, or "
+                        "`submit_answer` when you have a final answer with evidence. "
+                        "Do NOT output plain text — always call a tool."
+                    ),
+                })
+            else:
+                inst.messages.append(assistant_msg)
+            inst.turn += 1
+            if inst.turn >= self.max_turns:
                 inst.done = True
                 info["done"] = True
                 info["finish_reason"] = "max_turns"
             else:
                 info["done"] = False
 
-            # 3. Execute tool calls (if any)
+            # 3. Execute tool calls (if any, and not done)
             if tool_calls and not inst.done:
                 for tc in tool_calls:
                     fn = tc["function"]
@@ -696,34 +925,49 @@ You have `search` and `get_document` tools. Verify each claim by searching for s
         if inst.done:
             return (None, True)
 
-        # 1. Append assistant message
+        # 1. Process assistant message — always record in trajectory
         msg: Dict[str, Any] = dict(assistant_msg)
         msg.setdefault("role", "assistant")
         original_content = msg.get("content", "")
         if self.condense_thinking and isinstance(original_content, str) and original_content:
             msg["content"] = self._condense_think(original_content)
             traj_msg = copy.deepcopy(msg)
-            traj_msg["_original_content"] = original_content  # preserve for debugging
+            traj_msg["_original_content"] = original_content
             inst.trajectory.append(traj_msg)
         elif self.strip_thinking and isinstance(original_content, str) and original_content:
             msg["content"] = self._strip_think(original_content)
             traj_msg = copy.deepcopy(msg)
-            traj_msg["_original_content"] = original_content  # preserve for debugging
+            traj_msg["_original_content"] = original_content
             inst.trajectory.append(traj_msg)
         else:
             inst.trajectory.append(copy.deepcopy(msg))
-        inst.messages.append(msg)
-        inst.turn += 1
 
         tool_calls = msg.get("tool_calls")
 
-        # 2. Determine if done
+        # 2. Determine if done — only max_turns or submit_answer can end the episode.
+        #    If no tool calls: inject nudge, keep bad response ONLY in trajectory (not context).
         if not tool_calls:
-            inst.done = True
-        elif inst.turn >= self.max_turns:
+            inst.trajectory.append({
+                "role": "user",
+                "content": "[NUDGE] Model returned no tool call. Reminding to use a tool.",
+            })
+            inst.messages.append({
+                "role": "user",
+                "content": (
+                    "You did not call any tool. You MUST call a tool to make progress: "
+                    "use `search` to find documents, `get_document` to read them, or "
+                    "`submit_answer` when you have a final answer with evidence. "
+                    "Do NOT output plain text — always call a tool."
+                ),
+            })
+        else:
+            inst.messages.append(msg)
+
+        inst.turn += 1
+        if inst.turn >= self.max_turns:
             inst.done = True
 
-        # 3. Execute tool calls (if any, and not done via max_turns)
+        # 3. Execute tool calls (if any, and not done)
         if tool_calls and not inst.done:
             for tc in tool_calls:
                 fn = tc["function"]

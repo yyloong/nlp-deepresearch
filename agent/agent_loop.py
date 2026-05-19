@@ -106,24 +106,16 @@ You MUST work in the following order:
 6. If documents don't provide enough information, refine your search query from different angles. **Apply BM25 Rules 6-8:** (6) use equivalent expressions and relation inverses, (7) reorder search by entity distinctiveness, (8) split combined queries into simpler single-entity queries.
 7. The answer **MUST** match the question perfectly — otherwise continue searching.
 
-### HOW TO SUBMIT YOUR FINAL ANSWER ###
+**CRITICAL: You MUST call `submit_answer` to provide your final answer. Never output an answer as plain text — always use the `submit_answer` tool.**
 
-When you believe you have found the correct answer with solid evidence, call the `submit_answer` tool:
+**CRITICAL: Never output `[TOOL_CALL: ...]` or `[tool]: ...` as text.** These are internal context markers from conversation compression. Always use proper function-calling for tool invocations. If you see these markers in the conversation history, ignore their format — use the real `search`, `get_document`, and `submit_answer` tools instead.
 
-```
-submit_answer(
-    answer="<your concise final answer>",
-    evidence="Claim 1: <fact> -> Source: docid=<X>, quote=<exact text>; Claim 2: ..."
-)
-```
-
-**What happens next:** A verify agent will independently check your answer against the document corpus. It has `search` and `get_document` tools and will verify each claim. It returns feedback:
-
-- If **correct**: the verify agent confirms, and your answer is accepted.
-- If **incorrect**: you will receive specific feedback with suggestions for what to search next. Use this feedback to refine your search and try `submit_answer` again.
-
-**Important:** Never output a final answer as plain text — always use `submit_answer`. The verify agent will tell you if you're right. If you get negative feedback, do NOT give up — use the suggestions to search from a different angle and try again.
+**CRITICAL — Entity Identity & Relationship Check:** Before submitting your answer, carefully verify:
+- Are you naming the CORRECT entity? Similar descriptions may match multiple entities — confirm that ALL clues uniquely identify THIS specific entity and not a similar one.
+- Are subject/object relationships correct? Check who did what to whom. "A defeated B" ≠ "B defeated A". "A is B's father" ≠ "B is A's father".
+- Does the logical chain hold? If the question requires A → B → C, verify each link independently. Evidence for A and evidence for C does NOT prove A → B → C.
 """
+
 
 # ── Context condensation ──────────────────────
 

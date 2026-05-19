@@ -458,12 +458,13 @@ async def process_one_question(
 
         if done:
             tc_final = resp.get("tool_calls")
-            # Check if done was triggered by submit_answer verification
             tc_names = [t["function"]["name"] for t in tc_final] if tc_final else []
             if "submit_answer" in tc_names:
                 finish_reason = "submit_answer_confirmed"
             else:
-                finish_reason = "max_turns" if (tc_final and len(tc_final) > 0) else "no_tool_calls"
+                # done=True with no submit_answer → must be max_turns
+                # (no_tool_calls no longer ends the episode since the step_single fix)
+                finish_reason = "max_turns"
             break
 
         # ── 6. Context condensation ──
@@ -540,6 +541,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--query-ids", type=str, default=None,
                    help="Comma-separated list of query IDs to run (e.g. '442,26,471')")
     p.add_argument("--no-eval", action="store_true", help="Skip evaluation")
+    p.add_argument("--no-verify", action="store_true", help="Disable verify agent (submit_answer returns mock success)")
     # ── Serial-only 或额外参数 ──
     p.add_argument("--max-context", type=int, default=40960,
                    help="Max context window for auto-condensation")
@@ -584,6 +586,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     print(f"max_tool_calls: {args.max_tool_calls_per_turn}")
     print(f"condense_thinking: {condense_thinking}")
     print(f"no_think:   {args.no_think}")
+    print(f"verify:     {not args.no_verify}")
     print(f"Output:     {args.output_dir}/")
     print(f"===============================")
     print()
@@ -606,6 +609,7 @@ async def _main_async(args: argparse.Namespace) -> None:
         model=args.model,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
+        enable_verify=not args.no_verify,
     )
     tools = env.tool_specs
 
