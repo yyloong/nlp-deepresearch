@@ -100,24 +100,29 @@ You MUST work in the following order:
 
 1. Search for specific entities (names, places, dates) rather than long descriptive phrases.
 2. After getting results, extract names/entities from them and use those for your next search.
-3. If a snippet looks even partially relevant,use **call get_document** to read more detailed information and collect information in a more comprehensive way and in a full context,some times information can be totally different in different context,only reading snippets can be misleading.
-4. After get the detailed document, find key **relevant** information.
-5. Then if there are other documents that you haven't check detailedly, you should continue to search and get the detailed information.
-6.If you find all documents can not provided enough information,keep searching,refine your search query and consider if you can search from a different angle then rewrite your search query and for more useful documents again. **When rewriting, apply the strategies from BM25 Rules 6-8 above:** (6) use equivalent expressions and relation inverses, (7) reorder search by entity distinctiveness, (8) split combined queries into simpler single-entity queries.
-7.The answer **MUST** match the question perfectly otherwise you should continue to search.
+3. If a snippet looks even partially relevant, call `get_document` to read the full text. Snippets can be misleading without full context.
+4. After reading the full document, extract key **relevant** information and quote exact supporting text.
+5. If there are other documents you haven't checked in detail, continue searching and reading.
+6. If documents don't provide enough information, refine your search query from different angles. **Apply BM25 Rules 6-8:** (6) use equivalent expressions and relation inverses, (7) reorder search by entity distinctiveness, (8) split combined queries into simpler single-entity queries.
+7. The answer **MUST** match the question perfectly — otherwise continue searching.
 
-You are **NOT** allowed to output the following content unless you are totally confident about your answer:
+### HOW TO SUBMIT YOUR FINAL ANSWER ###
 
-**I am sure that the answer is totally correct,and the evidence is**
-evidence:
-Evidence Mapping (list each claim and its source):
-  Claim 1: <what I assert>
-    → Source: docid=<X>, quote="<exact supporting text from the document>"
-  Claim 2: ...
-  (add more claims as needed)
-answer:
-Explanation: <step-by-step reasoning, citing docids for each claim>
-Exact Answer: <concise final answer>
+When you believe you have found the correct answer with solid evidence, call the `submit_answer` tool:
+
+```
+submit_answer(
+    answer="<your concise final answer>",
+    evidence="Claim 1: <fact> -> Source: docid=<X>, quote=<exact text>; Claim 2: ..."
+)
+```
+
+**What happens next:** A verify agent will independently check your answer against the document corpus. It has `search` and `get_document` tools and will verify each claim. It returns feedback:
+
+- If **correct**: the verify agent confirms, and your answer is accepted.
+- If **incorrect**: you will receive specific feedback with suggestions for what to search next. Use this feedback to refine your search and try `submit_answer` again.
+
+**Important:** Never output a final answer as plain text — always use `submit_answer`. The verify agent will tell you if you're right. If you get negative feedback, do NOT give up — use the suggestions to search from a different angle and try again.
 """
 
 # ── Context condensation ──────────────────────
@@ -337,7 +342,7 @@ async def _run_one_question_async(
             resp["tool_calls"] = tc[:max_tool_calls_per_turn]
 
         # ── env.step_single ──
-        obs, done = env.step_single(slot_id, resp)
+        obs, done = await env.step_single(slot_id, resp)
 
         if done:
             break
@@ -489,6 +494,10 @@ async def generate_trajectories(
         record_trajectory=True,
         strip_thinking=strip_thinking,
         condense_thinking=condense_thinking,
+        client=client,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
     )
 
     records: List[Dict[str, Any]] = []

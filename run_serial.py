@@ -340,13 +340,27 @@ async def process_one_question(
         # ── 5. Execute tools via env.step_single ──
         # Capture obs length before step to find new tool-result messages
         n_msgs_before_step = len(obs)
-        obs, done = env.step_single(0, resp)
+        obs, done = await env.step_single(0, resp)
         n_tokens_after = count_tokens_messages(_tok, obs) if obs is not None else n_tokens_before
         st["n_tokens_after"] = n_tokens_after
         st["elapsed"] = time.time() - t_turn_start
 
         # ── Extract and log: condensed assistant content & tool results ──
-        # When done=True, step_single returns obs=None (no new messages to show)
+        # When submit_answer confirms correctness, step_single returns obs=None.
+        # Grab the feedback from the last tool message in the trajectory.
+        if obs is None:
+            traj = env._instances[0].trajectory
+            for m in reversed(traj):
+                if m.get("role") == "tool" and "is_correct" in (m.get("content", "") or ""):
+                    try:
+                        fb = json.loads(m["content"])
+                        verdict = "CORRECT" if fb.get("is_correct") else "INCORRECT"
+                        print(f"    │ [verify] {verdict} — {fb.get('reason', '')[:200]}", flush=True)
+                        if fb.get("suggestions"):
+                            print(f"    │ [verify] suggestions: {fb['suggestions'][:200]}", flush=True)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    break
         if obs is not None:
             new_msgs = obs[n_msgs_before_step:]
             for nm in new_msgs:
@@ -444,7 +458,12 @@ async def process_one_question(
 
         if done:
             tc_final = resp.get("tool_calls")
-            finish_reason = "max_turns" if (tc_final and len(tc_final) > 0) else "no_tool_calls"
+            # Check if done was triggered by submit_answer verification
+            tc_names = [t["function"]["name"] for t in tc_final] if tc_final else []
+            if "submit_answer" in tc_names:
+                finish_reason = "submit_answer_confirmed"
+            else:
+                finish_reason = "max_turns" if (tc_final and len(tc_final) > 0) else "no_tool_calls"
             break
 
         # ── 6. Context condensation ──
@@ -583,6 +602,10 @@ async def _main_async(args: argparse.Namespace) -> None:
         record_trajectory=True,
         strip_thinking=not args.no_strip_thinking,
         condense_thinking=condense_thinking,
+        client=client,
+        model=args.model,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
     )
     tools = env.tool_specs
 
@@ -690,7 +713,8 @@ async def _main_async(args: argparse.Namespace) -> None:
     gen_time = time.time() - t_start
 
     # ── Final summary ──
-    n_correct = sum(1 for r in records if r["status"] == "no_tool_calls")
+    n_confirmed = sum(1 for r in records if r["status"] == "submit_answer_confirmed")
+    n_no_tc = sum(1 for r in records if r["status"] == "no_tool_calls")
     n_max_turns = sum(1 for r in records if r["status"] == "max_turns")
     total_turns = sum(
         sum(1 for m in r["messages"] if m.get("role") == "assistant")
@@ -699,7 +723,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     print(f"\n{'=' * 80}")
     print(f"  Done: {len(records)} queries in {gen_time:.1f}s "
           f"({gen_time / max(len(records), 1):.1f}s avg)")
-    print(f"  Stopped by no_tool_calls: {n_correct}  |  max_turns: {n_max_turns}")
+    print(f"  submit_answer_confirmed: {n_confirmed}  |  no_tool_calls: {n_no_tc}  |  max_turns: {n_max_turns}")
     print(f"  Total assistant turns: {total_turns}")
     print(f"  Saved: {submission_path}")
     print(f"  Trajectories: {traj_dir}/")

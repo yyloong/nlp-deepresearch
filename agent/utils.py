@@ -401,13 +401,26 @@ def validate_tool_call(
 def extract_final_answer(messages: List[Dict[str, Any]]) -> Optional[str]:
     """Extract the final predicted answer from the trajectory.
 
-    1. Find the last assistant message with non-empty content.
-    2. Strip ``<think>...</think>`` blocks (including unclosed ones).
-    3. If an "Exact Answer:" marker is found, return only the text after it.
-    4. Otherwise return the (stripped) full content.
+    1. First check for ``submit_answer`` tool calls (new flow).
+    2. Fall back to text-based extraction from assistant content.
     """
     import re
 
+    # ── Priority 1: submit_answer tool call ──
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        for tc in (msg.get("tool_calls") or []):
+            if tc.get("function", {}).get("name") == "submit_answer":
+                try:
+                    args = json.loads(tc["function"].get("arguments", "{}"))
+                    answer = args.get("answer", "").strip()
+                    if answer:
+                        return answer
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+    # ── Priority 2: text-based extraction (legacy / no-tool-call answers) ──
     for msg in reversed(messages):
         if msg.get("role") != "assistant":
             continue
@@ -427,7 +440,6 @@ def extract_final_answer(messages: List[Dict[str, Any]]) -> Optional[str]:
         )
         if match:
             answer = match.group(1).strip()
-            # Remove trailing explanation fluff that sometimes leaks
             answer = re.sub(r"\n\s*Explanation\s*:.*$", "", answer, flags=re.IGNORECASE | re.DOTALL)
             return answer.strip()
         return content

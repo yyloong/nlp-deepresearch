@@ -26,7 +26,9 @@ Typical training loop::
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import inspect
 import json
 import logging
 from dataclasses import dataclass, field
@@ -141,6 +143,11 @@ class DeepResearchEnv:
         record_trajectory: bool = True,
         strip_thinking: bool = True,
         condense_thinking: bool = False,
+        # Verify-agent dependencies (needed for submit_answer tool)
+        client: Any = None,
+        model: str = "",
+        max_tokens: int = 4096,
+        temperature: float = 0.0,
     ) -> None:
         self.n_envs = n_envs
         self.system_prompt = system_prompt
@@ -150,6 +157,13 @@ class DeepResearchEnv:
         self.record_trajectory = record_trajectory
         self.strip_thinking = strip_thinking
         self.condense_thinking = condense_thinking
+
+        # Verify-agent config
+        self._client = client
+        self._model = model
+        self._max_tokens = max_tokens
+        self._temperature = temperature
+        self._question: str = ""  # set by reset_slot
 
         # Shared searcher (thread-safe for reads; tool calls are synchronous)
         self._searcher: BrowseCompBM25Searcher = build_searcher(index_path)
@@ -162,8 +176,18 @@ class DeepResearchEnv:
         self._finished_trajectories: List[Optional[List[Dict[str, Any]]]] = []
 
     # ── Tool registry ──────────────────────────
+    @property
+    def tool_specs(self) -> List[Dict[str, Any]]:
+        """Return the OpenAI-format tool specs for the model."""
+        return self._tools
+
+    @property
+    def verify_tool_specs(self) -> List[Dict[str, Any]]:
+        """Return tool specs for the verify agent (search + get_document + give_feedback)."""
+        return self._verify_tools
+
     def _build_tool_specs(self) -> Tuple[List[Dict[str, Any]], Dict[str, Callable[..., Any]]]:
-        """Build OpenAI-format tool specs and callable registry."""
+        """Build OpenAI-format tool specs and callable registry for main agent + verify agent."""
 
         def search(query: str) -> List[Dict[str, Any]]:
             docs = self._searcher.search(query, k=self.search_k)
@@ -183,7 +207,23 @@ class DeepResearchEnv:
                 return {"docid": docid, "error": "document not found"}
             return doc
 
-        tools = [
+        async def submit_answer(answer: str, evidence: str) -> Dict[str, Any]:
+            """Submit final answer for verification. Triggers a verify agent that checks the answer."""
+            if self._client is None:
+                return {"error": "No model client configured for verification"}
+            return await self._run_verify_agent(answer, evidence)
+
+        def give_feedback(is_correct: bool, reason: str, suggestions: str = "") -> Dict[str, Any]:
+            """Called by the verify agent to report its verification verdict.
+            Only available to the verify agent, NOT to the main agent."""
+            return {
+                "is_correct": is_correct,
+                "reason": reason,
+                "suggestions": suggestions,
+            }
+
+        # ── Main agent tools (search + get_document + submit_answer) ──
+        main_tools = [
             {
                 "type": "function",
                 "function": {
@@ -215,13 +255,217 @@ class DeepResearchEnv:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "submit_answer",
+                    "description": (
+                        "Submit your final answer for verification. A verify agent will independently "
+                        "check your answer against the document corpus and provide feedback. "
+                        "If the answer is incorrect, you will receive suggestions and can continue searching."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "answer": {
+                                "type": "string",
+                                "description": "Your final concise answer",
+                            },
+                            "evidence": {
+                                "type": "string",
+                                "description": (
+                                    "Chain-of-evidence mapping each claim to its source docid and quote. "
+                                    "Format: Claim 1: ... → Source: docid=X, quote=\"...\""
+                                ),
+                            },
+                        },
+                        "required": ["answer", "evidence"],
+                    },
+                },
+            },
         ]
-        return tools, {"search": search, "get_document": get_document}
 
-    @property
-    def tool_specs(self) -> List[Dict[str, Any]]:
-        """OpenAI-format tool definitions (for use by the policy model)."""
-        return self._tools
+        # ── Verify agent tools (search + get_document + give_feedback) ──
+        verify_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": (
+                        f"Search the BrowseComp-Plus BM25 index and return top-{self.search_k} results "
+                        "with docid, score, and snippet."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search query"},
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_document",
+                    "description": "Retrieve a full document by its docid.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "docid": {"type": "string", "description": "Document id"},
+                        },
+                        "required": ["docid"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "give_feedback",
+                    "description": (
+                        "Report your verification verdict. Call this AFTER thoroughly checking all claims. "
+                        "If the answer is wrong, provide specific, actionable suggestions for improvement."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "is_correct": {
+                                "type": "boolean",
+                                "description": "True if the answer is fully correct, False otherwise",
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Brief explanation of your verdict",
+                            },
+                            "suggestions": {
+                                "type": "string",
+                                "description": (
+                                    "If incorrect: specific suggestions for what to search next, "
+                                    "which claims to re-examine, or which angle to pursue"
+                                ),
+                            },
+                        },
+                        "required": ["is_correct", "reason"],
+                    },
+                },
+            },
+        ]
+
+        self._verify_tools = verify_tools
+        self._verify_registry = {
+            "search": search,
+            "get_document": get_document,
+            "give_feedback": give_feedback,
+        }
+
+        return main_tools, {
+            "search": search,
+            "get_document": get_document,
+            "submit_answer": submit_answer,
+        }
+
+    # ── Verify Agent ──────────────────────────
+
+    _VERIFY_SYSTEM_PROMPT = """\
+You are a Verification Agent. Your job is to independently verify whether a proposed answer to a question is correct, using the document corpus.
+
+**Question:** {question}
+**Proposed Answer:** {answer}
+**Claimed Evidence:**
+{evidence}
+
+You have `search` and `get_document` tools. Verify each claim by searching for supporting documents.
+
+**Rules:**
+1. For each claim, search for independent evidence — do NOT just trust the claimed evidence.
+2. Use get_document to read full documents; snippets alone can be misleading.
+3. Check that the answer exactly matches what the question asks (not a related but different question).
+4. If the evidence supports all claims and the answer is correct, call `give_feedback(is_correct=True, ...)`.
+5. If any claim is unsupported or the answer is wrong, call `give_feedback(is_correct=False, ...)` with specific, actionable suggestions.
+6. Do NOT call give_feedback until you have thoroughly searched and verified.
+"""
+
+    _VERIFY_MAX_TURNS = 5
+
+    async def _run_verify_agent(self, answer: str, evidence: str) -> Dict[str, Any]:
+        """Run a short verify-agent loop that checks the answer and returns feedback."""
+        if self._client is None:
+            return {"error": "No model client available for verification"}
+
+        verify_prompt = self._VERIFY_SYSTEM_PROMPT.format(
+            question=self._question,
+            answer=answer,
+            evidence=evidence,
+        )
+        verify_msgs: List[Dict[str, Any]] = [
+            {"role": "system", "content": verify_prompt},
+            {"role": "user", "content": "Please verify this answer. Search for evidence and then call give_feedback with your verdict."},
+        ]
+        verify_tools: List[Dict[str, Any]] = self._verify_tools
+
+        for _ in range(self._VERIFY_MAX_TURNS):
+            raw = await self._client.simple_chat(
+                model=self._model,
+                messages=verify_msgs,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+                tools=verify_tools,
+                tool_choice="auto",
+            )
+            resp: Dict[str, Any] = raw["choices"][0]["message"]
+            verify_msgs.append(resp)
+
+            tc = resp.get("tool_calls")
+            if not tc:
+                continue  # model didn't call any tool, retry
+
+            for tc_item in tc:
+                fn = tc_item["function"]
+                name = fn["name"]
+                call_id: str = tc_item.get("id", "")
+                try:
+                    args = json.loads(fn.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    verify_msgs.append({
+                        "role": "tool", "tool_call_id": call_id,
+                        "content": json.dumps({"error": "Invalid JSON arguments"}),
+                    })
+                    continue
+
+                if name not in self._verify_registry:
+                    verify_msgs.append({
+                        "role": "tool", "tool_call_id": call_id,
+                        "content": json.dumps({"error": f"Unknown tool: {name}"}),
+                    })
+                    continue
+
+                fn_impl = self._verify_registry[name]
+                try:
+                    if inspect.iscoroutinefunction(fn_impl):
+                        result = await fn_impl(**args)
+                    else:
+                        result = fn_impl(**args)
+                except Exception as exc:
+                    result = {"error": str(exc)}
+
+                tool_result = json.dumps(result, ensure_ascii=False)
+                verify_msgs.append({
+                    "role": "tool", "tool_call_id": call_id,
+                    "content": tool_result,
+                })
+
+            # If give_feedback was called, return its result
+            tc_names = [t["function"]["name"] for t in tc]
+            if "give_feedback" in tc_names:
+                for tc_item in tc:
+                    if tc_item["function"]["name"] == "give_feedback":
+                        try:
+                            return json.loads(tc_item["function"]["arguments"])
+                        except (json.JSONDecodeError, TypeError):
+                            return {"is_correct": False, "reason": "Failed to parse feedback arguments", "suggestions": ""}
+
+        # Max turns reached without give_feedback
+        return {"is_correct": False, "reason": "Verify agent exceeded max turns without calling give_feedback", "suggestions": "Try providing more detailed evidence or breaking down claims"}
 
     # ── Core API ───────────────────────────────
     def reset(self, questions: List[str]) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
@@ -267,7 +511,7 @@ class DeepResearchEnv:
 
         return observations, infos
 
-    def step(
+    async def step(
         self, actions: List[Dict[str, Any]]
     ) -> Tuple[
         List[Optional[List[Dict[str, Any]]]],
@@ -394,11 +638,13 @@ class DeepResearchEnv:
                         })
                     else:
                         try:
-                            raw = self._registry[name](**args)
+                            fn_impl = self._registry[name]
+                            if inspect.iscoroutinefunction(fn_impl):
+                                raw = await fn_impl(**args)
+                            else:
+                                raw = fn_impl(**args)
                             tool_result = json.dumps(raw, ensure_ascii=False)
                         except TypeError as exc:
-                            # Wrong argument names or counts
-                            import inspect
                             sig = inspect.signature(self._registry[name])
                             tool_result = json.dumps({
                                 "error": f"Invalid arguments for '{name}': {exc}. "
@@ -438,7 +684,7 @@ class DeepResearchEnv:
 
         return next_obs, rewards, dones, infos
 
-    def step_single(
+    async def step_single(
         self, slot_id: int, assistant_msg: Dict[str, Any]
     ) -> Tuple[Optional[List[Dict[str, Any]]], bool]:
         """Process one step for a single instance.
@@ -510,10 +756,13 @@ class DeepResearchEnv:
                     })
                 else:
                     try:
-                        raw = self._registry[name](**args)
+                        fn_impl = self._registry[name]
+                        if inspect.iscoroutinefunction(fn_impl):
+                            raw = await fn_impl(**args)
+                        else:
+                            raw = fn_impl(**args)
                         tool_result = json.dumps(raw, ensure_ascii=False)
                     except TypeError as exc:
-                        import inspect
                         sig = inspect.signature(self._registry[name])
                         tool_result = json.dumps({
                             "error": f"Invalid arguments for '{name}': {exc}. "
@@ -537,7 +786,22 @@ class DeepResearchEnv:
                     "content": tool_result,
                 })
 
-        # 4. Record trajectory if episode ended
+        # 4. Post-tool-execution: if submit_answer confirmed correctness, episode is done
+        if tool_calls and not inst.done:
+            for tc in tool_calls:
+                if tc["function"]["name"] == "submit_answer":
+                    # Check the tool result for is_correct flag
+                    for msg in inst.messages:
+                        if msg.get("role") == "tool" and msg.get("tool_call_id") == tc.get("id", ""):
+                            try:
+                                fb = json.loads(msg["content"])
+                                if fb.get("is_correct") is True:
+                                    inst.done = True
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                            break
+
+        # 5. Record trajectory if episode ended
         if inst.done and self.record_trajectory:
             self._finished_trajectories[slot_id] = inst.trajectory
 
@@ -734,6 +998,7 @@ class DeepResearchEnv:
 
         Returns the initial observation (messages) for the slot.
         """
+        self._question = question  # store for verify agent
         msgs: List[Dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": question},
