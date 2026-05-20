@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -29,7 +30,6 @@ _tok: Any = AutoTokenizer.from_pretrained(
 from .env import DeepResearchEnv
 from .eval_async import evaluate_trajectories
 from .utils import (
-    RETRY_NUDGE,
     count_tokens_messages,
     extract_final_answer,
     hard_truncate_tail_tool_messages,
@@ -37,365 +37,247 @@ from .utils import (
     validate_tool_call,
 )
 from .vllm_client_async import VLLMClientAsync
+from .agent import Agent, DEFAULT_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-MAX_TOOL_RETRIES = 2  # max retries per turn when tool call validation fails
 
-DEFAULT_SYSTEM_PROMPT = """\
-You are a Deep Research Agent. Answer complex questions by searching a document corpus \
-using `search` and `get_document`. Every answer must be grounded in retrieved evidence.
+# ═══════════════════════════════════════════════════════════════
+# Verbose serial processing (used when n_envs == 1)
+# ═══════════════════════════════════════════════════════════════
 
-**Important Rules:**
-1.You are limited to call one tool per turn but you can call other tools in the future turn,it just limits the rate of the tool calls but not the total number of the tool calls.
-2.search tool is used to get the relevant documents,and get_document tool is used to get the detailed information of the document.
-3.You should collect information step by step,make sure all the answer has its evidence and always have a full understanding of the whole context before you propose a conclusion.
-4.You are in a searching task but not a answering task with context,so feel free to call tools to get more information and details,the accuracy is MUCH MORE IMPORTANT than the speed and I'm not expected that you can anwser immediately but you call proper tool to get detailed information instead.
-5.YOU ARE **NOT** EXPECTED TO ANSWER IMMEDIATELY!!!
+def _tok_count(text: str) -> int:
+    return len(_tok.encode(text))
 
-**Actionable BM25 Search Rules:**
+def _extract_think_blocks(text: str) -> "List[str]":
+    blocks: List[str] = []
+    for m in re.finditer(r"<think>(.*?)</think>", text, re.DOTALL):
+        blocks.append(m.group(1).strip())
+    m = re.search(r"<think>(.*)$", text, re.DOTALL)
+    if m:
+        blocks.append(m.group(1).strip() + " [UNCLOSED]")
+    return blocks
 
-1. **Decompose Multi-Hop Questions (Prevent Query Dilution):**
-   - NEVER put all constraints into one query. BM25 will fail if you ask it to match 10 different facts at once. Break it down into sequential steps.
-   - *Bad:* "wizard who won the Dragon Taming Cup in the 3rd Era worked at a magical academy built by the Elf King"
-   - *Good Step 1:* First, find the academy -> "magical academy" "Elf King"
-   - *Good Step 2:* Then, find the person -> "[Name of Academy from Step 1]" "Dragon Taming Cup" "3rd Era"
+def _log_content_block(label: str, text: str, max_chars: int = 3000) -> None:
+    if not text:
+        return
+    suffix = ""
+    if len(text) > max_chars:
+        n_tok = _tok_count(text)
+        text = text[:max_chars]
+        suffix = f"\n... [truncated, {n_tok} tokens total]"
+    for line in text.split("\n"):
+        print(f"    │ {line}", flush=True)
+    if suffix:
+        print(f"    │{suffix}", flush=True)
 
-2. **Extract High-IDF Nouns ONLY:**
-   - Strip out ALL conversational language, verbs, and relational phrases. Only keep the rarest nouns and entities. 
-   - *Bad:* "a cybernetic pirate who secretly smuggled a glowing pineapple into a spaceship"
-   - *Good:* pirate "glowing pineapple" spaceship (Drop "who secretly smuggled")
+def _log_json_block(label: str, obj: Any) -> None:
+    text = json.dumps(obj, ensure_ascii=False, indent=2)
+    for line in text.split("\n"):
+        print(f"    │ {line}", flush=True)
 
-3. **Strip Relational Operators for Numbers/Dates:**
-   - Remove comparative words. Keep only exact digits or unique text descriptors.
-   - *Bad:* "a vampire born before the year 800 whose creator was a legendary blacksmith"
-   - *Good:* vampire creator blacksmith 800 (Drop "born before the year")
+async def _process_one_question_verbose(
+    env: DeepResearchEnv, agent: Agent, question: str, tools: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
+    import time as _time
+    max_context = agent.max_context
+    max_tokens = agent.max_tokens
+    max_tool_calls_per_turn = agent.max_tool_calls_per_turn
+    obs: List[Dict[str, Any]] = env.reset_slot(0, question)
+    finish_reason = "max_turns"
+    turn_stats: List[Dict[str, Any]] = []
+    total_retries = 0
 
-4. **Target the Most UNIQUE Identifier First:**
-   - Always start your search with the rarest combination of words (Highest IDF tokens) to quickly narrow down the BM25 results.
-   - *Example:* If looking for "a three-headed dog guarding a neon castle during the Great Meteor Shower", start with -> "three-headed dog" "neon castle" "Great Meteor Shower"
+    for turn in range(env.max_turns):
+        t_turn_start = _time.time()
+        n_tokens_before = count_tokens_messages(_tok, obs)
+        st: Dict[str, Any] = {"turn": turn + 1, "n_tokens_before": n_tokens_before,
+                              "think_truncated": False, "retries": 0, "tool_calls": [],
+                              "tool_results": [], "condensed": False}
 
-5. **Iterative BM25 Refinement:**
-   - If snippets are irrelevant, your keywords might be too strict or slightly mismatched in phrasing. DO NOT just repeat the query.
-   - *Strategy:* Drop the least important keywords, or try noun synonyms that might appear in a formal document (e.g., if "cash payment" fails, try "financial settlement" or "compensation").
+        n_msgs = len(obs)
+        print(f"  ┌─ Turn {turn + 1}/{env.max_turns} | msgs: {n_msgs} (sys:{sum(1 for m in obs if m.get('role')=='system')} usr:{sum(1 for m in obs if m.get('role')=='user')} asst:{sum(1 for m in obs if m.get('role')=='assistant')} tool:{sum(1 for m in obs if m.get('role')=='tool')}) | tokens: {n_tokens_before} | {_time.strftime('%H:%M:%S')}", flush=True)
 
-6. **Query Paraphrasing (Equivalent Expressions):**
-   When a query fails, think: is there another way to express the SAME fact using different words or relational inverses?
-   - *Relation inversion:* "A is B's father" ↔ "B is A's son" OR "A has a son/daughter B". "X wrote the book Y" ↔ "X is the author of Y" OR "Y was written by X". Always try the inverse relationship direction — documents may only contain one form.
-   - *Synonym substitution:* "constructed" ↔ "built" / "erected". "resided in" ↔ "lived in" / "inhabited". "penned" ↔ "wrote" / "authored".
-   - **CRITICAL:** Use paraphrasing to AVOID data leakage. When the question gives you specific clue phrases, rephrase them into generic terms before searching, so the search isn't biased by the question's exact wording.
+        safe_limit = max_context - max_tokens - 2000
+        if n_tokens_before > safe_limit:
+            t_cs = _time.time()
+            condensed = await agent.condense_context(obs, original_question=question)
+            env.set_messages(0, condensed)
+            obs = condensed
+            st["condensed"] = True
+            n_tokens_before = count_tokens_messages(_tok, obs)
+            print(f"  ↻ pre-call condensed → {n_tokens_before} tokens ({_time.time() - t_cs:.1f}s)", flush=True)
 
-7. **Search Order by Distinctiveness (NOT Question Order):**
-   Do NOT follow the question's logical order. Search for the MOST DISTINCTIVE entity first, then work backwards.
-   - *Example:* "A (vague: 'a chef') has a student B (medium: 'a pastry maker from Bavaria'), B invented a dessert C (highly specific: 'Black Forest cake with gold leaf')." → Search for C first ("Black Forest cake" "gold leaf"), then use C's context to find B, then trace B back to A.
-   - *Rule:* Rank entities by how UNIQUE / RARE their keywords are (High IDF). The rarest entity narrows the corpus fastest.
+        if n_tokens_before > safe_limit:
+            print(f"  ⚠ context still {n_tokens_before} > {safe_limit} after condense, forcing early stop", flush=True)
+            finish_reason = "context_overflow"
+            break
 
-8. **Keyword Splitting (Anti-Dilution):**
-   If a query combining multiple entities returns poor results, the critical information may be split across DIFFERENT documents, and BM25's bag-of-words scoring dilutes the match.
-   - *Bad (combined):* "chef" "Bavarian pastry maker" "Black Forest cake gold leaf" — three different topics, scores diluted.
-   - *Good (split):* Step 1: search "Black Forest cake" "gold leaf" → find the dessert and its inventor. Step 2: search the inventor's name "Bavaria" → find their teacher. Step 3: search the teacher's name chef.
-   - *Heuristic:* If a query has 3+ distinct named entities/concepts and returns irrelevant results, split it into 2-3 simpler queries, each targeting ONE core entity, then connect the dots from the retrieved documents.
+        raw = await agent.client.simple_chat(model=agent.model, messages=obs, temperature=agent.temperature,
+                                             max_tokens=agent.max_tokens, tools=tools, tool_choice="auto",
+                                             extra_payload=agent.extra_payload)
+        resp: Dict[str, Any] = raw["choices"][0]["message"]
+        final_raw_content: str = resp.get("content", "") or ""
+        raw_content: str = final_raw_content
+        raw_tc = resp.get("tool_calls")
 
-You MUST work in the following order:
+        usage = raw.get("usage", {})
+        if usage:
+            print(f"    │ [model] prompt_tokens={usage.get('prompt_tokens','?')}  completion_tokens={usage.get('completion_tokens','?')}  total={usage.get('total_tokens','?')}", flush=True)
 
-1. Search for specific entities (names, places, dates) rather than long descriptive phrases.
-2. After getting results, extract names/entities from them and use those for your next search.
-3. If a snippet looks even partially relevant, call `get_document` to read the full text. Snippets can be misleading without full context.
-4. After reading the full document, extract key **relevant** information and quote exact supporting text.
-5. If there are other documents you haven't checked in detail, continue searching and reading.
-6. If documents don't provide enough information, refine your search query from different angles. **Apply BM25 Rules 6-8:** (6) use equivalent expressions and relation inverses, (7) reorder search by entity distinctiveness, (8) split combined queries into simpler single-entity queries.
-7. The answer **MUST** match the question perfectly — otherwise continue searching.
+        think_blocks = _extract_think_blocks(raw_content)
+        if think_blocks:
+            print(f"    │ [think] {len(think_blocks)} block(s), {sum(_tok_count(b) for b in think_blocks)} tokens total", flush=True)
+        non_think = raw_content
+        if think_blocks:
+            non_think = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL)
+            non_think = re.sub(r"<think>.*$", "", non_think, flags=re.DOTALL).strip()
+        if non_think:
+            print(f"    │ [content] ({_tok_count(non_think)} tokens):", flush=True)
+            _log_content_block("content", non_think, max_chars=2000)
+        elif raw_tc:
+            print(f"    │ [content] (tool-call only, no text)", flush=True)
 
-**CRITICAL: You MUST call `submit_answer` to provide your final answer. Never output an answer as plain text — always use the `submit_answer` tool.**
-
-**CRITICAL: Never output internal markers as text.** The following are compression artifacts from conversation history — NEVER reproduce them in your output: `[tool ...]`, `[reasoning]`, `[/reasoning]`, `[PROGRESS SUMMARY]`. Always use proper function-calling (`search`, `get_document`, `submit_answer`) instead.
-
-**CRITICAL — Entity Identity & Relationship Check:** Before submitting your answer, carefully verify:
-- Are you naming the CORRECT entity? Similar descriptions may match multiple entities — confirm that ALL clues uniquely identify THIS specific entity and not a similar one.
-- Are subject/object relationships correct? Check who did what to whom. "A defeated B" ≠ "B defeated A". "A is B's father" ≠ "B is A's father".
-- Does the logical chain hold? If the question requires A → B → C, verify each link independently. Evidence for A and evidence for C does NOT prove A → B → C.
-"""
-
-
-# ── Context condensation ──────────────────────
-
-CONDENSE_PROMPT = """\
-You are a research progress summarizer. Compress the conversation history into a \
-dense, structured progress record. Keep only essential information — facts, docids, \
-names, dates, numbers, and search queries. Drop redundant or irrelevant content.
-
-Structure your output as follows:
-
-1. **Clue verification status** — one line per clue: ✓ docid=X, or ✗ unknown
-2. **Searches performed** — query + top docids, one line each
-3. **Key documents** — for each important docid: title + extracted relevant sentences (max 3 per doc)
-4. **Key findings** — bullet points of verified facts with docid references
-5. **What remains to be found** — missing clues to search next
-
-When describing tool calls in the history, summarize them as:
-  [search]: query="..."
-  [get_document]: docid=X → found: <key facts>
-  [submit_answer]: answer="..."
-
-When you see [reasoning] blocks, summarize the key insight in 1-2 sentences."""
-
-
-async def _condense_context(
-    tok: Any,
-    messages: List[Dict[str, Any]],
-    client: VLLMClientAsync,
-    model: str,
-    temperature: float,
-    max_tokens: int,
-    max_context: int,
-    extra_payload: Optional[Dict[str, Any]] = None,
-    original_question: str = "",
-) -> List[Dict[str, Any]]:
-    """Condense conversation history using token-accurate truncation.
-
-    Uses the tokenizer to truncate the transcript so the condense call itself
-    stays within the context window. Rebuilds as: [system, user, summary_user_msg].
-    """
-    if len(messages) <= 4:
-        return messages
-
-    # Use the original question (passed in) to prevent degradation across condensations.
-    # messages[1] may be a prior summary, not the original question.
-    question = original_question or messages[1].get("content", "")
-
-    # Serialize everything after system + user into one transcript
-    import re as _re
-    transcript_lines: List[str] = []
-    for m in messages[2:]:
-        role = m.get("role", "?")
-        content = str(m.get("content", "") or "")
-        # Strip nested PROGRESS SUMMARY headers (prevent recursion across condensations)
-        content = _re.sub(r'\[PROGRESS SUMMARY[^\]]*\]', '', content)
-        # Replace <think>/[TOOL_CALL:] → neutral format so the model doesn't learn them
-        content = _re.sub(r'<think>(.*?)</think>', r'[reasoning]\n\1\n[/reasoning]', content, flags=_re.DOTALL)
-        content = _re.sub(r'<think>(.*)$', r'[reasoning]\n\1\n[/reasoning]', content, flags=_re.DOTALL)
-        content = _re.sub(r'\[TOOL_CALL:\s*(\w+)\((.*?)\)\s*\]', r'[tool \1: \2]', content)
-        content = content.strip()
-        if not content:
-            continue
-        tc = m.get("tool_calls")
-        if tc:
-            for t in tc:
-                fn = t.get("function", {})
-                args_str = fn.get('arguments', '')
+        if raw_tc:
+            print(f"    │ [tool_calls] {len(raw_tc)} call(s):", flush=True)
+            for tci, tc_item in enumerate(raw_tc):
+                fn = tc_item.get("function", {})
+                name = fn.get("name", "?")
                 try:
-                    args = json.loads(args_str)
-                    args_str = json.dumps(args, ensure_ascii=False)
-                except Exception:
-                    pass
-                content += f"\n[tool {fn.get('name', '?')}: {args_str}]"
-        # Token-based truncation for long tool results
-        if role == "tool":
-            content_tokens = count_tokens_messages(tok, [{"role": "user", "content": content}])
-            if content_tokens > 1500:
-                # Truncate to ~1500 tokens
-                ids = tok.encode(content, add_special_tokens=False)
-                if len(ids) > 1500:
-                    content = tok.decode(ids[:1500], skip_special_tokens=True) + "\n...[truncated]"
-        transcript_lines.append(f"[{role}]: {content}")
+                    args_parsed = json.loads(fn.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    args_parsed = fn.get("arguments", "{}")
+                print(f"    │   [{tci}] {name}", flush=True)
+                _log_json_block("args", args_parsed)
 
-    transcript = "\n\n".join(transcript_lines)
-    # Token-based cap for full transcript
-    transcript_tokens = count_tokens_messages(tok, [{"role": "user", "content": transcript}])
-    max_transcript_tokens = 25000
-    if transcript_tokens > max_transcript_tokens:
-        ids = tok.encode(transcript, add_special_tokens=False)
-        transcript = tok.decode(ids[:max_transcript_tokens], skip_special_tokens=True) + "\n\n...[transcript truncated]"
+        content = raw_content
+        tc = raw_tc
+        if is_truncated_think_response(content, tc):
+            st["think_truncated"] = True
+            st["retries"] += 1
+            print(f"    ⚠ [think-trunc] content truncated ({_tok_count(content)} tokens)", flush=True)
+            resp = await agent.retry_think_truncation(obs, resp, tools, lambda m: env.append_to_trajectory(0, m))
+            tc = resp.get("tool_calls")
+            content = resp.get("content", "") or ""
+            final_raw_content = content
+            print(f"    ↪ retry | content: {_tok_count(content)} tokens | tc: {len(tc) if tc else 0}", flush=True)
+            if content:
+                _log_content_block("retry-content", content, max_chars=1000)
 
-    condense_messages = [
-        {"role": "system", "content": CONDENSE_PROMPT},
-        {"role": "user", "content": f"Compress:\n\n{transcript}"},
-    ]
+        if tc:
+            all_errors_init: List[Dict[str, str]] = []
+            for tc_item in tc:
+                err = validate_tool_call(tc_item, tools)
+                if err:
+                    all_errors_init.append({"tool_name": tc_item.get("function", {}).get("name", "?"), "message": err})
+            if all_errors_init:
+                st["retries"] += 1
+                print(f"    ⚠ tool validation failed: {len(all_errors_init)} error(s)", flush=True)
+                for e in all_errors_init:
+                    print(f"       {e['tool_name']}: {e['message']}", flush=True)
+                resp = await agent.retry_tool_validation(obs, resp, tools, lambda m: env.append_to_trajectory(0, m))
+                tc = resp.get("tool_calls")
+                final_raw_content = resp.get("content", "") or ""
 
-    resp = await client.simple_chat(
-        model=model,
-        messages=condense_messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        tools=[],
-        tool_choice="auto",
-        extra_payload=extra_payload,
-    )
-    summary = resp["choices"][0]["message"].get("content", "")
+        tc = resp.get("tool_calls")
+        if tc and len(tc) > max_tool_calls_per_turn:
+            n_truncated = len(tc) - max_tool_calls_per_turn
+            resp = agent.enforce_max_tool_calls(resp)
+            print(f"    ⚠ tool calls truncated ({n_truncated} dropped)", flush=True)
 
-    # Summary goes into a user message — it's new context for the agent
-    summary_msg: Dict[str, Any] = {
-        "role": "user",
-        "content": (
-            f"Original question: {question}\n\n"
-            f"[PROGRESS SUMMARY — prior conversation compressed]\n"
-            f"{summary}"
-        ),
+        tc = resp.get("tool_calls")
+        if tc:
+            for tc_item in tc:
+                fn = tc_item.get("function", {})
+                st["tool_calls"].append({"name": fn.get("name", "?"), "args_preview": str(fn.get("arguments", ""))[:120]})
+
+        n_msgs_before_step = len(obs)
+        obs, done = await env.step_single(0, resp)
+        n_tokens_after = count_tokens_messages(_tok, obs) if obs is not None else n_tokens_before
+        st["n_tokens_after"] = n_tokens_after
+        st["elapsed"] = _time.time() - t_turn_start
+
+        if obs is None:
+            for m in reversed(env._instances[0].trajectory):
+                if m.get("role") == "tool" and "is_correct" in (m.get("content", "") or ""):
+                    try:
+                        fb = json.loads(m["content"])
+                        verdict = "CORRECT" if fb.get("is_correct") else "INCORRECT"
+                        print(f"    │ [verify] {verdict} — {fb.get('reason','')[:200]}", flush=True)
+                        if fb.get("suggestions"):
+                            print(f"    │ [verify] suggestions: {fb['suggestions'][:200]}", flush=True)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    break
+        if obs is not None:
+            for nm in obs[n_msgs_before_step:]:
+                role = nm.get("role", "")
+                if role == "tool":
+                    tc_id = nm.get("tool_call_id", "?")
+                    tool_content = nm.get("content", "") or ""
+                    st["tool_results"].append({"tool_call_id": tc_id, "tokens": _tok_count(tool_content)})
+                    try:
+                        parsed = json.loads(tool_content)
+                        if isinstance(parsed, dict):
+                            keys = list(parsed.keys())
+                            print(f"    │ [tool_result] id={tc_id}  tokens={_tok_count(tool_content)}  keys={keys}", flush=True)
+                            if "error" in parsed:
+                                print(f"    │   ERROR: {str(parsed['error'])[:300]}", flush=True)
+                    except (json.JSONDecodeError, TypeError):
+                        print(f"    │ [tool_result] id={tc_id}  tokens={_tok_count(tool_content)}  (raw text)", flush=True)
+
+        tc_names = [t["name"] for t in st["tool_calls"]]
+        tc_str = ", ".join(tc_names) if tc_names else "(none)"
+        retry_flag = f" retries:{st['retries']}" if st["retries"] else ""
+        cond_flag = " ↻CONDENSED" if st["condensed"] else ""
+        print(f"  └─ turn {turn + 1:2d} done | tokens: {n_tokens_before:5d} → {n_tokens_after:5d} (Δ{n_tokens_after - n_tokens_before:+d}) | tools: {tc_str} → {len(st['tool_results'])} results ({sum(tr['tokens'] for tr in st['tool_results'])} tokens){retry_flag}{cond_flag} | {st['elapsed']:.1f}s", flush=True)
+        turn_stats.append(st)
+        total_retries += st["retries"]
+
+        if done:
+            tc_final = resp.get("tool_calls")
+            tc_names_final = [t["function"]["name"] for t in tc_final] if tc_final else []
+            finish_reason = "submit_answer_confirmed" if "submit_answer" in tc_names_final else "max_turns"
+            break
+
+        used = count_tokens_messages(_tok, obs)
+        safe_limit = max_context - max_tokens - 2000
+        if used > safe_limit * 0.7:
+            last = obs[-1] if obs else None
+            if last is not None and last.get("role") == "tool":
+                hard_truncate_tail_tool_messages(_tok, obs, max_context, label=f"turn {turn + 1}")
+                env.sync_trajectory_tool_tail(0)
+                used_after = count_tokens_messages(_tok, obs)
+                if used_after > max_context // 2:
+                    t_cond_start = _time.time()
+                    condensed = await agent.condense_context(obs)
+                    env.set_messages(0, condensed)
+                    obs = condensed
+                    st["condensed"] = True
+                    print(f"    ↻ context condensed ({used_after} → {count_tokens_messages(_tok, obs)} tokens, {_time.time() - t_cond_start:.1f}s)", flush=True)
+        print()
+
+    return env.extract_slot_trajectory(0), finish_reason, {
+        "total_turns": len(turn_stats), "total_retries": total_retries,
+        "n_think_trunc": sum(1 for s in turn_stats if s["think_truncated"]),
+        "n_condensed": sum(1 for s in turn_stats if s["condensed"]),
+        "final_tokens": turn_stats[-1]["n_tokens_after"] if turn_stats else 0,
+        "tool_calls_total": sum(len(s["tool_calls"]) for s in turn_stats),
+        "turn_details": turn_stats,
     }
-
-    condensed: List[Dict[str, Any]] = [
-        messages[0],   # system prompt
-        summary_msg,   # user: summary of everything so far
-    ]
-
-    before = count_tokens_messages(tok, messages)
-    after = count_tokens_messages(tok, condensed)
-    print(f"  [condense] {before} → {after} tokens ({len(messages)} → {len(condensed)} messages)", flush=True)
-    return condensed
 
 
 # ═══════════════════════════════════════════════════════════════
-# Async per-slot router — 每个 slot 独立协程，一问结束立刻补下一问
+# Async per-slot router
 # ═══════════════════════════════════════════════════════════════
 
 async def _run_one_question_async(
-    slot_id: int,
-    qidx: int,
-    question: str,
-    env: DeepResearchEnv,
-    client: VLLMClientAsync,
-    model: str,
-    tools: List[Dict[str, Any]],
-    max_tokens: int,
-    temperature: float,
-    max_context: int,
-    extra_payload: Optional[Dict[str, Any]],
-    result_queue: "asyncio.Queue[tuple[int, List[Dict[str, Any]]]]",
-    *,
-    done_counter: Optional[List[int]] = None,
-    n_total: int = 0,
-    done_lock: Optional["asyncio.Lock"] = None,
-    max_tool_calls_per_turn: int = 1,
-    think_trunc_no_think: bool = False,
+    slot_id: int, qidx: int, question: str, env: DeepResearchEnv, agent: Agent,
+    tools: List[Dict[str, Any]], result_queue: "asyncio.Queue[tuple[int, List[Dict[str, Any]]]]",
+    *, done_counter=None, n_total=0, done_lock=None,
 ) -> None:
-    """Run a single question to completion in one slot.
-
-    The slot's lifecycle: model → retries → step_single → condense → loop.
-    When done, pushes ``(qidx, trajectory)`` into *result_queue*.
-    If *done_counter* / *done_lock* / *n_total* are provided, prints
-    progress every 10 completions.
-    """
-    import asyncio as _asyncio
-
-    obs: List[Dict[str, Any]] = env.reset_slot(slot_id, question)
-
-    for _ in range(env.max_turns):
-        # ── Model call ──
-        raw = await client.simple_chat(
-            model=model, messages=obs,
-            temperature=temperature, max_tokens=max_tokens,
-            tools=tools, tool_choice="auto", extra_payload=extra_payload,
-        )
-        resp: Dict[str, Any] = raw["choices"][0]["message"]
-
-        # ── Think truncation retry (two-stage: no-think → RETRY_NUDGE) ──
-        content = resp.get("content", "") or ""
-        tc = resp.get("tool_calls")
-        if is_truncated_think_response(content, tc):
-            # Truncate content to 1/5 when think block is incomplete,
-            # close the </think> tag and mark it as truncated
-            if content:
-                resp["content"] = content[:len(content) // 10] + "\n...[THINK_TRUNCATED]\n</think>"
-            # Record the truncated response in trajectory
-            env.append_to_trajectory(slot_id, resp)
-            print(f"    [think-trunc] slot {slot_id}: content truncated ({len(content)} → {len(resp['content'])} chars)", flush=True)
-
-            if think_trunc_no_think:
-                # Stage 1: retry with thinking DISABLED (avoids the repetition loop)
-                no_think_extra = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
-                msgs_no_think = list(obs) + [resp]
-                raw = await client.simple_chat(
-                    model=model, messages=msgs_no_think,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, tool_choice="auto", extra_payload=no_think_extra,
-                )
-                resp = raw["choices"][0]["message"]
-                tc = resp.get("tool_calls")
-                print(f"  [retry] slot {slot_id}: truncated think → retrying with thinking disabled", flush=True)
-
-            if not tc:
-                # Stage 2 (or direct fallback): RETRY_NUDGE
-                if think_trunc_no_think:
-                    env.append_to_trajectory(slot_id, resp)
-                env.append_to_trajectory(slot_id, {"role": "user", "content": RETRY_NUDGE})
-                msgs = list(obs) + [resp, {"role": "user", "content": RETRY_NUDGE}]
-                raw = await client.simple_chat(
-                    model=model, messages=msgs,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, tool_choice="auto", extra_payload=extra_payload,
-                )
-                resp = raw["choices"][0]["message"]
-                tc = resp.get("tool_calls")
-                tag = "no-think retry also failed → " if think_trunc_no_think else ""
-                print(f"  [retry] slot {slot_id}: {tag}RETRY_NUDGE", flush=True)
-
-        # ── Tool validation retry ──
-        if tc:
-            for _retry_num in range(MAX_TOOL_RETRIES):
-                all_errors: List[Dict[str, str]] = []
-                for tc_item in tc:
-                    err = validate_tool_call(tc_item, tools)
-                    if err:
-                        all_errors.append({
-                            "tool_name": tc_item.get("function", {}).get("name", "?"),
-                            "message": err,
-                        })
-                if not all_errors:
-                    break
-                # Record the failed response + error nudge in trajectory
-                env.append_to_trajectory(slot_id, resp)
-                error_lines = [f"- `{e['tool_name']}`: {e['message']}" for e in all_errors]
-                nudge = (
-                    "Your tool call(s) failed validation:\n\n"
-                    + "\n".join(error_lines)
-                    + "\n\nPlease correct the error(s) and try again."
-                )
-                env.append_to_trajectory(slot_id, {"role": "user", "content": nudge})
-                msgs = list(obs) + [resp, {"role": "user", "content": nudge}]
-                raw = await client.simple_chat(
-                    model=model, messages=msgs,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, tool_choice="auto", extra_payload=extra_payload,
-                )
-                resp = raw["choices"][0]["message"]
-                tc = resp.get("tool_calls")
-                if not tc:
-                    break
-
-        # ── Enforce max tool calls per turn ──
-        tc = resp.get("tool_calls")
-        if tc and len(tc) > max_tool_calls_per_turn:
-            resp["tool_calls"] = tc[:max_tool_calls_per_turn]
-
-        # ── env.step_single ──
-        obs, done = await env.step_single(slot_id, resp)
-
-        if done:
-            break
-
-        # ── Context condensation ──
-        used = count_tokens_messages(_tok, obs)
-        if used > max_context // 2:
-            last = obs[-1] if obs else None
-            is_tool_tail = last is not None and last.get("role") == "tool"
-            if is_tool_tail:
-                hard_truncate_tail_tool_messages(_tok, obs, max_context, label=f"slot {slot_id}")
-                # Sync trajectory tool messages with truncated versions
-                env.sync_trajectory_tool_tail(slot_id)
-                used_after = count_tokens_messages(_tok, obs)
-                if used_after > max_context // 2:
-                    condensed = await _condense_context(
-                        _tok, obs, client, model, temperature,
-                        max_tokens, max_context, extra_payload,
-                    )
-                    env.set_messages(slot_id, condensed)
-                    env.replace_trajectory(slot_id, condensed)
-                    obs = condensed
-
-    # ── Report result ──
-    traj = env.extract_slot_trajectory(slot_id)
+    traj = await agent.run_question(env, slot_id, question, tools)
     await result_queue.put((qidx, traj))
-
     if done_counter is not None and done_lock is not None and n_total > 0:
         async with done_lock:
             done_counter[0] += 1
@@ -405,38 +287,16 @@ async def _run_one_question_async(
 
 
 async def run_agent_async_router(
-    env: DeepResearchEnv,
-    client: VLLMClientAsync,
-    model: str,
-    questions: List[str],
-    max_context: int = 40960,
-    max_tokens: int = 4096,
-    temperature: float = 0.0,
-    extra_payload: Optional[Dict[str, Any]] = None,
-    max_tool_calls_per_turn: int = 1,
-    think_trunc_no_think: bool = False,
+    env: DeepResearchEnv, agent: Agent, questions: List[str],
 ) -> List[List[Dict[str, Any]]]:
-    """Fully-async per-slot router — no idle time between questions.
-
-    Each env slot runs as an independent coroutine.  When a slot finishes
-    one question it immediately pulls the next from the queue.  Model calls
-    and tool execution never block sibling slots.
-
-    Returns trajectories in the same order as *questions*.
-    """
     import asyncio as _asyncio
-
     n_total = len(questions)
     n_workers = min(env.n_envs, n_total)
     tools = env.tool_specs
-
     pending: "_asyncio.Queue[tuple[int, str]]" = _asyncio.Queue()
     results: "_asyncio.Queue[tuple[int, List[Dict[str, Any]]]]" = _asyncio.Queue()
-
     for qidx, q in enumerate(questions):
         await pending.put((qidx, q))
-
-    # Shared progress counter so workers can print incrementally
     done_counter: List[int] = [0]
     done_lock = _asyncio.Lock()
 
@@ -446,35 +306,16 @@ async def run_agent_async_router(
                 qidx, q = pending.get_nowait()
             except _asyncio.QueueEmpty:
                 return
-            await _run_one_question_async(
-                slot_id=slot_id,
-                qidx=qidx,
-                question=q,
-                env=env,
-                client=client,
-                model=model,
-                tools=tools,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                max_context=max_context,
-                extra_payload=extra_payload,
-                result_queue=results,
-                done_counter=done_counter,
-                n_total=n_total,
-                done_lock=done_lock,
-                max_tool_calls_per_turn=max_tool_calls_per_turn,
-                think_trunc_no_think=think_trunc_no_think,
-            )
+            await _run_one_question_async(slot_id=slot_id, qidx=qidx, question=q, env=env,
+                                          agent=agent, tools=tools, result_queue=results,
+                                          done_counter=done_counter, n_total=n_total, done_lock=done_lock)
 
     workers = [_worker(i) for i in range(n_workers)]
     await _asyncio.gather(*workers)
-
-    # Collect results in original order
     result_dict: Dict[int, List[Dict[str, Any]]] = {}
     for _ in range(n_total):
         qidx, traj = await results.get()
         result_dict[qidx] = traj
-
     return [result_dict[i] for i in range(n_total)]
 
 
@@ -483,83 +324,98 @@ async def run_agent_async_router(
 # ═══════════════════════════════════════════════════════════════
 
 async def generate_trajectories(
-    dataset_path: str,
-    index_path: str,
-    model: str,
-    base_url: str = "http://127.0.0.1:8000/v1",
-    api_key: str = "dummy",
-    output_path: Optional[str] = None,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-    n_envs: int = 4,
-    max_turns: int = 10,
-    temperature: float = 0.0,
-    max_tokens: int = 4096,
-    max_context: int = 40960,
-    search_k: int = 5,
-    snippet_max_chars: int = 1200,
-    extra_payload: Optional[Dict[str, Any]] = None,
-    limit: Optional[int] = None,
-    strip_thinking: bool = True,
-    condense_thinking: bool = False,
-    max_tool_calls_per_turn: int = 1,
-    think_trunc_no_think: bool = False,
+    dataset_path: str, index_path: str, model: str, base_url: str = "http://127.0.0.1:8000/v1",
+    api_key: str = "dummy", output_path: Optional[str] = None,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT, n_envs: int = 4, max_turns: int = 10,
+    temperature: float = 0.0, max_tokens: int = 4096, max_context: int = 40960,
+    search_k: int = 5, snippet_max_chars: int = 1200,
+    extra_payload: Optional[Dict[str, Any]] = None, limit: Optional[int] = None,
+    query_ids: Optional[List[str]] = None,
+    max_tool_calls_per_turn: int = 1, think_trunc_no_think: bool = False,
 ) -> List[Dict[str, Any]]:
     from .dataset_utils import load_jsonl
-
     rows = load_jsonl(dataset_path, limit=limit)
+    if query_ids:
+        ids = set(query_ids)
+        rows = [r for r in rows if r.get("query_id", "") in ids]
+        print(f"Filtered to {len(rows)} queries by query_ids: {sorted(ids)}", flush=True)
     total = len(rows)
     client = VLLMClientAsync(base_url=base_url, api_key=api_key, max_concurrent=n_envs)
 
-    env = DeepResearchEnv(
-        index_path=index_path,
-        n_envs=n_envs,
-        system_prompt=system_prompt,
-        max_turns=max_turns,
-        search_k=search_k,
-        snippet_max_chars=snippet_max_chars,
-        record_trajectory=True,
-        strip_thinking=strip_thinking,
-        condense_thinking=condense_thinking,
-        client=client,
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
+    agent = Agent(client=client, model=model, tokenizer=_tok, max_tokens=max_tokens,
+                  temperature=temperature, max_context=max_context, extra_payload=extra_payload,
+                  max_tool_calls_per_turn=max_tool_calls_per_turn, think_trunc_no_think=think_trunc_no_think)
+    verify_agent = Agent(client=client, model=model, tokenizer=_tok, max_tokens=max_tokens, temperature=temperature)
+
+    env = DeepResearchEnv(index_path=index_path, n_envs=n_envs, system_prompt=system_prompt,
+                          max_turns=max_turns, search_k=search_k, snippet_max_chars=snippet_max_chars,
+                          record_trajectory=True, verify_agent=verify_agent)
 
     records: List[Dict[str, Any]] = []
-
     try:
         all_questions = [r["query"] for r in rows]
         all_qids = [r["query_id"] for r in rows]
 
-        trajs = await run_agent_async_router(
-            env=env,
-            client=client,
-            model=model,
-            questions=all_questions,
-            max_context=max_context,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            extra_payload=extra_payload,
-            max_tool_calls_per_turn=max_tool_calls_per_turn,
-            think_trunc_no_think=think_trunc_no_think,
-        )
+        if n_envs == 1:
+            tools = env.tool_specs
+            traj_dir = ""
+            if output_path:
+                traj_dir = str(Path(output_path).parent / "trajectories")
+                Path(traj_dir).mkdir(parents=True, exist_ok=True)
+            for i, row in enumerate(rows):
+                qid = row["query_id"]
+                question = row["query"]
+                gold_answer = row.get("answer", "") or row.get("gold_answer", "") or ""
+                t0 = time.time()
+                q_preview = question[:200].replace("\n", " ")
+                if len(question) > 200: q_preview += "..."
+                print(f"┌{'─'*78}┐\n│ [{i+1}/{total}]  qid={qid}\n├{'─'*78}┤\n│ Question: {q_preview}")
+                if gold_answer:
+                    gold_preview = gold_answer[:150].replace("\n", " ")
+                    if len(gold_answer) > 150: gold_preview += "..."
+                    print(f"│ Gold Ans: {gold_preview}")
+                print(f"└{'─'*78}┘\n  Running...", flush=True)
 
-        for row, traj in zip(rows, trajs):
-            answer = extract_final_answer(traj) or ""
-            # Infer finish reason from trajectory
-            finish_reason = "unknown"
-            for m in reversed(traj):
-                if m.get("role") == "assistant":
-                    tc = m.get("tool_calls")
-                    finish_reason = "max_turns" if (tc and len(tc) > 0) else "no_tool_calls"
-                    break
-            records.append({
-                "query_id": row["query_id"],
-                "status": finish_reason,
-                "predicted_answer": answer,
-                "messages": traj,
-            })
+                traj, finish_reason, stats = await _process_one_question_verbose(env=env, agent=agent, question=question, tools=tools)
+                answer = extract_final_answer(traj) or ""
+                elapsed = time.time() - t0
+                rec = {"query_id": qid, "status": finish_reason, "predicted_answer": answer, "messages": traj}
+                records.append(rec)
+
+                if traj_dir:
+                    with Path(traj_dir, f"{qid}.json").open("w", encoding="utf-8") as f:
+                        json.dump(rec, f, ensure_ascii=False, indent=2)
+                    # Save condense messages
+                    if agent._condense_sessions:
+                        with Path(traj_dir, f"{qid}_condense.json").open("w", encoding="utf-8") as f:
+                            json.dump({"query_id": qid, "sessions": agent._condense_sessions}, f, ensure_ascii=False, indent=2)
+                    # Save verify messages
+                    if verify_agent._verify_msgs:
+                        with Path(traj_dir, f"{qid}_verify.json").open("w", encoding="utf-8") as f:
+                            json.dump({"query_id": qid, "messages": verify_agent._verify_msgs}, f, ensure_ascii=False, indent=2)
+                    # Save verify condense messages
+                    if verify_agent._condense_sessions:
+                        with Path(traj_dir, f"{qid}_verify_condense.json").open("w", encoding="utf-8") as f:
+                            json.dump({"query_id": qid, "sessions": verify_agent._condense_sessions}, f, ensure_ascii=False, indent=2)
+                    agent.reset_trajectories()
+                    verify_agent.reset_trajectories()
+
+                ans_preview = answer[:200].replace("\n", " ")
+                if len(answer) > 200: ans_preview += "..."
+                print(f"  ┌{'─'*76}┐\n  │ ✓ [{i+1}/{total}] qid={qid}  finished in {elapsed:.1f}s\n  ├{'─'*76}┤\n  │ status:     {finish_reason}\n  │ turns:      {stats['total_turns']}\n  │ retries:    {stats['total_retries']} (think-trunc: {stats['n_think_trunc']}, condensed: {stats['n_condensed']})\n  │ tool calls: {stats['tool_calls_total']}\n  │ tokens:     {stats['final_tokens']}")
+                if answer: print(f"  ├{'─'*76}┤\n  │ Answer: {ans_preview}")
+                print(f"  └{'─'*76}┘\n", flush=True)
+        else:
+            trajs = await run_agent_async_router(env=env, agent=agent, questions=all_questions)
+            for row, traj in zip(rows, trajs):
+                answer = extract_final_answer(traj) or ""
+                finish_reason = "unknown"
+                for m in reversed(traj):
+                    if m.get("role") == "assistant":
+                        tc = m.get("tool_calls")
+                        finish_reason = "max_turns" if (tc and len(tc) > 0) else "no_tool_calls"
+                        break
+                records.append({"query_id": row["query_id"], "status": finish_reason, "predicted_answer": answer, "messages": traj})
 
         print(f"[generate] {len(records)}/{total} queries done", flush=True)
     finally:
@@ -573,56 +429,36 @@ async def generate_trajectories(
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         print(f"[generate] saved {len(records)} trajectories → {output_path}", flush=True)
-
     return records
 
 
 # ═══════════════════════════════════════════════════════════════
-# 一键执行入口
+# CLI
 # ═══════════════════════════════════════════════════════════════
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Deep Research Agent — 一键轨迹生成 + 评估",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python -m agent.agent_loop \\
-      --dataset browsecomp_plus_hard50.jsonl \\
-      --index-path indexes/browsecomp_plus_bm25.sqlite \\
-      --model qwen_auto --max-tokens 4096 --n-envs 4
-
-  python -m agent.agent_loop \\
-      --dataset browsecomp_plus_hard50.jsonl \\
-      --index-path indexes/browsecomp_plus_bm25.sqlite \\
-      --model qwen_auto --limit 10 --no-eval
-        """,
-    )
-    p.add_argument("--dataset", required=True, help="数据集 jsonl 路径")
-    p.add_argument("--index-path", required=True, help="BM25 SQLite 索引路径")
-    p.add_argument("--model", default="qwen_auto", help="vLLM 模型名")
-    p.add_argument("--base-url", default="http://127.0.0.1:8000/v1", help="vLLM 服务地址")
+    p = argparse.ArgumentParser(description="Deep Research Agent — 一键轨迹生成 + 评估",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--index-path", required=True)
+    p.add_argument("--model", default="qwen_auto")
+    p.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     p.add_argument("--api-key", default="dummy")
-    p.add_argument("--output-dir", default="runs", help="输出目录")
-    p.add_argument("--n-envs", type=int, default=4, help="并行 env 实例数")
-    p.add_argument("--max-turns", type=int, default=10, help="最大 tool-calling 轮数")
-    p.add_argument("--max-tokens", type=int, default=4096, help="每轮模型最大 token 数")
-    p.add_argument("--max-context", type=int, default=40960, help="模型最大上下文长度（用于自动压缩判断）")
-    p.add_argument("--max-tool-calls-per-turn", type=int, default=1, help="每轮最大 tool call 数（超出的会被截断）")
-    p.add_argument("--search-k", type=int, default=5, help="search 返回文档数")
+    p.add_argument("--output-dir", default="runs")
+    p.add_argument("--n-envs", type=int, default=4)
+    p.add_argument("--max-turns", type=int, default=10)
+    p.add_argument("--max-tokens", type=int, default=4096)
+    p.add_argument("--max-context", type=int, default=40960)
+    p.add_argument("--max-tool-calls-per-turn", type=int, default=1)
+    p.add_argument("--search-k", type=int, default=5)
     p.add_argument("--snippet-max-chars", type=int, default=1200)
     p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--eval-batch-size", type=int, default=16, help="评估并行数")
-    p.add_argument("--eval-model", default=None, help="评估模型（默认同 --model）")
-    p.add_argument("--limit", type=int, default=None, help="限制处理条数")
-    p.add_argument("--no-eval", action="store_true", help="跳过评估")
-    p.add_argument("--no-strip-thinking", action="store_true", help="保留 <think> 块在上下文中（默认 strip）")
-    p.add_argument("--condense-thinking", action="store_true", help="压缩 <think> 块为简洁的计划摘要而非完全 strip（保留核心目的和规划）")
-    p.add_argument("--no-think", action="store_true", help="禁用模型 thinking 模式（通过 extra_payload 传入 chat_template_kwargs）")
-    p.add_argument("--think-trunc-no-think", action="store_true", default=False,
-                   help="When think-block is truncated, first retry with thinking disabled "
-                        "before falling back to RETRY_NUDGE")
-    p.add_argument("--tokenizer-path", default="Qwen/Qwen3-8B", help="Tokenizer 模型路径（用于精确 token 计数）")
+    p.add_argument("--eval-batch-size", type=int, default=16)
+    p.add_argument("--eval-model", default=None)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--no-eval", action="store_true")
+    p.add_argument("--think-trunc-no-think", action="store_true", default=False)
+    p.add_argument("--tokenizer-path", default="Qwen/Qwen3-8B")
     return p
 
 
@@ -630,126 +466,47 @@ async def _main_async(args: argparse.Namespace) -> None:
     global _TOKENIZER_PATH, _tok
     if args.tokenizer_path != _TOKENIZER_PATH:
         _TOKENIZER_PATH = args.tokenizer_path
-        _tok = AutoTokenizer.from_pretrained(
-            _TOKENIZER_PATH, trust_remote_code=True, local_files_only=True,
-        )
-
+        _tok = AutoTokenizer.from_pretrained(_TOKENIZER_PATH, trust_remote_code=True, local_files_only=True)
     output_dir = Path(args.output_dir)
     ts = time.strftime("%Y%m%d_%H%M%S")
     run_dir = output_dir / f"run_{ts}"
     run_dir.mkdir(parents=True, exist_ok=True)
     submission_path = str(run_dir / "submission.jsonl")
     eval_path = str(run_dir / "eval.jsonl")
-
-    # ── 构建 extra_payload ──
-    extra_payload: Optional[Dict[str, Any]] = None
-    if args.no_think:
-        extra_payload = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
-
-    # ── 1. 生成轨迹 ──
     t0 = time.time()
     records = await generate_trajectories(
-        dataset_path=args.dataset,
-        index_path=args.index_path,
-        model=args.model,
-        base_url=args.base_url,
-        api_key=args.api_key,
-        output_path=submission_path,
-        n_envs=args.n_envs,
-        max_turns=args.max_turns,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-        max_context=args.max_context,
-        search_k=args.search_k,
-        snippet_max_chars=args.snippet_max_chars,
-        extra_payload=extra_payload,
-        limit=args.limit,
-        strip_thinking=not args.no_strip_thinking,
-        condense_thinking=args.condense_thinking,
-        max_tool_calls_per_turn=args.max_tool_calls_per_turn,
-        think_trunc_no_think=args.think_trunc_no_think,
-    )
+        dataset_path=args.dataset, index_path=args.index_path, model=args.model,
+        base_url=args.base_url, api_key=args.api_key, output_path=submission_path,
+        n_envs=args.n_envs, max_turns=args.max_turns, temperature=args.temperature,
+        max_tokens=args.max_tokens, max_context=args.max_context,
+        search_k=args.search_k, snippet_max_chars=args.snippet_max_chars,
+        limit=args.limit, max_tool_calls_per_turn=args.max_tool_calls_per_turn,
+        think_trunc_no_think=args.think_trunc_no_think)
     gen_time = time.time() - t0
     print(f"\n[done] generated {len(records)} trajectories in {gen_time:.1f}s", flush=True)
-
-    if args.no_eval:
-        return
-
-    # ── 2. 评估 ──
+    if args.no_eval: return
     eval_model = args.eval_model or args.model
     t0 = time.time()
-    summary, details = await evaluate_trajectories(
-        records=records,
-        dataset_path=args.dataset,
-        model=eval_model,
-        base_url=args.base_url,
-        api_key=args.api_key,
-        eval_batch_size=args.eval_batch_size,
-        temperature=0.0,
-        max_tokens=8192,
-        output_path=eval_path,
-    )
+    summary, details = await evaluate_trajectories(records=records, dataset_path=args.dataset,
+        model=eval_model, base_url=args.base_url, api_key=args.api_key,
+        eval_batch_size=args.eval_batch_size, temperature=0.0, max_tokens=8192, output_path=eval_path)
     eval_time = time.time() - t0
-
-    # ── 3. 打印结果 ──
-    print(f"\n{'='*50}")
-    print(f"Evaluation complete in {eval_time:.1f}s")
-    print(f"Accuracy: {summary['accuracy']:.2%} ({summary['correct']}/{summary['total_queries']})")
-    print(f"Avg tool calls/query: {summary['avg_tool_calls_per_query']}")
-    print(f"Avg retrieved docs/query: {summary['avg_retrieved_docs_per_query']}")
-    print(f"{'='*50}")
-
-    # ── 4. 拆分保存 correct / incorrect ──
+    print(f"\n{'='*50}\nEvaluation complete in {eval_time:.1f}s\nAccuracy: {summary['accuracy']:.2%} ({summary['correct']}/{summary['total_queries']})\nAvg tool calls/query: {summary['avg_tool_calls_per_query']}\nAvg retrieved docs/query: {summary['avg_retrieved_docs_per_query']}\n{'='*50}")
     eval_map = {d["query_id"]: d["eval_judgment"] for d in details}
     correct_records = [r for r in records if eval_map.get(r["query_id"]) == "CORRECT"]
     incorrect_records = [r for r in records if eval_map.get(r["query_id"]) == "INCORRECT"]
-
-    # 轨迹
-    correct_path = run_dir / "correct.json"
-    incorrect_path = run_dir / "incorrect.json"
-    with correct_path.open("w", encoding="utf-8") as f:
-        for rec in correct_records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    with incorrect_path.open("w", encoding="utf-8") as f:
-        for rec in incorrect_records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-    # eval 评估详情
-    eval_correct = [d for d in details if d["eval_judgment"] == "CORRECT"]
-    eval_incorrect = [d for d in details if d["eval_judgment"] == "INCORRECT"]
-    eval_correct_path = run_dir / "eval_correct.json"
-    eval_incorrect_path = run_dir / "eval_incorrect.json"
-    with eval_correct_path.open("w", encoding="utf-8") as f:
-        for d in eval_correct:
-            f.write(json.dumps(d, ensure_ascii=False) + "\n")
-    with eval_incorrect_path.open("w", encoding="utf-8") as f:
-        for d in eval_incorrect:
-            f.write(json.dumps(d, ensure_ascii=False) + "\n")
-
-    print(f"\nSaved: {len(correct_records)} correct → {correct_path}")
-    print(f"Saved: {len(incorrect_records)} incorrect → {incorrect_path}")
-    print(f"Saved: {len(eval_correct)} eval correct → {eval_correct_path}")
-    print(f"Saved: {len(eval_incorrect)} eval incorrect → {eval_incorrect_path}")
-
-    # 错误案例摘要
-    if incorrect_records:
-        print(f"\nIncorrect ({len(incorrect_records)}):")
-        for d in details:
-            if d["eval_judgment"] == "INCORRECT":
-                print(f"  [{d['query_id']}] pred={d['predicted_answer'][:80]}...")
-                if len([x for x in details if x['eval_judgment']=='INCORRECT']) > 10:
-                    if d == [x for x in details if x['eval_judgment']=='INCORRECT'][9]:
-                        print(f"  ... and {len(incorrect_records)-10} more")
-                        break
+    for name, recs in [("correct.json", correct_records), ("incorrect.json", incorrect_records),
+                        ("eval_correct.json", [d for d in details if d["eval_judgment"]=="CORRECT"]),
+                        ("eval_incorrect.json", [d for d in details if d["eval_judgment"]=="INCORRECT"])]:
+        with (run_dir / name).open("w", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"\nSaved: {len(correct_records)} correct, {len(incorrect_records)} incorrect → {run_dir}")
 
 
 def main():
     args = _build_parser().parse_args()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        stream=sys.stderr,
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stderr)
     asyncio.run(_main_async(args))
 
 

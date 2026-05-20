@@ -1,1 +1,2 @@
-from .env import DeepResearchEnv, DEFAULT_SYSTEM_PROMPT
+from .agent import Agent, DEFAULT_SYSTEM_PROMPT
+from .env import DeepResearchEnv

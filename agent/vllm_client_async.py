@@ -23,6 +23,7 @@ class VLLMClientAsync:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         http_client = httpx.AsyncClient(
             http2=False,
+            trust_env=False,  # ignore HTTP_PROXY / HTTPS_PROXY (vLLM is local)
             limits=httpx.Limits(
                 max_keepalive_connections=0,
                 max_connections=max_concurrent + 10,
