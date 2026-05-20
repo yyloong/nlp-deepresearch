@@ -177,6 +177,7 @@ async def process_one_question(
             condensed = await _condense_context(
                 _tok, obs, client, model, temperature,
                 max_tokens, max_context, extra_payload,
+                original_question=question,
             )
             env.set_messages(0, condensed)
             env.replace_trajectory(0, condensed)

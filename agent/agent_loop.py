@@ -150,6 +150,7 @@ async def _condense_context(
     max_tokens: int,
     max_context: int,
     extra_payload: Optional[Dict[str, Any]] = None,
+    original_question: str = "",
 ) -> List[Dict[str, Any]]:
     """Condense conversation history using token-accurate truncation.
 
@@ -158,6 +159,10 @@ async def _condense_context(
     """
     if len(messages) <= 4:
         return messages
+
+    # Use the original question (passed in) to prevent degradation across condensations.
+    # messages[1] may be a prior summary, not the original question.
+    question = original_question or messages[1].get("content", "")
 
     # Serialize everything after system + user into one transcript
     transcript_lines: List[str] = []
@@ -193,8 +198,8 @@ async def _condense_context(
     summary_msg: Dict[str, Any] = {
         "role": "user",
         "content": (
+            f"Original question: {question}\n\n"
             f"[PROGRESS SUMMARY — prior conversation compressed]\n"
-            f"Original question: {messages[1]['content']}\n\n"
             f"{summary}"
         ),
     }
