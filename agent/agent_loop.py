@@ -108,7 +108,7 @@ You MUST work in the following order:
 
 **CRITICAL: You MUST call `submit_answer` to provide your final answer. Never output an answer as plain text — always use the `submit_answer` tool.**
 
-**CRITICAL: Never output `[TOOL_CALL: ...]` or `[tool]: ...` as text.** These are internal context markers from conversation compression. Always use proper function-calling for tool invocations. If you see these markers in the conversation history, ignore their format — use the real `search`, `get_document`, and `submit_answer` tools instead.
+**CRITICAL: Never output internal markers as text.** The following are compression artifacts from conversation history — NEVER reproduce them in your output: `[tool ...]`, `[reasoning]`, `[/reasoning]`, `[PROGRESS SUMMARY]`. Always use proper function-calling (`search`, `get_document`, `submit_answer`) instead.
 
 **CRITICAL — Entity Identity & Relationship Check:** Before submitting your answer, carefully verify:
 - Are you naming the CORRECT entity? Similar descriptions may match multiple entities — confirm that ALL clues uniquely identify THIS specific entity and not a similar one.

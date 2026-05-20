@@ -294,8 +294,9 @@ class DeepResearchEnv:
                             "evidence": {
                                 "type": "string",
                                 "description": (
-                                    "Chain-of-evidence mapping each claim to its source docid and quote. "
-                                    "Format: Claim 1: ... → Source: docid=X, quote=\"...\""
+                                    "Chain-of-evidence for each claim in your answer. "
+                                    "Format each claim as: Claim N: <what you assert> → Source: docid=X, quote=\"<exact supporting text>\". "
+                                    "Example: Claim 1: The author was born in 1864 → Source: docid=19351, quote=\"Mary H. Debenham (1864-1947)\""
                                 ),
                             },
                         },
