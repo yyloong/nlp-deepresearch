@@ -401,12 +401,13 @@ def validate_tool_call(
 def extract_final_answer(messages: List[Dict[str, Any]]) -> Optional[str]:
     """Extract the final predicted answer from the trajectory.
 
-    1. First check for ``submit_answer`` tool calls (new flow).
-    2. Fall back to text-based extraction from assistant content.
+    1. Proper ``submit_answer`` tool calls.
+    2. Text-based ``[TOOL_CALL: submit_answer(...)]`` (model output format leak).
+    3. Text-based "Exact Answer:" extraction (legacy).
     """
     import re
 
-    # ── Priority 1: submit_answer tool call ──
+    # ── Priority 1: submit_answer tool call (proper function calling) ──
     for msg in reversed(messages):
         if msg.get("role") != "assistant":
             continue
@@ -420,11 +421,30 @@ def extract_final_answer(messages: List[Dict[str, Any]]) -> Optional[str]:
                 except (json.JSONDecodeError, TypeError):
                     pass
 
-    # ── Priority 2: text-based extraction (legacy / no-tool-call answers) ──
+    # ── Priority 2: [TOOL_CALL: submit_answer(...)] in text content ──
     for msg in reversed(messages):
         if msg.get("role") != "assistant":
             continue
-        content = msg.get("content")
+        content = msg.get("content", "")
+        if not content:
+            continue
+        m = re.search(
+            r'\[TOOL_CALL:\s*submit_answer\s*\((.*?)\)\s*\]', content, re.DOTALL,
+        )
+        if m:
+            try:
+                args = json.loads(m.group(1))
+                answer = args.get("answer", "").strip()
+                if answer:
+                    return answer
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # ── Priority 3: text-based "Exact Answer:" extraction (legacy) ──
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", "")
         if not content:
             continue
         # Strip <think> blocks (closed and unclosed)

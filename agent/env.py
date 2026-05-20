@@ -466,12 +466,12 @@ For each claim, check whether the documents you retrieved actually support it. C
 **BEWARE OF ENTITY CONFUSION — The evidence may describe someone/something ELSE:**
 Just because you found evidence matching the DESCRIPTIONS does NOT mean the answer's ENTITY is correct. The same description may fit multiple entities, but the question asks for a SPECIFIC one.
 
-**Example:** The question asks "Who was beaten to death?" Clues: a monkey with golden fur, immense strength, wielded a magical staff, caused havoc in heaven, accompanied a monk on a journey to the West. The answer "Six-Eared Macaque" is WRONG, even though:
+**Example:** The question asks "Who was killed by Sun Wukong?" Clues: a monkey with golden fur, immense strength, wielded a magical staff, caused havoc in heaven, impersonated a monk's disciple. The answer "Sun Wukong" is WRONG, even though:
 - Both Sun Wukong (Monkey King) AND the Six-Eared Macaque match "monkey with golden fur" and "immense strength"
 - Both wielded magical staves
-- Both caused havoc in heaven
-- Both accompanied the monk (the Six-Eared Macaque impersonated Sun Wukong for part of the journey)
-BUT only Sun Wukong was beaten to death (and resurrected). The Six-Eared Macaque was NOT the one beaten to death — he was killed differently. The evidence may superficially match both entities, but the specific EVENT (beaten to death) uniquely identifies Sun Wukong.
+- Both caused havoc
+- Both accompanied the monk (the Six-Eared Macaque impersonated Sun Wukong)
+BUT Sun Wukong was the KILLER, not the victim. The Six-Eared Macaque was the one killed by Sun Wukong. Despite sharing nearly identical descriptions, the subject/object relationship is reversed. The evidence may superficially match both entities, but the specific EVENT (who killed whom) distinguishes them.
 
 **Before calling give_feedback, ask yourself:**
 - Does the evidence confirm THIS specific entity, or just a SIMILAR entity?

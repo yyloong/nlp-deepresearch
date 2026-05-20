@@ -170,6 +170,35 @@ async def process_one_question(
             flush=True,
         )
 
+        # ── Pre-call condense: if context approaches limit, condense BEFORE model call ──
+        safe_limit = max_context - max_tokens - 2000  # reserve for output + overhead
+        if n_tokens_before > safe_limit:
+            t_cs = time.time()
+            condensed = await _condense_context(
+                _tok, obs, client, model, temperature,
+                max_tokens, max_context, extra_payload,
+            )
+            env.set_messages(0, condensed)
+            env.replace_trajectory(0, condensed)
+            obs = condensed
+            st["condensed"] = True
+            n_tokens_before = count_tokens_messages(_tok, obs)
+            print(
+                f"  ↻ pre-call condensed → {n_tokens_before} tokens "
+                f"({time.time() - t_cs:.1f}s)",
+                flush=True,
+            )
+
+        # ── Final safety: if still over limit, grab last submit_answer and end ──
+        if n_tokens_before > safe_limit:
+            print(
+                f"  ⚠ context still {n_tokens_before} > {safe_limit} after condense, "
+                f"forcing early stop with last submit_answer",
+                flush=True,
+            )
+            finish_reason = "context_overflow"
+            break
+
         # ── 1. Model call ──
         raw = await client.simple_chat(
             model=model,
@@ -467,9 +496,10 @@ async def process_one_question(
                 finish_reason = "max_turns"
             break
 
-        # ── 6. Context condensation ──
+        # ── 6. Post-turn context condensation ──
         used = count_tokens_messages(_tok, obs)
-        if used > max_context // 2:
+        safe_limit = max_context - max_tokens - 2000
+        if used > safe_limit * 0.7:  # trigger early, before safe_limit is reached
             last = obs[-1] if obs else None
             if last is not None and last.get("role") == "tool":
                 hard_truncate_tail_tool_messages(
@@ -541,6 +571,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--query-ids", type=str, default=None,
                    help="Comma-separated list of query IDs to run (e.g. '442,26,471')")
     p.add_argument("--no-eval", action="store_true", help="Skip evaluation")
+    p.add_argument("--eval-only", type=str, default=None,
+                   help="Only run eval on an existing submission.jsonl (provide path to submission)")
     p.add_argument("--no-verify", action="store_true", help="Disable verify agent (submit_answer returns mock success)")
     # ── Serial-only 或额外参数 ──
     p.add_argument("--max-context", type=int, default=40960,
@@ -561,6 +593,30 @@ def _build_parser() -> argparse.ArgumentParser:
 
 async def _main_async(args: argparse.Namespace) -> None:
     from agent.dataset_utils import load_jsonl
+
+    # ── Eval-only mode: load existing submission.jsonl and evaluate ──
+    if args.eval_only:
+        records = load_jsonl(args.eval_only)
+        print(f"Loaded {len(records)} records from {args.eval_only}", flush=True)
+        if not args.dataset:
+            sys.exit("ERROR: --dataset is required for eval")
+        eval_model = args.eval_model or args.model
+        eval_path = str(Path(args.eval_only).parent / "eval.jsonl")
+        summary, details = await evaluate_trajectories(
+            records=records,
+            dataset_path=args.dataset,
+            model=eval_model,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            eval_batch_size=args.eval_batch_size,
+            temperature=0.0,
+            max_tokens=8192,
+            output_path=eval_path,
+        )
+        print(f"\nAccuracy: {summary['accuracy']:.2%} ({summary['correct']}/{summary['total_queries']})")
+        print(f"Avg tool calls/query: {summary['avg_tool_calls_per_query']}")
+        print(f"Eval saved: {eval_path}")
+        return
 
     # Validate required args (may come from env vars)
     if not args.dataset:
@@ -718,8 +774,9 @@ async def _main_async(args: argparse.Namespace) -> None:
 
     # ── Final summary ──
     n_confirmed = sum(1 for r in records if r["status"] == "submit_answer_confirmed")
-    n_no_tc = sum(1 for r in records if r["status"] == "no_tool_calls")
     n_max_turns = sum(1 for r in records if r["status"] == "max_turns")
+    n_overflow = sum(1 for r in records if r["status"] == "context_overflow")
+    n_other = len(records) - n_confirmed - n_max_turns - n_overflow
     total_turns = sum(
         sum(1 for m in r["messages"] if m.get("role") == "assistant")
         for r in records
@@ -727,7 +784,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     print(f"\n{'=' * 80}")
     print(f"  Done: {len(records)} queries in {gen_time:.1f}s "
           f"({gen_time / max(len(records), 1):.1f}s avg)")
-    print(f"  submit_answer_confirmed: {n_confirmed}  |  no_tool_calls: {n_no_tc}  |  max_turns: {n_max_turns}")
+    print(f"  submit_answer_confirmed: {n_confirmed}  |  max_turns: {n_max_turns}  |  context_overflow: {n_overflow}  |  other: {n_other}")
     print(f"  Total assistant turns: {total_turns}")
     print(f"  Saved: {submission_path}")
     print(f"  Trajectories: {traj_dir}/")
