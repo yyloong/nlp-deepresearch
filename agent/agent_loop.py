@@ -87,13 +87,13 @@ using `search` and `get_document`. Every answer must be grounded in retrieved ev
 
 7. **Search Order by Distinctiveness (NOT Question Order):**
    Do NOT follow the question's logical order. Search for the MOST DISTINCTIVE entity first, then work backwards.
-   - *Example:* "A (vague: 'a librarian') has a son B (medium: 'a writer from Dakota'), B wrote a book C (highly specific: 'biography of Susan B. Anthony')." → Search for C first ("Susan B. Anthony" biography), then use C's context to find B, then trace B back to A.
+   - *Example:* "A (vague: 'a chef') has a student B (medium: 'a pastry maker from Bavaria'), B invented a dessert C (highly specific: 'Black Forest cake with gold leaf')." → Search for C first ("Black Forest cake" "gold leaf"), then use C's context to find B, then trace B back to A.
    - *Rule:* Rank entities by how UNIQUE / RARE their keywords are (High IDF). The rarest entity narrows the corpus fastest.
 
 8. **Keyword Splitting (Anti-Dilution):**
    If a query combining multiple entities returns poor results, the critical information may be split across DIFFERENT documents, and BM25's bag-of-words scoring dilutes the match.
-   - *Bad (combined):* "librarian" "Dakota writer" "Susan B. Anthony biography" — three different topics, scores diluted.
-   - *Good (split):* Step 1: search "Susan B. Anthony" biography → find the book and its author. Step 2: search the author's name "Dakota" → find their partner. Step 3: search the partner's name librarian.
+   - *Bad (combined):* "chef" "Bavarian pastry maker" "Black Forest cake gold leaf" — three different topics, scores diluted.
+   - *Good (split):* Step 1: search "Black Forest cake" "gold leaf" → find the dessert and its inventor. Step 2: search the inventor's name "Bavaria" → find their teacher. Step 3: search the teacher's name chef.
    - *Heuristic:* If a query has 3+ distinct named entities/concepts and returns irrelevant results, split it into 2-3 simpler queries, each targeting ONE core entity, then connect the dots from the retrieved documents.
 
 You MUST work in the following order:
@@ -121,24 +121,23 @@ You MUST work in the following order:
 
 CONDENSE_PROMPT = """\
 You are a research progress summarizer. Compress the conversation history into a \
-concise but complete progress record. Preserve ALL factual details — names, dates, \
-numbers, document IDs, and key snippets. Do NOT summarize or paraphrase evidence; \
-copy important findings verbatim. Be thorough on facts, concise in wording.
+dense, structured progress record. Keep only essential information — facts, docids, \
+names, dates, numbers, and search queries. Drop redundant or irrelevant content.
 
 Structure your output as follows:
 
-1. **Original question** (verbatim)
-2. **Clues from question** (list every distinct clue / constraint that needs verification)
-3. **Clue verification status** (for each clue: ✓ verified by docid X, or ✗ still unknown)
-4. **Searches performed** (list every search query with the docids it returned)
-5. **Documents retrieved** (for each docid read via get_document, keep the full \
-   document text or at minimum all factual claims, names, dates, and numbers)
-6. **Key findings** (specific evidence gathered, cross-references verified)
-7. **What remains to be found** (specific missing pieces needed to answer)
+1. **Clue verification status** — one line per clue: ✓ docid=X, or ✗ unknown
+2. **Searches performed** — query + top docids, one line each
+3. **Key documents** — for each important docid: title + extracted relevant sentences (max 3 per doc)
+4. **Key findings** — bullet points of verified facts with docid references
+5. **What remains to be found** — missing clues to search next
 
-CRITICAL: Do NOT lose any document ID or factual detail. If a document contains a \
-name, date, or number that might be relevant, keep it verbatim. The clue verification \
-status is the most important section — it tells the agent what still needs work."""
+When describing tool calls in the history, summarize them as:
+  [search]: query="..."
+  [get_document]: docid=X → found: <key facts>
+  [submit_answer]: answer="..."
+
+When you see [reasoning] blocks, summarize the key insight in 1-2 sentences."""
 
 
 async def _condense_context(
@@ -165,18 +164,48 @@ async def _condense_context(
     question = original_question or messages[1].get("content", "")
 
     # Serialize everything after system + user into one transcript
+    import re as _re
     transcript_lines: List[str] = []
     for m in messages[2:]:
         role = m.get("role", "?")
         content = str(m.get("content", "") or "")
+        # Strip nested PROGRESS SUMMARY headers (prevent recursion across condensations)
+        content = _re.sub(r'\[PROGRESS SUMMARY[^\]]*\]', '', content)
+        # Replace <think>/[TOOL_CALL:] → neutral format so the model doesn't learn them
+        content = _re.sub(r'<think>(.*?)</think>', r'[reasoning]\n\1\n[/reasoning]', content, flags=_re.DOTALL)
+        content = _re.sub(r'<think>(.*)$', r'[reasoning]\n\1\n[/reasoning]', content, flags=_re.DOTALL)
+        content = _re.sub(r'\[TOOL_CALL:\s*(\w+)\((.*?)\)\s*\]', r'[tool \1: \2]', content)
+        content = content.strip()
+        if not content:
+            continue
         tc = m.get("tool_calls")
         if tc:
             for t in tc:
                 fn = t.get("function", {})
-                content += f"\n[TOOL_CALL: {fn.get('name', '?')}({fn.get('arguments', '')})]"
+                args_str = fn.get('arguments', '')
+                try:
+                    args = json.loads(args_str)
+                    args_str = json.dumps(args, ensure_ascii=False)
+                except Exception:
+                    pass
+                content += f"\n[tool {fn.get('name', '?')}: {args_str}]"
+        # Token-based truncation for long tool results
+        if role == "tool":
+            content_tokens = count_tokens_messages(tok, [{"role": "user", "content": content}])
+            if content_tokens > 1500:
+                # Truncate to ~1500 tokens
+                ids = tok.encode(content, add_special_tokens=False)
+                if len(ids) > 1500:
+                    content = tok.decode(ids[:1500], skip_special_tokens=True) + "\n...[truncated]"
         transcript_lines.append(f"[{role}]: {content}")
 
     transcript = "\n\n".join(transcript_lines)
+    # Token-based cap for full transcript
+    transcript_tokens = count_tokens_messages(tok, [{"role": "user", "content": transcript}])
+    max_transcript_tokens = 25000
+    if transcript_tokens > max_transcript_tokens:
+        ids = tok.encode(transcript, add_special_tokens=False)
+        transcript = tok.decode(ids[:max_transcript_tokens], skip_special_tokens=True) + "\n\n...[transcript truncated]"
 
     condense_messages = [
         {"role": "system", "content": CONDENSE_PROMPT},

@@ -387,128 +387,160 @@ class DeepResearchEnv:
     # ── Verify Agent ──────────────────────────
 
     _CONDENSE_VERIFY_PROMPT = """\
-You are a document compression assistant. Below is a verification agent's conversation history.
-The tool results contain full document texts that are too large for the context window.
+You are a conversation compressor. Condense the verification conversation into a dense summary. \
+Keep all factual claims, docids, names, dates, numbers, and search queries. Drop redundant content.
 
-Your job: compress large tool-result messages by keeping only the KEY FACTS relevant to verification.
-For each document text, extract: names, dates, numbers, relationships, and quotes directly relevant
-to the claims being verified. Discard boilerplate, navigation text, and irrelevant paragraphs.
-
-Return a JSON array of messages with the SAME structure as the input (role, content, tool_call_id, etc.).
-The system prompt and first user message must be preserved verbatim.
-For assistant messages with tool_calls, keep them as-is.
-For tool-result messages: if the content is short (< 500 chars), keep it. If it's long,
-replace the content with a compressed summary prefixed by "[Compressed] ".
-
-Output ONLY valid JSON array. No other text.
+Structure:
+1. Searches performed — query + top docids, one line each
+2. Documents read — for each docid: title + 1-3 key facts relevant to verification
+3. Verification status — for each claim in the answer: supported / unsupported / uncertain
 """
 
     async def _condense_verify_context(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Compress verify-agent messages when they exceed the token budget."""
-        # Keep system + first user intact, only condense the rest
-        head = msgs[:2]  # system + first user
+        """Compress verify-agent messages using the same transcript approach as _condense_context."""
+        if len(msgs) <= 4:
+            return msgs
+        import re as _re
+
+        # Keep system + first user intact
+        head = msgs[:2]  # system prompt + user (question/answer/evidence)
         tail = msgs[2:]
 
-        # Serialize tail for the condense model
-        tail_json = json.dumps(tail, ensure_ascii=False)
-        condense_msgs = [
-            {"role": "system", "content": self._CONDENSE_VERIFY_PROMPT},
-            {"role": "user", "content": f"Compress this conversation history. Keep all factual claims, docids, names, dates, and numbers. Return only the JSON array:\n\n{tail_json}"},
-        ]
+        # Build transcript from tail — same format preprocessing as _condense_context
+        transcript_lines: List[str] = []
+        for m in tail:
+            role = m.get("role", "?")
+            content = str(m.get("content", "") or "")
+            content = _re.sub(r'\[PROGRESS SUMMARY[^\]]*\]', '', content)
+            content = _re.sub(r'<think>(.*?)</think>', r'[reasoning]\n\1\n[/reasoning]', content, flags=_re.DOTALL)
+            content = _re.sub(r'<think>(.*)$', r'[reasoning]\n\1\n[/reasoning]', content, flags=_re.DOTALL)
+            content = _re.sub(r'\[TOOL_CALL:\s*(\w+)\((.*?)\)\s*\]', r'[tool \1: \2]', content)
+            content = content.strip()
+            if not content:
+                continue
+            # Tool calls from proper function calling → text
+            tc = m.get("tool_calls")
+            if tc:
+                for t in tc:
+                    fn = t.get("function", {})
+                    args_str = fn.get('arguments', '')
+                    try:
+                        args = json.loads(args_str)
+                        args_str = json.dumps(args, ensure_ascii=False)
+                    except Exception:
+                        pass
+                    content += f"\n[tool {fn.get('name', '?')}: {args_str}]"
+            # Token-based truncation for long tool results
+            tok = _get_verify_tok()
+            if role == "tool":
+                content_tokens = count_tokens_messages(tok, [{"role": "user", "content": content}])
+                if content_tokens > 1500:
+                    ids = tok.encode(content, add_special_tokens=False)
+                    if len(ids) > 1500:
+                        content = tok.decode(ids[:1500], skip_special_tokens=True) + "\n...[truncated]"
+            transcript_lines.append(f"[{role}]: {content}")
 
+        transcript = "\n\n".join(transcript_lines)
+        # Token cap for transcript
+        tok = _get_verify_tok()
+        tx_tokens = count_tokens_messages(tok, [{"role": "user", "content": transcript}])
+        if tx_tokens > 25000:
+            ids = tok.encode(transcript, add_special_tokens=False)
+            transcript = tok.decode(ids[:25000], skip_special_tokens=True) + "\n\n...[truncated]"
+
+        # Call condense model — same prompt pattern as _condense_context
         try:
             raw = await self._client.simple_chat(
                 model=self._model,
-                messages=condense_msgs,
+                messages=[
+                    {"role": "system", "content": self._CONDENSE_VERIFY_PROMPT},
+                    {"role": "user", "content": f"Compress:\n\n{transcript}"},
+                ],
                 temperature=0.0,
                 max_tokens=self._max_tokens,
             )
-            content = raw["choices"][0]["message"].get("content", "")
-            import re
-            json_match = re.search(r"\[.*\]", content, re.DOTALL)
-            if json_match:
-                compressed_tail = json.loads(json_match.group(0))
-                if isinstance(compressed_tail, list):
-                    return head + compressed_tail
+            summary = raw["choices"][0]["message"].get("content", "")
         except Exception:
-            pass
+            summary = ""
 
-        # Fallback: truncate each tool-result to a reasonable size
+        if summary:
+            summary_msg: Dict[str, Any] = {
+                "role": "user",
+                "content": f"[VERIFY PROGRESS SUMMARY]\n{summary}",
+            }
+            return head + [summary_msg]
+
+        # Fallback: truncate
         for m in tail:
             if m.get("role") == "tool" and len(m.get("content", "")) > 3000:
                 m["content"] = m["content"][:3000] + "\n...[truncated]"
         return head + tail
 
     _VERIFY_SYSTEM_PROMPT = """\
-You are a Verification Agent. Your job is to independently verify whether a proposed answer to a question is correct, using the document corpus.
+You are a Verification Agent. Your job is to independently verify whether a proposed answer is correct by searching the document corpus. You have `search` and `get_document` tools to find evidence, and `give_feedback` to report your verdict.
 
-**Question:** {question}
-**Proposed Answer:** {answer}
-**Claimed Evidence:**
-{evidence}
-
-You have `search` and `get_document` tools to find evidence, and `give_feedback` to report your verdict.
-
-**CRITICAL — You MUST follow this workflow in order:**
+Follow this workflow:
 
 Step 1 — Search for Independent Evidence:
-Extract each factual claim from the proposed answer. For each claim, call `search` with targeted keywords derived from that claim. Do NOT just copy the claimed evidence's docids — search independently.
+Extract each factual claim from the proposed answer. For each claim, call `search` with targeted keywords. Do NOT just copy the claimed evidence's docids — search independently.
 
 Step 2 — Read Full Documents:
-For any search result that appears relevant, call `get_document` to read the full text. Snippets alone are often misleading or incomplete.
+For any relevant search result, call `get_document` to read the full text. Snippets alone are often misleading or incomplete.
 
 Step 3 — Verify Claim by Claim (CRITICAL — Check Entity Identity):
-For each claim, check whether the documents you retrieved actually support it. Compare: does the document text confirm EXACTLY what the claim asserts?
+Check whether the documents actually support each claim.
 
 **BEWARE OF ENTITY CONFUSION — The evidence may describe someone/something ELSE:**
-Just because you found evidence matching the DESCRIPTIONS does NOT mean the answer's ENTITY is correct. The same description may fit multiple entities, but the question asks for a SPECIFIC one.
+Just because you found evidence matching the DESCRIPTIONS does NOT mean the answer's ENTITY is correct. The same description may fit multiple entities.
 
-**Example:** The question asks "Who was killed by Sun Wukong?" Clues: a monkey with golden fur, immense strength, wielded a magical staff, caused havoc in heaven, impersonated a monk's disciple. The answer "Sun Wukong" is WRONG, even though:
-- Both Sun Wukong (Monkey King) AND the Six-Eared Macaque match "monkey with golden fur" and "immense strength"
-- Both wielded magical staves
-- Both caused havoc
-- Both accompanied the monk (the Six-Eared Macaque impersonated Sun Wukong)
-BUT Sun Wukong was the KILLER, not the victim. The Six-Eared Macaque was the one killed by Sun Wukong. Despite sharing nearly identical descriptions, the subject/object relationship is reversed. The evidence may superficially match both entities, but the specific EVENT (who killed whom) distinguishes them.
+**Example:** The question asks "Who was killed by Sun Wukong?" Clues: a monkey with golden fur, immense strength, magical staff, havoc in heaven, accompanied a monk. The answer "Sun Wukong" is WRONG — both Sun Wukong AND the Six-Eared Macaque share nearly identical descriptions (golden fur, magical staff, havoc, monk's companion). BUT Sun Wukong was the KILLER, Six-Eared Macaque was the VICTIM. The subject/object relationship is reversed. Superficial evidence matches both — only the specific EVENT distinguishes them.
 
 **Before calling give_feedback, ask yourself:**
-- Does the evidence confirm THIS specific entity, or just a SIMILAR entity?
+- Does the evidence confirm THIS specific entity, or just a SIMILAR one?
 - Is the subject/object relationship correct? (A did X to B, not B did X to A)
-- Do all clues point to the SAME entity, or am I mixing up two similar entities?
+- Do ALL clues point to the SAME entity, or am I mixing up two similar entities?
 - Is the logical chain correct? (A → B → C, not A → C directly)
 
 Step 4 — Report Verdict via give_feedback:
-ONLY after completing Steps 1-3, call `give_feedback`:
-- If ALL claims are independently supported and the answer matches the question → `is_correct=True`
-- If ANY claim is unsupported, wrong, or the answer doesn't match the question → `is_correct=False` with specific, actionable suggestions for which angle to search next
+Only after completing steps 1-3, call `give_feedback`:
+- All claims independently supported and answer matches question → `is_correct=True`
+- Any claim unsupported or wrong → `is_correct=False` with specific, actionable suggestions.
 
-**NEVER call give_feedback without first calling search or get_document.** (Step 0 is the only exception.)
-"""
-
-    _STAGE1_SYSTEM_PROMPT = """\
-You are a quick classifier. Your ONLY job: determine whether a proposed answer is a CONCRETE answer or a SURRENDER/EVASION.
-
-**CONCRETE answer** = names a specific entity, person, place, number, or fact (e.g. "Marguerite Smith", "Paris", "42", "John Doe")
-**SURRENDER/EVASION** = gives up, says it cannot be determined, claims no evidence, or provides a non-answer (e.g. "cannot be determined", "not found", "unable to find", "no evidence", "I cannot answer", "insufficient information", "the documents do not mention", "unknown")
-
-Output ONLY one word: CONCRETE or SURRENDER. No other text.
+CRITICAL: You MUST call `search` or `get_document` before `give_feedback`.
 """
 
     async def _run_stage1_check(self, answer: str) -> bool:
-        """Quick model check: is this a concrete answer? Returns True if concrete, False if surrender."""
-        try:
-            raw = await self._client.simple_chat(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": self._STAGE1_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Answer: {answer}"},
-                ],
-                temperature=0.0,
-                max_tokens=10,
-            )
-            result = raw["choices"][0]["message"].get("content", "").strip().upper()
-            return "CONCRETE" in result
-        except Exception:
-            return True  # on error, proceed to stage 2
+        """Check if answer is a surrender statement. Retries up to 2 times on parse failure."""
+        for attempt in range(3):
+            try:
+                raw = await self._client.simple_chat(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": (
+                            "Classify whether this answer is a SURRENDER (giving up, saying the "
+                            "answer cannot be found, e.g. \"cannot be determined\", \"not found\", "
+                            "\"unable to find\", \"no evidence\", \"insufficient information\", "
+                            "\"unknown\") or an ANSWER (any specific name, title, number, or factual "
+                            "claim, even if possibly wrong).\n\n"
+                            "If the answer contains BOTH surrender words AND a specific guess → ANSWER.\n\n"
+                            "You MUST end your response with exactly one line: VERDICT: ANSWER or VERDICT: SURRENDER"
+                        )},
+                        {"role": "user", "content": f"Answer to classify:\n{answer}"},
+                    ],
+                    temperature=0.0,
+                    max_tokens=self._max_tokens,
+                )
+                content = raw["choices"][0]["message"].get("content", "")
+                import re
+                # Strip think blocks
+                content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+                content = re.sub(r'<think>.*$', '', content, flags=re.DOTALL)
+                m = re.search(r'VERDICT:\s*(ANSWER|SURRENDER)', content, re.IGNORECASE)
+                if m:
+                    return m.group(1).upper() == "ANSWER"
+            except Exception:
+                pass
+        return True  # all retries failed → proceed to stage 2
 
     async def _run_verify_agent(self, answer: str, evidence: str) -> Dict[str, Any]:
         """Two-stage verify: (1) quick surrender check, (2) full evidence verification.
@@ -520,27 +552,22 @@ Output ONLY one word: CONCRETE or SURRENDER. No other text.
             return {"error": "No model client available for verification"}
 
         # ── Stage 1: Quick surrender check (answer only, no evidence) ──
-        print(f"    [verify] Stage 1: checking if answer is concrete...", flush=True)
-        is_concrete = await self._run_stage1_check(answer)
-        if not is_concrete:
-            print(f"    [verify] Stage 1 → SURRENDER — rejecting immediately", flush=True)
+        print(f"    [verify] Stage 1: checking for surrender...", flush=True)
+        is_answer = await self._run_stage1_check(answer)
+        if not is_answer:
+            print(f"    [verify] Stage 1 → SURRENDER — rejecting, tell agent to try different angles", flush=True)
             return {
                 "is_correct": False,
-                "reason": "The answer is a surrender/evasion, not a concrete answer. The answer exists in the corpus. Do NOT give up. Try searching from completely different angles — use different keywords, inverse relations, or split compound queries (BM25 Rules 6-8).",
+                "reason": "Your answer is a surrender statement. The answer EXISTS in the corpus — do NOT give up. Try completely different search angles: use different keywords, inverse relations, or split compound queries (BM25 Rules 6-8).",
                 "suggestions": "Rephrase your search queries with different keywords, try relation inverses, or split compound queries into simpler single-entity searches.",
             }
-        print(f"    [verify] Stage 1 → CONCRETE — proceeding to full verification", flush=True)
+        print(f"    [verify] Stage 1 → ANSWER — proceeding to full verification", flush=True)
 
         # ── Stage 2: Full verification ──
         print(f"    [verify] ═══ Stage 2: full verification (max_turns={self.max_turns}) ═══", flush=True)
         print(f"    [verify] answer: {answer}", flush=True)
         print(f"    [verify] evidence ({len(evidence)} chars): {evidence[:500]}{'...' if len(evidence) > 500 else ''}", flush=True)
 
-        verify_prompt = self._VERIFY_SYSTEM_PROMPT.format(
-            question=self._question,
-            answer=answer,
-            evidence=evidence,
-        )
         verify_tools: List[Dict[str, Any]] = self._verify_tools
         _MAX_CTX = 35000  # condense threshold for verify messages
 
@@ -570,6 +597,12 @@ Output ONLY one word: CONCRETE or SURRENDER. No other text.
                     tool_choice="auto",
                 )
                 resp: Dict[str, Any] = raw["choices"][0]["message"]
+                # Replace <think> → [reasoning] so they don't leak into verify context
+                raw_content = resp.get("content", "") or ""
+                if raw_content:
+                    import re as _re2
+                    resp["content"] = _re2.sub(r'<think>(.*?)</think>', r'[reasoning]\n\1\n[/reasoning]', raw_content, flags=_re2.DOTALL)
+                    resp["content"] = _re2.sub(r'<think>(.*)$', r'[reasoning]\n\1\n[/reasoning]', resp["content"], flags=_re2.DOTALL)
                 usage = raw.get("usage", {})
                 tok_info = f"  prompt={usage.get('prompt_tokens', '?')} comp={usage.get('completion_tokens', '?')}" if usage else ""
                 msgs.append(resp)
@@ -680,15 +713,12 @@ Output ONLY one word: CONCRETE or SURRENDER. No other text.
 
         # ── Build initial messages ──
         verify_msgs: List[Dict[str, Any]] = [
-            {"role": "system", "content": verify_prompt},
+            {"role": "system", "content": self._VERIFY_SYSTEM_PROMPT},
             {"role": "user", "content": (
-                "Verify the answer above. Follow your workflow: "
-                "(0) check if it's a surrender answer → if yes, give_feedback(False) immediately. "
-                "(1) search for independent evidence for each claim. "
-                "(2) get_document to read full texts. "
-                "(3) verify claim by claim. "
-                "(4) only then call give_feedback with your verdict. "
-                "Remember: you MUST call search or get_document before give_feedback."
+                f"**Question:** {self._question}\n\n"
+                f"**Proposed Answer:** {answer}\n\n"
+                f"**Claimed Evidence:**\n{evidence}\n\n"
+                f"Please verify this answer following the workflow."
             )},
         ]
 
