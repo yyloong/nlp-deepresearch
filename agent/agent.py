@@ -80,6 +80,11 @@ Only after completing steps 1-3, call `give_feedback`:
 - All claims independently supported and answer matches question → `is_correct=True`
 - Any claim unsupported or wrong → `is_correct=False` with specific, actionable suggestions.
 
+CRITICAL for suggestions: NEVER give specific search queries or entity names — that is the main agent's job to figure out. Instead, guide the direction:
+- If evidence is insufficient → suggest what type/aspect of evidence to look for, or check if a specific claim can be verified
+- If constraints don't match → suggest switching to a different angle or finding another answer candidate
+- Be specific about WHAT to verify, not HOW to search.
+
 CRITICAL: You MUST call `search` or `get_document` before `give_feedback`."""
 
 DEFAULT_SYSTEM_PROMPT = """\
@@ -663,23 +668,26 @@ class Agent:
     async def run_stage1_check(self, answer: str) -> bool:
         """Check if answer is a surrender statement. Retries up to 2 times on parse failure.
 
-        Returns True if ANSWER, False if SURRENDER.
+        Returns True if PASS, False if SURRENDER.
         """
         for _attempt in range(3):
             try:
                 resp = await self.call_model(
                     messages=[
                         {"role": "system", "content": (
-                            "Classify whether this answer is a SURRENDER (giving up) or an ANSWER.\n"
-                            "SURRENDER = says the answer cannot be found: \"cannot be determined\", "
-                            "\"not found\", \"unable to find\", \"no evidence\", \"insufficient information\", "
-                            "\"unknown\", \"no ... found in the corpus/document/provided\", "
-                            "\"does not appear\", \"is not mentioned\". "
-                            "Even if the answer mentions specific names or entities, "
-                            "if it says they were NOT found, it is SURRENDER.\n"
-                            "ANSWER = provides a specific factual claim (name, title, number) "
-                            "WITHOUT surrender language.\n\n"
-                            "You MUST end with exactly: VERDICT: ANSWER or VERDICT: SURRENDER"
+                            "Classify whether this answer is a SURRENDER (giving up) or a PASS (factual assertion).\n"
+                            "SURRENDER = the answer says something was NOT found, NOT available, "
+                            "NOT mentioned, cannot be determined, or is unknown. Key phrases: "
+                            "\"not found\", \"not mentioned\", \"not available\", \"no evidence\", "
+                            "\"cannot be determined\", \"unable to find\", \"insufficient information\", "
+                            "\"unknown\", \"does not appear\", \"cannot find\", \"not provided\", "
+                            "\"not specified\", \"not listed\", \"no document\", \"no information\". "
+                            "ANY answer whose main claim is that something is missing/absent/unknown IS a surrender. "
+                            "Even if it mentions specific names, if the core message is \"X is not found/in the documents\", "
+                            "it is SURRENDER.\n"
+                            "PASS = provides a positive factual assertion (a name, title, number, date) "
+                            "without saying it was not found.\n\n"
+                            "You MUST end with exactly: VERDICT: PASS or VERDICT: SURRENDER"
                         )},
                         {"role": "user", "content": f"Answer to classify:\n{answer}"},
                     ],
@@ -690,11 +698,11 @@ class Agent:
                 stripped = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
                 stripped = re.sub(r'<think>.*$', '', stripped, flags=re.DOTALL).strip()
                 print(f"    [verify] stage1 response: {stripped[:200]}", flush=True)
-                m = re.search(r'VERDICT:\s*(ANSWER|SURRENDER)', stripped, re.IGNORECASE)
+                m = re.search(r'VERDICT:\s*(PASS|SURRENDER)', stripped, re.IGNORECASE)
                 if m:
                     verdict = m.group(1).upper()
                     print(f"    [verify] stage1 verdict: {verdict}", flush=True)
-                    return verdict == "ANSWER"
+                    return verdict == "PASS"
             except Exception:
                 pass
         return True  # all retries failed → proceed to stage 2
@@ -713,7 +721,7 @@ class Agent:
     ) -> Dict[str, Any]:
         """Two-stage verify: (1) quick surrender check, (2) full evidence verification.
 
-        Stage 1: model classifies answer as ANSWER or SURRENDER.
+        Stage 1: model classifies answer as PASS or SURRENDER.
         Stage 2: full verify agent with search + get_document + give_feedback.
         """
         # ── Stage 1: Quick surrender check ──
@@ -723,7 +731,7 @@ class Agent:
             print(f"    [verify] stage1 result: SURRENDER", flush=True)
             return {
                 "is_correct": False,
-                "reason": "Your answer is a surrender statement. The answer EXISTS in the corpus — do NOT give up. Try completely different search angles: use different keywords, inverse relations, or split compound queries (BM25 Rules 6-8).",
+                "reason": "Your answer is a surrender statement. The answer EXISTS in the corpus — do NOT give up. Try completely different search angles: use different keywords, inverse relations, or split compound queries into simpler single-entity searches.",
                 "suggestions": "Rephrase your search queries with different keywords, try relation inverses, or split compound queries into simpler single-entity searches.",
             }
         print(f"    [verify] verify_stage2_start", flush=True)
