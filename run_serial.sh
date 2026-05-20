@@ -2,8 +2,6 @@
 #
 # Deep Research Agent — 串行轨迹生成 + 评估
 #
-# 与 run_agent.sh 的区别：n_envs=1，逐条串行处理，消除并行 batching 随机性。
-#
 # Usage:
 #   ./run_serial.sh                           # 使用默认参数
 #   ./run_serial.sh --limit 10 --no-eval      # 只跑 10 条，跳过评估
@@ -26,7 +24,6 @@ MAX_TOKENS="${MAX_TOKENS:-8912}"
 MAX_TOOL_CALLS="${MAX_TOOL_CALLS:-1}"
 SEARCH_K="${SEARCH_K:-5}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
-NO_THINK="${NO_THINK:-0}"
 
 # ── 清理代理变量（vLLM 在 localhost，不能走 proxy）──
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
@@ -43,17 +40,10 @@ fi
 # ── 检查前置条件 ──
 if [ ! -f "${INDEX_PATH}" ]; then
     echo "ERROR: BM25 index not found at ${INDEX_PATH}"
-    echo "Build it first: python -m agent.build_bm25_index --corpus-path ${ROOT}/browsecomp-plus-corpus --index-path ${INDEX_PATH}"
     exit 1
 fi
-
 if [ ! -f "${DATASET}" ]; then
     echo "ERROR: Dataset not found at ${DATASET}"
-    exit 1
-fi
-
-if [ ! -f "${ROOT}/run_serial.py" ]; then
-    echo "ERROR: run_serial.py not found at ${ROOT}/run_serial.py"
     exit 1
 fi
 
@@ -63,19 +53,13 @@ echo "Dataset:    ${DATASET}"
 echo "Index:      ${INDEX_PATH}"
 echo "Model:      ${MODEL}"
 echo "Base URL:   ${BASE_URL}"
-echo "mode:       serial (n_envs=1, eval_batch_size=1)"
+echo "max_turns:  ${MAX_TURNS}"
 echo "max_tokens: ${MAX_TOKENS}"
-echo "max_tool_calls: ${MAX_TOOL_CALLS}"
 echo "Output:     ${OUTPUT_DIR}/"
 echo "===================================="
 echo
 
 cd "${ROOT}"
-
-NO_THINK_FLAG=()
-if [[ -n "${NO_THINK}" && "${NO_THINK}" != "0" && "${NO_THINK}" != "false" ]]; then
-    NO_THINK_FLAG=(--no-think)
-fi
 
 exec python run_serial.py \
     --dataset "${DATASET}" \
@@ -88,8 +72,5 @@ exec python run_serial.py \
     --max-tool-calls-per-turn "${MAX_TOOL_CALLS}" \
     --search-k "${SEARCH_K}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
-    --no-condense-thinking \
-    --no-strip-thinking \
     --think-trunc-no-think \
-    "${NO_THINK_FLAG[@]}" \
     "$@"

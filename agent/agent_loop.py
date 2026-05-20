@@ -103,6 +103,7 @@ async def _process_one_question_verbose(
             t_cs = _time.time()
             condensed = await agent.condense_context(obs, original_question=question)
             env.set_messages(0, condensed)
+            env.append_to_trajectory(0, {"role": "user", "content": condensed[1]['content'], "_condensed": True})
             obs = condensed
             st["condensed"] = True
             n_tokens_before = count_tokens_messages(_tok, obs)
@@ -252,6 +253,7 @@ async def _process_one_question_verbose(
                     t_cond_start = _time.time()
                     condensed = await agent.condense_context(obs)
                     env.set_messages(0, condensed)
+                    env.append_to_trajectory(0, {"role": "user", "content": condensed[1]['content'], "_condensed": True})
                     obs = condensed
                     st["condensed"] = True
                     print(f"    ↻ context condensed ({used_after} → {count_tokens_messages(_tok, obs)} tokens, {_time.time() - t_cond_start:.1f}s)", flush=True)

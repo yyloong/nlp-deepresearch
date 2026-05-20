@@ -609,6 +609,7 @@ class Agent:
                 if used_after > self.max_context // 2:
                     condensed = await self.condense_context(obs)
                     env.set_messages(slot_id, condensed)
+                    env.append_to_trajectory(slot_id, {"role": "user", "content": condensed[1]['content'], "_condensed": True})
                     obs = condensed
         return obs
 
@@ -669,13 +670,16 @@ class Agent:
                 resp = await self.call_model(
                     messages=[
                         {"role": "system", "content": (
-                            "Classify whether this answer is a SURRENDER (giving up, saying the "
-                            "answer cannot be found, e.g. \"cannot be determined\", \"not found\", "
-                            "\"unable to find\", \"no evidence\", \"insufficient information\", "
-                            "\"unknown\") or an ANSWER (any specific name, title, number, or factual "
-                            "claim, even if possibly wrong).\n\n"
-                            "If the answer contains BOTH surrender words AND a specific guess → ANSWER.\n\n"
-                            "You MUST end your response with exactly one line: VERDICT: ANSWER or VERDICT: SURRENDER"
+                            "Classify whether this answer is a SURRENDER (giving up) or an ANSWER.\n"
+                            "SURRENDER = says the answer cannot be found: \"cannot be determined\", "
+                            "\"not found\", \"unable to find\", \"no evidence\", \"insufficient information\", "
+                            "\"unknown\", \"no ... found in the corpus/document/provided\", "
+                            "\"does not appear\", \"is not mentioned\". "
+                            "Even if the answer mentions specific names or entities, "
+                            "if it says they were NOT found, it is SURRENDER.\n"
+                            "ANSWER = provides a specific factual claim (name, title, number) "
+                            "WITHOUT surrender language.\n\n"
+                            "You MUST end with exactly: VERDICT: ANSWER or VERDICT: SURRENDER"
                         )},
                         {"role": "user", "content": f"Answer to classify:\n{answer}"},
                     ],
