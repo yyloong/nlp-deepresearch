@@ -451,9 +451,6 @@ You have `search` and `get_document` tools to find evidence, and `give_feedback`
 
 **CRITICAL — You MUST follow this workflow in order:**
 
-Step 0 — Anti-Surrender Check (FIRST):
-If the proposed answer is a surrender/evasion response — e.g. "cannot be determined", "not found", "unable to find", "no evidence", "I cannot answer", "insufficient information" — immediately call `give_feedback(is_correct=False, reason="The answer exists in the corpus. Do NOT give up. Try searching from completely different angles — use different keywords, inverse relations, or split compound queries.", suggestions="...")` and STOP. Do NOT waste turns searching for a non-answer.
-
 Step 1 — Search for Independent Evidence:
 Extract each factual claim from the proposed answer. For each claim, call `search` with targeted keywords derived from that claim. Do NOT just copy the claimed evidence's docids — search independently.
 
@@ -487,16 +484,55 @@ ONLY after completing Steps 1-3, call `give_feedback`:
 **NEVER call give_feedback without first calling search or get_document.** (Step 0 is the only exception.)
 """
 
-    async def _run_verify_agent(self, answer: str, evidence: str) -> Dict[str, Any]:
-        """Run a verify-agent loop that checks the answer and returns feedback.
+    _STAGE1_SYSTEM_PROMPT = """\
+You are a quick classifier. Your ONLY job: determine whether a proposed answer is a CONCRETE answer or a SURRENDER/EVASION.
 
-        Uses the same max_turns as the main agent. Condenses context when it approaches
-        the token limit. Retries once on timeout.
+**CONCRETE answer** = names a specific entity, person, place, number, or fact (e.g. "Marguerite Smith", "Paris", "42", "John Doe")
+**SURRENDER/EVASION** = gives up, says it cannot be determined, claims no evidence, or provides a non-answer (e.g. "cannot be determined", "not found", "unable to find", "no evidence", "I cannot answer", "insufficient information", "the documents do not mention", "unknown")
+
+Output ONLY one word: CONCRETE or SURRENDER. No other text.
+"""
+
+    async def _run_stage1_check(self, answer: str) -> bool:
+        """Quick model check: is this a concrete answer? Returns True if concrete, False if surrender."""
+        try:
+            raw = await self._client.simple_chat(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": self._STAGE1_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Answer: {answer}"},
+                ],
+                temperature=0.0,
+                max_tokens=10,
+            )
+            result = raw["choices"][0]["message"].get("content", "").strip().upper()
+            return "CONCRETE" in result
+        except Exception:
+            return True  # on error, proceed to stage 2
+
+    async def _run_verify_agent(self, answer: str, evidence: str) -> Dict[str, Any]:
+        """Two-stage verify: (1) quick surrender check, (2) full evidence verification.
+
+        Stage 1: model classifies answer as CONCRETE or SURRENDER (answer only, no evidence).
+        Stage 2: full verify agent with search + get_document + give_feedback.
         """
         if self._client is None:
             return {"error": "No model client available for verification"}
 
-        print(f"    [verify] ═══ starting (max_turns={self.max_turns}) ═══", flush=True)
+        # ── Stage 1: Quick surrender check (answer only, no evidence) ──
+        print(f"    [verify] Stage 1: checking if answer is concrete...", flush=True)
+        is_concrete = await self._run_stage1_check(answer)
+        if not is_concrete:
+            print(f"    [verify] Stage 1 → SURRENDER — rejecting immediately", flush=True)
+            return {
+                "is_correct": False,
+                "reason": "The answer is a surrender/evasion, not a concrete answer. The answer exists in the corpus. Do NOT give up. Try searching from completely different angles — use different keywords, inverse relations, or split compound queries (BM25 Rules 6-8).",
+                "suggestions": "Rephrase your search queries with different keywords, try relation inverses, or split compound queries into simpler single-entity searches.",
+            }
+        print(f"    [verify] Stage 1 → CONCRETE — proceeding to full verification", flush=True)
+
+        # ── Stage 2: Full verification ──
+        print(f"    [verify] ═══ Stage 2: full verification (max_turns={self.max_turns}) ═══", flush=True)
         print(f"    [verify] answer: {answer}", flush=True)
         print(f"    [verify] evidence ({len(evidence)} chars): {evidence[:500]}{'...' if len(evidence) > 500 else ''}", flush=True)
 
