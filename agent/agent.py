@@ -670,9 +670,7 @@ class Agent:
                         "content": (
                             "STOP SEARCHING. You have reached the turn limit. "
                             "Based on the evidence you have gathered so far, call give_feedback NOW "
-                            "with your best assessment. If you have no evidence, call "
-                            "give_feedback(is_correct=False, reason=\"Insufficient evidence found\", "
-                            "error_type=\\"insufficient_evidence\\"). Do NOT call any other tool -- only give_feedback."
+                            "with your best assessment."
                         ),
                     })
 
