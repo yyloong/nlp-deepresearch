@@ -766,7 +766,7 @@ class Agent:
                     if name == "search" and isinstance(result, list):
                         all_results = [{"docid": r.get('docid','?'), "score": r.get('score',0),
                                         "snippet": str(r.get('snippet',''))[:200]} for r in result]
-                        print(f"    [verify] -> {len(result)} results top: {[r.get('docid','?') for r in result[:3]]}", flush=True)
+                        print(f"    [verify] -> {len(result)} results top: {[r.get('docid','?') for r in result]}", flush=True)
                     elif name == "get_document" and isinstance(result, dict):
                         print(f"    [verify] -> doc: {result.get('title','?')[:80]} text={len(result.get('text',''))} chars", flush=True)
 
