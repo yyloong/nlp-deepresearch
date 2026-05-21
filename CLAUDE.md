@@ -7,6 +7,7 @@
 - 明确声明 tool call 是**唯一**的响应方式（"You MUST call X tool"、"plain text is ignored"）
 - 提供**重试机制**：tool 调用失败时 inject nudge message 后重试（最多 2 次）
 - 重试 nudge 要**具体**指出缺少什么参数（"Missing field: key_thoughts"），不要泛泛说 "try again"
+- 重试机制必须有 prompt 提示，重试后必须清理重试部分上下文
 
 ### 2. 绝对禁止数据泄露
 prompt 中**绝对不能**出现：
@@ -68,3 +69,8 @@ prompt 中**绝对不能**出现：
 - 子 agent 的输入（prompt + document）和输出（提取结果）必须打印，方便对比真正需要的信息
 - condense 前后的 token 数、消息数必须打印
 - 不要依赖反复跑代码来看 bug，日志要详尽到能直接定位问题
+
+## 要求模型输出规定格式规则
+1.必须要用 YOU MUST OUTPUT FOLLOWING THIS FORMAT (BEFORE YOU CALL TOOLS 这段如果同时有工具调用的时候加上):
+2.必须有规则提取+格式约束+重试
+3.重试机制必须有 prompt 提示，重试后必须清理重试部分上下文

@@ -132,7 +132,7 @@ class DeepResearchEnv:
     def _build_tool_specs(self) -> Tuple[List[Dict[str, Any]], Dict[str, Callable[..., Any]]]:
         """Build OpenAI-format tool specs and callable registry for main agent + verify agent."""
 
-        async def search(query: str) -> List[Dict[str, Any]]:
+        async def search(query: str, found: str = "", next_reason: str = "") -> List[Dict[str, Any]]:
             print(f"    [search] query='{query}' k={self.search_k} sub_agent={self._sub_agent is not None}", flush=True)
             docs = self._searcher.search(query, k=self.search_k)
             print(f"    [search] found {len(docs)} docs", flush=True)
@@ -230,22 +230,24 @@ class DeepResearchEnv:
                 "suggestions": suggestions,
             }
 
-        # ── Main agent tools (search + get_document + submit_answer) ──
+        # ── Main agent tools ──
         main_tools = [
             {
                 "type": "function",
                 "function": {
                     "name": "search",
                     "description": (
-                        f"Search the BrowseComp-Plus BM25 index and return top-{self.search_k} results "
-                        "with docid, score, and snippet."
+                        f"Search the BM25 index (top-{self.search_k} results). "
+                        "Query MUST be 2-3 specific words (names/dates/titles), NOT generic descriptions."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "query": {"type": "string", "description": "Search query"},
+                            "query": {"type": "string", "description": "2-3 specific entity names, never generic words"},
+                            "found": {"type": "string", "description": "BEFORE this search: what specific names/dates/titles did you find in the LAST search results? List them."},
+                            "next_reason": {"type": "string", "description": "Why this search? How does it use what you found to move toward the answer?"},
                         },
-                        "required": ["query"],
+                        "required": ["query", "found", "next_reason"],
                     },
                 },
             },
