@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .browsecomp_searcher import BrowseCompBM25Searcher, snippetize
 from .tools import build_searcher
+from .utils import count_tokens_messages, truncate_utf8_prefix_to_token_budget
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
@@ -173,9 +174,33 @@ class DeepResearchEnv:
 
             async def _process_one(doc):
                 import traceback as _tb
+                prefix = f"Query: {query}\n\nDocument (docid={doc['docid']}):\n"
+                _sub = self._sub_agent
+                _tok = _sub.tokenizer
+                _safe_input = (
+                    getattr(_sub, "max_context", 32768)
+                    - getattr(_sub, "max_tokens", 4096)
+                    - 2000
+                )
+                _fixed = count_tokens_messages(
+                    _tok,
+                    [
+                        {"role": "system", "content": _SUB_PROMPT},
+                        {"role": "user", "content": prefix},
+                    ],
+                )
+                _doc_budget = max(256, _safe_input - _fixed - 64)
+                _doc_body = truncate_utf8_prefix_to_token_budget(
+                    _tok, doc["text"], _doc_budget
+                )
+                if len(_doc_body) < len(doc["text"]):
+                    print(
+                        f"    [sub] docid={doc['docid']}: doc truncated to {_doc_budget} tokens",
+                        flush=True,
+                    )
                 msgs = [
                     {"role": "system", "content": _SUB_PROMPT},
-                    {"role": "user", "content": f"Query: {query}\n\nDocument (docid={doc['docid']}):\n{doc['text'][:4000]}"}
+                    {"role": "user", "content": prefix + _doc_body},
                 ]
                 for attempt in range(2):
                     try:

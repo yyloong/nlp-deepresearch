@@ -348,7 +348,10 @@ async def generate_trajectories(
                   temperature=temperature, max_context=max_context, extra_payload=extra_payload,
                   max_tool_calls_per_turn=max_tool_calls_per_turn, think_trunc_no_think=think_trunc_no_think)
     verify_agent = Agent(client=client, model=model, tokenizer=_tok, max_tokens=max_tokens, temperature=temperature)
-    sub_agent = Agent(client=client, model=model, tokenizer=_tok, max_tokens=2048, temperature=0.0)
+    sub_agent = Agent(
+        client=client, model=model, tokenizer=_tok,
+        max_tokens=4096, max_context=32768, temperature=0.0,
+    )
 
     env = DeepResearchEnv(index_path=index_path, n_envs=n_envs, system_prompt=system_prompt,
                           max_turns=max_turns, search_k=search_k, snippet_max_chars=snippet_max_chars,
