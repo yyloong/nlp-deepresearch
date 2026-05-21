@@ -93,6 +93,7 @@ class DeepResearchEnv:
         record_trajectory: bool = True,
         verify_agent: Any = None,
         enable_verify: bool = True,
+        sub_agent: Any = None,
     ) -> None:
         self.n_envs = n_envs
         self.system_prompt = system_prompt
@@ -104,6 +105,7 @@ class DeepResearchEnv:
         # Verify-agent config
         self._verify_agent = verify_agent
         self._enable_verify = enable_verify
+        self._sub_agent = sub_agent
         self._question: str = ""  # set by reset_slot
 
         # Shared searcher (thread-safe for reads; tool calls are synchronous)
@@ -130,17 +132,76 @@ class DeepResearchEnv:
     def _build_tool_specs(self) -> Tuple[List[Dict[str, Any]], Dict[str, Callable[..., Any]]]:
         """Build OpenAI-format tool specs and callable registry for main agent + verify agent."""
 
-        def search(query: str) -> List[Dict[str, Any]]:
+        async def search(query: str) -> List[Dict[str, Any]]:
+            print(f"    [search] query='{query}' k={self.search_k} sub_agent={self._sub_agent is not None}", flush=True)
             docs = self._searcher.search(query, k=self.search_k)
-            return [
-                {
-                    "docid": doc["docid"],
-                    "score": doc["score"],
-                    "snippet": snippetize(doc["text"], self.snippet_max_chars),
-                    "url": doc.get("url", ""),
+            print(f"    [search] found {len(docs)} docs", flush=True)
+            if self._sub_agent is None:
+                return [
+                    {
+                        "docid": doc["docid"],
+                        "score": doc["score"],
+                        "snippet": snippetize(doc["text"], self.snippet_max_chars),
+                        "url": doc.get("url", ""),
+                    }
+                    for doc in docs
+                ]
+            # ── Sub-agent processing: read docs in parallel, extract relevant info ──
+            import asyncio as _asyncio
+            _SUB_PROMPT = (
+                "Extract facts from this document that are related to the query, even loosely. "
+                "Report specific names, dates, places, and details found in the document. "
+                "Do NOT just say 'nothing found' — if the document mentions any entity or fact "
+                "that could be connected to the query's topic, report it. "
+                "The query is a rough guide, not an exact match requirement. "
+                "Call submit_information with what you found."
+            )
+            _sub_tools = [{
+                "type": "function",
+                "function": {
+                    "name": "submit_information",
+                    "description": "Submit relevant facts extracted from the document.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "relevant_info": {"type": "string", "description": "Relevant facts found (names, dates, numbers, quotes with docid)"}
+                        },
+                        "required": ["relevant_info"]
+                    }
                 }
-                for doc in docs
-            ]
+            }]
+
+            async def _process_one(doc):
+                import traceback as _tb
+                msgs = [
+                    {"role": "system", "content": _SUB_PROMPT},
+                    {"role": "user", "content": f"Query: {query}\n\nDocument (docid={doc['docid']}):\n{doc['text'][:4000]}"}
+                ]
+                for attempt in range(2):
+                    try:
+                        resp = await self._sub_agent.call_model(msgs, _sub_tools)
+                        tc = resp.get("tool_calls")
+                        if tc:
+                            for t in tc:
+                                if t['function']['name'] == 'submit_information':
+                                    import json as _json
+                                    args = _json.loads(t['function'].get('arguments','{}'))
+                                    info = args.get('relevant_info','').strip()
+                                    print(f"    [sub] docid={doc['docid']}: extracted {len(info)} chars", flush=True)
+                                    return {"docid": doc['docid'], "summary": info if info else "(nothing relevant found)"}
+                        if attempt == 0:
+                            msgs.append({"role": "user", "content": "You MUST call submit_information to submit your findings."})
+                            print(f"    [sub] docid={doc['docid']}: retry with nudge", flush=True)
+                    except Exception as e:
+                        print(f"    [sub] docid={doc['docid']}: ERROR {e}", flush=True)
+                        _tb.print_exc()
+                        break
+                print(f"    [sub] docid={doc['docid']}: all attempts failed, using snippet fallback", flush=True)
+                return {"docid": doc['docid'], "summary": snippetize(doc['text'], 300)}
+
+            tasks = [_process_one(d) for d in docs]
+            results = await _asyncio.gather(*tasks)
+            return list(results)
 
         def get_document(docid: str) -> Dict[str, Any]:
             doc = self._searcher.get_document(docid)
@@ -445,7 +506,7 @@ class DeepResearchEnv:
                 info["done"] = False
 
             # 3. Execute tool calls (if any, and not done)
-            if tool_calls and not inst.done:
+            if tool_calls:
                 for tc in tool_calls:
                     fn = tc["function"]
                     name = fn["name"]
@@ -570,8 +631,8 @@ class DeepResearchEnv:
         if inst.turn >= self.max_turns:
             inst.done = True
 
-        # 3. Execute tool calls (if any, and not done)
-        if tool_calls and not inst.done:
+        # 3. Execute tool calls (if any)
+        if tool_calls:
             for tc in tool_calls:
                 fn = tc["function"]
                 name = fn["name"]
@@ -604,10 +665,12 @@ class DeepResearchEnv:
                 else:
                     try:
                         fn_impl = self._registry[name]
+                        print(f"    [tool-exec] calling {name}({list(args.keys())}) async={inspect.iscoroutinefunction(fn_impl)}", flush=True)
                         if inspect.iscoroutinefunction(fn_impl):
                             raw = await fn_impl(**args)
                         else:
                             raw = fn_impl(**args)
+                        print(f"    [tool-exec] {name} returned {type(raw).__name__} len={len(raw) if hasattr(raw,'__len__') else '?'}", flush=True)
                         tool_result = json.dumps(raw, ensure_ascii=False)
                     except TypeError as exc:
                         sig = inspect.signature(self._registry[name])

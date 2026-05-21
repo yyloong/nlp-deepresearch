@@ -9,6 +9,10 @@ Encapsulates:
 - Main agent loop and verify agent loop
 """
 
+# ⚠️ CRITICAL: NEVER put <think>, </think>, [reasoning], [/reasoning], or any
+# internal format markers in model-facing prompt strings in this file.
+# These are internal artifacts and must never leak into model prompts.
+
 from __future__ import annotations
 
 import inspect
@@ -34,40 +38,72 @@ MAX_TOOL_RETRIES = 2
 
 # Prompt for model-generated analysis in structured condense (main agent)
 _CONDENSE_ANALYSIS_PROMPT = """\
-Write a progress summary FOR the research agent to read. Call submit_condensed_summary. \
-Write in second person (\"you\"/\"your\") as if speaking to the agent — NEVER use \"the agent\". \
-The conversation record contains the past tool calls and results. \
-Focus on analysis and what to do next. \
-Call submit_condensed_summary to respond. No <think> blocks or text before the tool call."""
+Extract key information from the conversation into four fields. \
+Call submit_condensed_summary with ALL four fields filled in.
+
+tool_summary: Summarize what tools were used and what was found. \
+Deduplicate repeated searches -- mention each unique query once with its top results. \
+List each unique document read with key content extracted (not just docid). \
+Summarize each unique answer submission and the feedback received. \
+Be concise but include specific names, docids, and key details from results.
+
+key_thoughts: The reasoning strategy -- what hypotheses were being tested, \
+what logical chains were being followed, what clue connections were being explored. \
+Capture the thinking process so dead ends are not repeated.
+
+key_findings: What FACTS were actually found in documents. Include specific names, \
+dates, numbers, titles, relationships, quotes with docid references. \
+Include both supporting and contradictory evidence.
+
+remaining_to_find: Which specific clues from the question are still unsolved. \
+Be precise -- not \"identify the club\" but \"find club name starting with B, \
+4 syllables, linked to Latin music, connected to surname Franzini\".
+
+RULES:
+- Be dense: every sentence should contain a useful fact or insight
+- If an answer was rejected, extract what was learned from the feedback
+"""
 
 # Prompt for model-generated analysis in verify condense
 _VERIFY_CONDENSE_ANALYSIS_PROMPT = """\
-Write a verification progress summary. Call submit_condensed_summary. \
-Write in second person (\"you\"/\"your\") — NEVER use \"the agent\". \
-Produce exactly three sections:
-1. Search strategy — what you searched and why
-2. Key evidence — key facts from documents with docid references
-3. Claim verification status — supported / unsupported / uncertain
-Keep each section under 10 lines. Call submit_condensed_summary to respond."""
+Extract key information from the verification conversation into four fields. \
+Call submit_condensed_summary with ALL four fields filled in.
+
+tool_summary: Summarize what searches were performed (deduplicated), \
+what documents were read with key content, and what feedback was given. \
+Be concise but include specific queries, docids, and key details.
+
+key_thoughts: The verification strategy -- why those searches were chosen, \
+what hypotheses about the answer were being tested.
+
+key_findings: Key evidence found in documents with docid references. \
+Which claims are supported, which are contradicted, which lack evidence.
+
+remaining_to_find: What still needs to be verified -- specific claims \
+not yet checked, documents not yet read, angles not yet explored.
+
+RULES:
+- Be dense: every sentence should contain a useful fact or insight
+"""
 
 VERIFY_SYSTEM_PROMPT = """\
 You are a Verification Agent. Your job is to independently verify whether a proposed answer is correct by searching the document corpus. You have `search` and `get_document` tools to find evidence, and `give_feedback` to report your verdict.
 
 Follow this workflow:
 
-Step 1 — Search for Independent Evidence:
-Extract each factual claim from the proposed answer. For each claim, call `search` with targeted keywords. Do NOT just copy the claimed evidence's docids — search independently.
+Step 1 -- Search for Independent Evidence:
+Extract each factual claim from the proposed answer. For each claim, call `search` with targeted keywords. Do NOT just copy the claimed evidence's docids -- search independently.
 
-Step 2 — Read Full Documents:
+Step 2 -- Read Full Documents:
 For any relevant search result, call `get_document` to read the full text. Snippets alone are often misleading or incomplete.
 
-Step 3 — Verify Claim by Claim (CRITICAL — Check Entity Identity):
+Step 3 -- Verify Claim by Claim (CRITICAL -- Check Entity Identity):
 Check whether the documents actually support each claim.
 
-**BEWARE OF ENTITY CONFUSION — The evidence may describe someone/something ELSE:**
+**BEWARE OF ENTITY CONFUSION -- The evidence may describe someone/something ELSE:**
 Just because you found evidence matching the DESCRIPTIONS does NOT mean the answer's ENTITY is correct. The same description may fit multiple entities.
 
-**Example:** The question asks "Who was killed by Sun Wukong?" Clues: a monkey with golden fur, immense strength, magical staff, havoc in heaven, accompanied a monk. The answer "Sun Wukong" is WRONG — both Sun Wukong AND the Six-Eared Macaque share nearly identical descriptions (golden fur, magical staff, havoc, monk's companion). BUT Sun Wukong was the KILLER, Six-Eared Macaque was the VICTIM. The subject/object relationship is reversed. Superficial evidence matches both — only the specific EVENT distinguishes them.
+**Example:** The question asks "Who was killed by Sun Wukong?" Clues: a monkey with golden fur, immense strength, magical staff, havoc in heaven, accompanied a monk. The answer "Sun Wukong" is WRONG -- both Sun Wukong AND the Six-Eared Macaque share nearly identical descriptions (golden fur, magical staff, havoc, monk's companion). BUT Sun Wukong was the KILLER, Six-Eared Macaque was the VICTIM. The subject/object relationship is reversed. Superficial evidence matches both -- only the specific EVENT distinguishes them.
 
 **Before calling give_feedback, ask yourself:**
 - Does the evidence confirm THIS specific entity, or just a SIMILAR one?
@@ -75,13 +111,13 @@ Just because you found evidence matching the DESCRIPTIONS does NOT mean the answ
 - Do ALL clues point to the SAME entity, or am I mixing up two similar entities?
 - Is the logical chain correct? (A → B → C, not A → C directly)
 
-Step 4 — Report Verdict via give_feedback:
+Step 4 -- Report Verdict via give_feedback:
 Only after completing steps 1-3, call `give_feedback`:
 - All claims independently supported and answer matches question → `is_correct=True`
 - Any claim unsupported or wrong → `is_correct=False` with specific, actionable suggestions.
 
-CRITICAL for suggestions: NEVER give specific search queries or entity names — that is the main agent's job to figure out. Instead, guide the direction:
-- If evidence is insufficient → suggest what type/aspect of evidence to look for, or check if a specific claim can be verified
+CRITICAL for suggestions: NEVER give specific search queries or entity names -- that is the main agent's job to figure out. Instead, guide the direction:
+- If evidence is insufficient → suggest what type/aspect of evidence to look for, or check if a specific claim can be verified and **suggest the agent if can not find efficient evidence ,restart from another angle**.
 - If constraints don't match → suggest switching to a different angle or finding another answer candidate
 - Be specific about WHAT to verify, not HOW to search.
 
@@ -91,74 +127,43 @@ DEFAULT_SYSTEM_PROMPT = """\
 You are a Deep Research Agent. Answer complex questions by searching a document corpus \
 using `search` and `get_document`. Every answer must be grounded in retrieved evidence.
 
+**HOW TO SEARCH:**
+
+BM25 has NO understanding of word order or meaning. Your query is split into individual tokens, and each token is matched independently — a document matching any single token appears in results. Generic tokens match thousands of docs and bury the relevant one. Short queries (2-3 words) using rare, specific tokens work best.
+
+Example search chain:
+  Q: "A wizard won the Dragon Taming Cup at an academy built by the Elf King. Name his familiar."
+  1. search "Elf King academy" (3 words, rarest clue) → finds "Crystal Tower Academy"
+  2. search "Crystal Tower" "Dragon Cup" (entity + next clue) → finds "Gandalf"
+  3. search "Gandalf familiar" (2 words) → "Shadowfax". Done.
+
+CRITICAL SEARCH RULES:
+1. FIRST search = the RAREST clue word (profession, object, name). NEVER a vague description.
+   Vague queries return noise — \"third era\" matches 500+ docs, \"Elf King\" matches 5.
+2. 2-3 words per query, NEVER exceed 5. More words = worse.
+3. Chain: entity from result + one new clue.
+4. If stuck, completely DIFFERENT clue. Never rephrase a failed query.
+5. Call get_document on promising results BEFORE searching again. Snippets show only the first part — chapter titles and key details are often deeper in the document. You cannot judge relevance from snippet alone. When reading a book text, look for \"CHAPTER I\" or \"Chapter 1\" to find the exact first chapter title. Quote it precisely.
+
 **Important Rules:**
-1.You are limited to call one tool per turn but you can call other tools in the future turn,it just limits the rate of the tool calls but not the total number of the tool calls.
-2.search tool is used to get the relevant documents,and get_document tool is used to get the detailed information of the document.
-3.You should collect information step by step,make sure all the answer has its evidence and always have a full understanding of the whole context before you propose a conclusion.
-4.You are in a searching task but not a answering task with context,so feel free to call tools to get more information and details,the accuracy is MUCH MORE IMPORTANT than the speed and I'm not expected that you can anwser immediately but you call proper tool to get detailed information instead.
-5.YOU ARE **NOT** EXPECTED TO ANSWER IMMEDIATELY!!!
+1.You are limited to call one tool per turn.
+2.Use search for documents, get_document for full text.
+3.Accuracy over speed. YOU ARE NOT EXPECTED TO ANSWER IMMEDIATELY.
 
-**Actionable BM25 Search Rules:**
+You MUST work in this order:
+1. First, summarize what you already know: which clues from the question are you working on? What entities have you found so far? What remains unknown?
+2. Pick the most specific piece of information you have right now — a name, a date, a title. Use that to search next. Always prefer concreteness over vagueness.
+3. DIG DEEPER into each entity before moving on. Exhaust what you can learn from one finding, then use it to find the next.
+4. After each search, update your summary: what new entity/fact did you find? What's still missing?
+5. When a result looks relevant, call get_document to read the full text.
 
-1. **Decompose Multi-Hop Questions (Prevent Query Dilution):**
-   - NEVER put all constraints into one query. BM25 will fail if you ask it to match 10 different facts at once. Break it down into sequential steps.
-   - *Bad:* "wizard who won the Dragon Taming Cup in the 3rd Era worked at a magical academy built by the Elf King"
-   - *Good Step 1:* First, find the academy -> "magical academy" "Elf King"
-   - *Good Step 2:* Then, find the person -> "[Name of Academy from Step 1]" "Dragon Taming Cup" "3rd Era"
+**CRITICAL: NEVER guess from prior knowledge.** Every answer MUST be found in retrieved documents. If search results don't contain the answer, search from a completely different angle — do NOT fall back on what you think you know.
 
-2. **Extract High-IDF Nouns ONLY:**
-   - Strip out ALL conversational language, verbs, and relational phrases. Only keep the rarest nouns and entities.
-   - *Bad:* "a cybernetic pirate who secretly smuggled a glowing pineapple into a spaceship"
-   - *Good:* pirate "glowing pineapple" spaceship (Drop "who secretly smuggled")
+**CRITICAL: You MUST call `submit_answer` to provide your final answer.**
 
-3. **Strip Relational Operators for Numbers/Dates:**
-   - Remove comparative words. Keep only exact digits or unique text descriptors.
-   - *Bad:* "a vampire born before the year 800 whose creator was a legendary blacksmith"
-   - *Good:* vampire creator blacksmith 800 (Drop "born before the year")
+**CRITICAL: Never output `[tool ...]`, `[reasoning]`, `[/reasoning]` as text.** "Following is your previous progress:" is a compressed summary -- use it but continue your own thinking. Feedback from submit_answer tells you why your answer was wrong -- use suggestions to improve.
 
-4. **Target the Most UNIQUE Identifier First:**
-   - Always start your search with the rarest combination of words (Highest IDF tokens) to quickly narrow down the BM25 results.
-   - *Example:* If looking for "a three-headed dog guarding a neon castle during the Great Meteor Shower", start with -> "three-headed dog" "neon castle" "Great Meteor Shower"
-
-5. **Iterative BM25 Refinement:**
-   - If snippets are irrelevant, your keywords might be too strict or slightly mismatched in phrasing. DO NOT just repeat the query.
-   - *Strategy:* Drop the least important keywords, or try noun synonyms that might appear in a formal document (e.g., if "cash payment" fails, try "financial settlement" or "compensation").
-
-6. **Query Paraphrasing (Equivalent Expressions):**
-   When a query fails, think: is there another way to express the SAME fact using different words or relational inverses?
-   - *Relation inversion:* "A is B's father" ↔ "B is A's son" OR "A has a son/daughter B". "X wrote the book Y" ↔ "X is the author of Y" OR "Y was written by X". Always try the inverse relationship direction — documents may only contain one form.
-   - *Synonym substitution:* "constructed" ↔ "built" / "erected". "resided in" ↔ "lived in" / "inhabited". "penned" ↔ "wrote" / "authored".
-   - **CRITICAL:** Use paraphrasing to AVOID data leakage. When the question gives you specific clue phrases, rephrase them into generic terms before searching, so the search isn't biased by the question's exact wording.
-
-7. **Search Order by Distinctiveness (NOT Question Order):**
-   Do NOT follow the question's logical order. Search for the MOST DISTINCTIVE entity first, then work backwards.
-   - *Example:* "A (vague: 'a chef') has a student B (medium: 'a pastry maker from Bavaria'), B invented a dessert C (highly specific: 'Black Forest cake with gold leaf')." → Search for C first ("Black Forest cake" "gold leaf"), then use C's context to find B, then trace B back to A.
-   - *Rule:* Rank entities by how UNIQUE / RARE their keywords are (High IDF). The rarest entity narrows the corpus fastest.
-
-8. **Keyword Splitting (Anti-Dilution):**
-   If a query combining multiple entities returns poor results, the critical information may be split across DIFFERENT documents, and BM25's bag-of-words scoring dilutes the match.
-   - *Bad (combined):* "chef" "Bavarian pastry maker" "Black Forest cake gold leaf" — three different topics, scores diluted.
-   - *Good (split):* Step 1: search "Black Forest cake" "gold leaf" → find the dessert and its inventor. Step 2: search the inventor's name "Bavaria" → find their teacher. Step 3: search the teacher's name chef.
-   - *Heuristic:* If a query has 3+ distinct named entities/concepts and returns irrelevant results, split it into 2-3 simpler queries, each targeting ONE core entity, then connect the dots from the retrieved documents.
-
-You MUST work in the following order:
-
-1. Search for specific entities (names, places, dates) rather than long descriptive phrases.
-2. After getting results, extract names/entities from them and use those for your next search.
-3. If a snippet looks even partially relevant, call `get_document` to read the full text. Snippets can be misleading without full context.
-4. After reading the full document, extract key **relevant** information and quote exact supporting text.
-5. If there are other documents you haven't checked in detail, continue searching and reading.
-6. If documents don't provide enough information, refine your search query from different angles. **Apply BM25 Rules 6-8:** (6) use equivalent expressions and relation inverses, (7) reorder search by entity distinctiveness, (8) split combined queries into simpler single-entity queries.
-7. The answer **MUST** match the question perfectly — otherwise continue searching.
-
-**CRITICAL: You MUST call `submit_answer` to provide your final answer. Never output an answer as plain text — always use the `submit_answer` tool.**
-
-**CRITICAL: Never output internal markers as text.** The following are compression artifacts — NEVER reproduce: `[tool ...]`, `[reasoning]`, `[/reasoning]`, `[PROGRESS SUMMARY]`. "Following is your previous progress:" is a compressed summary of prior turns for your reference. Use the information but ALWAYS do your own thinking in <think> blocks — do NOT skip thinking just because there is a summary. `Your previous feedback` contains verification results — use suggestions to improve. Always use proper function-calling (`search`, `get_document`, `submit_answer`).
-
-**CRITICAL — Entity Identity & Relationship Check:** Before submitting your answer, carefully verify:
-- Are you naming the CORRECT entity? Similar descriptions may match multiple entities — confirm that ALL clues uniquely identify THIS specific entity and not a similar one.
-- Are subject/object relationships correct? Check who did what to whom. "A defeated B" ≠ "B defeated A". "A is B's father" ≠ "B is A's father".
-- Does the logical chain hold? If the question requires A → B → C, verify each link independently. Evidence for A and evidence for C does NOT prove A → B → C.
+**CRITICAL: If the same answer has been rejected multiple times, change target and restart from a completely different angle.**
 """
 
 
@@ -360,88 +365,6 @@ class Agent:
             raw = re.sub(r'\n\nYour previous.*$', '', raw, flags=re.DOTALL)
             question = raw.strip()
 
-        # ── Extract structured tool call data ──
-        searches: List[Dict[str, Any]] = []
-        doc_reads: List[Dict[str, Any]] = []
-        submissions: List[Dict[str, Any]] = []
-
-        for i, m in enumerate(messages):
-            role = m.get('role','?')
-            tc = m.get('tool_calls')
-            if tc and role == "assistant":
-                for t in tc:
-                    fn = t.get("function", {})
-                    name = fn.get('name','?')
-                    try:
-                        args = json.loads(fn.get('arguments','{}'))
-                    except Exception:
-                        args = {}
-                    # Find the corresponding tool result
-                    call_id = t.get('id','')
-                    result = None
-                    for j in range(i + 1, len(messages)):
-                        rm = messages[j]
-                        if rm.get('role') == "tool" and rm.get('tool_call_id') == call_id:
-                            try:
-                                result = json.loads(str(rm.get('content','')))
-                            except Exception:
-                                result = {"_raw": str(rm.get('content',''))[:200]}
-                            break
-
-                    if name == "search":
-                        q = args.get('query','?')
-                        top_docids = ""
-                        if isinstance(result, list) and len(result) > 0:
-                            top = [(r.get('docid','?'), r.get("score", 0)) for r in result[:3]]
-                            top_docids = ", ".join(f"{d}:{s:.1f}" for d, s in top)
-                        searches.append({"query": q, "top": top_docids, "n": len(result) if isinstance(result, list) else "?"})
-                    elif name == "get_document":
-                        docid = args.get('docid','?')
-                        title = "?"
-                        text_len = "?"
-                        if isinstance(result, dict):
-                            title = str(result.get('title','?'))[:80]
-                            text_len = len(result.get('text',''))
-                        doc_reads.append({"docid": docid, "title": title, "text_len": text_len})
-                    elif name == "submit_answer":
-                        ans = args.get('answer','?')
-                        fb = {}
-                        if isinstance(result, dict):
-                            fb = {"is_correct": result.get('is_correct'), "reason": str(result.get('reason',''))[:200]}
-                        submissions.append({"answer": ans[:200] if isinstance(ans, str) else str(ans)[:200], "feedback": fb})
-                    elif name == "give_feedback":
-                        pass  # verify agent internal, not main agent
-
-        # ── Build structured template ──
-        lines: List[str] = []
-        lines.append("")
-
-        if searches:
-            lines.append("Your previous searches:")
-            for s in searches:
-                q = s['query'][:150]
-                lines.append(f"- query=\"{q}\" → {s['n']} results, top: {s['top']}")
-            lines.append("")
-
-        if doc_reads:
-            lines.append("Your previous documents read:")
-            for d in doc_reads:
-                lines.append(f"- docid={d['docid']}, title=\"{d['title']}\", text={d['text_len']} chars")
-            lines.append("")
-
-        if submissions:
-            lines.append("Your previous answer submissions:")
-            for s in submissions:
-                fb = s['feedback']
-                verdict = "✓ CORRECT" if fb.get('is_correct') else "✗ INCORRECT"
-                lines.append(f"- answer=\"{s['answer']}\" → {verdict}")
-                if fb.get('reason'):
-                    lines.append(f"  reason: {fb['reason']}")
-                suggestions = fb.get('suggestions','')
-                if suggestions:
-                    lines.append(f"  suggestions: {str(suggestions)[:200]}")
-            lines.append("")
-
         # ── Build analysis context from the conversation ──
         # Keep reasoning blocks and non-tool content for the model to analyze
         analysis_lines: List[str] = []
@@ -478,20 +401,21 @@ class Agent:
         # ── Log structured template ──
                 # ── Call model for key findings + what remains ──
         # Give condense model a submit tool so it MUST use tool calling → structured output
-        condense_extra = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+        condense_extra = None  # let the model think -- compression needs reasoning
         condense_tools = [{
             "type": "function",
             "function": {
                 "name": "submit_condensed_summary",
-                "description": "Submit your condensed progress summary. You MUST use this tool — plain text is ignored.",
+                "description": "Submit your condensed progress summary. You MUST use this tool -- plain text is ignored.",
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "tool_summary": {"type": "string", "description": "Summary of tools used: searches (deduplicated), documents read with key content, submissions and their feedback"},
                         "key_thoughts": {"type": "string", "description": "Core reasoning and strategy in 2-3 sentences"},
                         "key_findings": {"type": "string", "description": "Verified facts with docid references"},
                         "remaining_to_find": {"type": "string", "description": "Missing clues, what to search next"},
                     },
-                    "required": ["key_thoughts", "key_findings", "remaining_to_find"],
+                    "required": ["tool_summary", "key_thoughts", "key_findings", "remaining_to_find"],
                 },
             },
         }]
@@ -528,7 +452,7 @@ class Agent:
                             try:
                                 args = json.loads(fn.get('arguments','{}'))
                                 # Validate required fields
-                                missing = [k for k in ("key_thoughts", "key_findings", "remaining_to_find") if not args.get(k)]
+                                missing = [k for k in ("tool_summary","key_thoughts","key_findings","remaining_to_find") if not args.get(k)]
                                 if missing:
                                     if attempt == 0:
                                         nudge = {"role": "user", "content": f"Missing required fields in submit_condensed_summary: {', '.join(missing)}. Please provide ALL required fields and try again."}
@@ -536,6 +460,8 @@ class Agent:
                                         session_msgs.append(nudge)
                                     continue  # retry
                                 parts = []
+                                if args.get('tool_summary'):
+                                    parts.append(args['tool_summary'])
                                 parts.append(f"Your previous analysis: {args['key_thoughts']}")
                                 parts.append(f"Your previous findings:\n{args['key_findings']}")
                                 parts.append(f"What you still need to find: {args['remaining_to_find']}")
@@ -561,17 +487,14 @@ class Agent:
                     session_msgs.append(nudge)
             except Exception:
                 if fallback_truncation and attempt == 1:
-                    analysis = "(analysis unavailable — model error)"
+                    analysis = "(analysis unavailable -- model error)"
                 elif not fallback_truncation:
                     raise
 
         # ── Assemble final summary ──
-        if analysis:
-            lines.append(analysis)
-        else:
-            lines.append("(progress summary unavailable)")
-
-        summary_text = "\n".join(lines)
+        if not analysis:
+            analysis = "(progress summary unavailable)"
+        summary_text = analysis
 
         summary_msg: Dict[str, Any] = {
             "role": "user",
@@ -731,7 +654,7 @@ class Agent:
             print(f"    [verify] stage1 result: SURRENDER", flush=True)
             return {
                 "is_correct": False,
-                "reason": "Your answer is a surrender statement. The answer EXISTS in the corpus — do NOT give up. Try completely different search angles: use different keywords, inverse relations, or split compound queries into simpler single-entity searches.",
+                "reason": "Your answer is a surrender statement. The answer EXISTS in the corpus -- do NOT give up. Try completely different search angles: use different keywords, inverse relations, or split compound queries into simpler single-entity searches.",
                 "suggestions": "Rephrase your search queries with different keywords, try relation inverses, or split compound queries into simpler single-entity searches.",
             }
         print(f"    [verify] verify_stage2_start", flush=True)
@@ -754,7 +677,7 @@ class Agent:
                             "Based on the evidence you have gathered so far, call give_feedback NOW "
                             "with your best assessment. If you have no evidence, call "
                             "give_feedback(is_correct=False, reason=\"Insufficient evidence found\", "
-                            "suggestions=\"...\"). Do NOT call any other tool — only give_feedback."
+                            "suggestions=\"...\"). Do NOT call any other tool -- only give_feedback."
                         ),
                     })
 
@@ -909,7 +832,7 @@ class Agent:
                 "You have NOT called give_feedback yet and have run out of turns. "
                 "Based on ALL evidence gathered so far, you MUST call give_feedback NOW. "
                 "If you are unsure, call give_feedback(is_correct=False, reason=\"...\", suggestions=\"...\"). "
-                "Do NOT search or get_document anymore — ONLY give_feedback."
+                "Do NOT search or get_document anymore -- ONLY give_feedback."
             ),
         })
         result = await _run_loop(verify_msgs, verify_max, 2, "retry")
@@ -919,4 +842,4 @@ class Agent:
 
         print(f"    [verify] all attempts exhausted, passing through", flush=True)
         self._verify_msgs = verify_msgs
-        return {"is_correct": True, "reason": "Verification timed out — answer accepted by default", "suggestions": ""}
+        return {"is_correct": True, "reason": "Verification timed out -- answer accepted by default", "suggestions": ""}

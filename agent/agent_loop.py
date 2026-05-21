@@ -342,16 +342,17 @@ async def generate_trajectories(
         rows = [r for r in rows if r.get("query_id", "") in ids]
         print(f"Filtered to {len(rows)} queries by query_ids: {sorted(ids)}", flush=True)
     total = len(rows)
-    client = VLLMClientAsync(base_url=base_url, api_key=api_key, max_concurrent=n_envs)
+    client = VLLMClientAsync(base_url=base_url, api_key=api_key, max_concurrent=max(n_envs, 10))
 
     agent = Agent(client=client, model=model, tokenizer=_tok, max_tokens=max_tokens,
                   temperature=temperature, max_context=max_context, extra_payload=extra_payload,
                   max_tool_calls_per_turn=max_tool_calls_per_turn, think_trunc_no_think=think_trunc_no_think)
     verify_agent = Agent(client=client, model=model, tokenizer=_tok, max_tokens=max_tokens, temperature=temperature)
+    sub_agent = Agent(client=client, model=model, tokenizer=_tok, max_tokens=2048, temperature=0.0)
 
     env = DeepResearchEnv(index_path=index_path, n_envs=n_envs, system_prompt=system_prompt,
                           max_turns=max_turns, search_k=search_k, snippet_max_chars=snippet_max_chars,
-                          record_trajectory=True, verify_agent=verify_agent)
+                          record_trajectory=True, verify_agent=verify_agent, sub_agent=sub_agent)  # sub_agent disabled
 
     records: List[Dict[str, Any]] = []
     try:
