@@ -99,6 +99,7 @@ For any relevant search result, call `get_document` to read the full text. Snipp
 
 Step 3 -- Verify Claim by Claim (CRITICAL -- Check Entity Identity):
 Check whether the documents actually support each claim.
+use get_document to read the full text of the document if you want to know more about the document.
 
 **BEWARE OF ENTITY CONFUSION -- The evidence may describe someone/something ELSE:**
 Just because you found evidence matching the DESCRIPTIONS does NOT mean the answer's ENTITY is correct. The same description may fit multiple entities.
@@ -114,12 +115,7 @@ Just because you found evidence matching the DESCRIPTIONS does NOT mean the answ
 Step 4 -- Report Verdict via give_feedback:
 Only after completing steps 1-3, call `give_feedback`:
 - All claims independently supported and answer matches question → `is_correct=True`
-- Any claim unsupported or wrong → `is_correct=False` with specific, actionable suggestions.
-
-CRITICAL for suggestions: NEVER give specific search queries or entity names -- that is the main agent's job to figure out. Instead, guide the direction:
-- If evidence is insufficient → suggest what type/aspect of evidence to look for, or check if a specific claim can be verified and **suggest the agent if can not find efficient evidence ,restart from another angle**.
-- If constraints don't match → suggest switching to a different angle or finding another answer candidate
-- Be specific about WHAT to verify, not HOW to search.
+- Any claim unsupported or wrong → `is_correct=False` with reason explaining exactly what is wrong.
 
 CRITICAL: You MUST call `search` or `get_document` before `give_feedback`."""
 
@@ -143,7 +139,7 @@ CRITICAL SEARCH RULES:
 2. 2-3 words per query, NEVER exceed 5. More words = worse.
 3. Chain: entity from result + one new clue.
 4. If stuck, completely DIFFERENT clue. Never rephrase a failed query.
-5. Call get_document on promising results BEFORE searching again. Snippets show only the first part — chapter titles and key details are often deeper in the document. You cannot judge relevance from snippet alone. When reading a book text, look for \"CHAPTER I\" or \"Chapter 1\" to find the exact first chapter title. Quote it precisely.
+5. call get_document if you want to know more about the document.
 
 **Important Rules:**
 1.You are limited to call one tool per turn.
@@ -159,7 +155,7 @@ You MUST work in this order:
 
 **CRITICAL: You MUST call `submit_answer` to provide your final answer.**
 
-**CRITICAL: Never output `[tool ...]`, `[reasoning]`, `[/reasoning]` as text.** "Following is your previous progress:" is a compressed summary -- use it but continue your own thinking. Feedback from submit_answer tells you why your answer was wrong -- use suggestions to improve.
+**CRITICAL: Never output `[tool ...]`, `[reasoning]`, `[/reasoning]` as text.** "Following is your previous progress:" is a compressed summary -- use it but continue your own thinking. When your answer is rejected: Your answer has been rejected. If you cannot find enough evidence or your answer has obvious incorrectness, try to restart from a completely different angle.
 
 **CRITICAL: If the same answer has been rejected multiple times, change target and restart from a completely different angle.**
 
@@ -655,7 +651,6 @@ class Agent:
             return {
                 "is_correct": False,
                 "reason": "Your answer is a surrender statement. The answer EXISTS in the corpus -- do NOT give up. Try completely different search angles: use different keywords, inverse relations, or split compound queries into simpler single-entity searches.",
-                "suggestions": "Rephrase your search queries with different keywords, try relation inverses, or split compound queries into simpler single-entity searches.",
             }
         print(f"    [verify] verify_stage2_start", flush=True)
 
@@ -677,7 +672,7 @@ class Agent:
                             "Based on the evidence you have gathered so far, call give_feedback NOW "
                             "with your best assessment. If you have no evidence, call "
                             "give_feedback(is_correct=False, reason=\"Insufficient evidence found\", "
-                            "suggestions=\"...\"). Do NOT call any other tool -- only give_feedback."
+                            "error_type=\\"insufficient_evidence\\"). Do NOT call any other tool -- only give_feedback."
                         ),
                     })
 
@@ -750,10 +745,9 @@ class Agent:
                                 fb = json.loads(args_str)
                             except (json.JSONDecodeError, TypeError):
                                 pass
-                            print(f"    [verify] {label} turn {vturn+1}: give_feedback -> is_correct={fb.get('is_correct')}", flush=True)
+                            print(f"    [verify] {label} turn {vturn+1}: give_feedback -> is_correct={fb.get('is_correct')} error_type={fb.get('error_type','?')}", flush=True)
                             print(f"    [verify]   reason: {fb.get('reason','')}", flush=True)
-                            if fb.get('suggestions'):
-                                print(f"    [verify]   suggestions: {fb['suggestions']}", flush=True)
+                            
 
                     if name not in registry:
                         msgs.append({
@@ -802,7 +796,7 @@ class Agent:
                             try:
                                 return json.loads(tc_item['function']['arguments'])
                             except (json.JSONDecodeError, TypeError):
-                                return {"is_correct": False, "reason": "Failed to parse feedback arguments", "suggestions": ""}
+                                return {"is_correct": False, "reason": "Failed to parse feedback arguments"}
 
             return {}
 
@@ -831,7 +825,7 @@ class Agent:
             "content": (
                 "You have NOT called give_feedback yet and have run out of turns. "
                 "Based on ALL evidence gathered so far, you MUST call give_feedback NOW. "
-                "If you are unsure, call give_feedback(is_correct=False, reason=\"...\", suggestions=\"...\"). "
+                "If you are unsure, call give_feedback(is_correct=False, reason=\"...\"). "
                 "Do NOT search or get_document anymore -- ONLY give_feedback."
             ),
         })
@@ -842,4 +836,4 @@ class Agent:
 
         print(f"    [verify] all attempts exhausted, passing through", flush=True)
         self._verify_msgs = verify_msgs
-        return {"is_correct": True, "reason": "Verification timed out -- answer accepted by default", "suggestions": ""}
+        return {"is_correct": True, "reason": "Verification timed out", "error_type": "insufficient_evidence", }

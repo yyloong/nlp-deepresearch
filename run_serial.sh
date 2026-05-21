@@ -22,7 +22,7 @@ OUTPUT_DIR="${ROOT}/runs"
 MAX_TURNS="${MAX_TURNS:-30}"
 MAX_TOKENS="${MAX_TOKENS:-8912}"
 MAX_TOOL_CALLS="${MAX_TOOL_CALLS:-1}"
-SEARCH_K="${SEARCH_K:-5}"
+SEARCH_K="${SEARCH_K:-10}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 
 # ── 清理代理变量（vLLM 在 localhost，不能走 proxy）──
@@ -70,6 +70,7 @@ exec python run_serial.py \
     --max-turns "${MAX_TURNS}" \
     --max-tokens "${MAX_TOKENS}" \
     --max-tool-calls-per-turn "${MAX_TOOL_CALLS}" \
+    --no-verify \
     --search-k "${SEARCH_K}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
     --think-trunc-no-think \

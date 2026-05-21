@@ -201,6 +201,8 @@ class DeepResearchEnv:
 
             tasks = [_process_one(d) for d in docs]
             results = await _asyncio.gather(*tasks)
+            for r in results:
+                print(f"    [search-result] docid={r.get('docid','?')}: {r.get('summary','?')}", flush=True)
             return list(results)
 
         def get_document(docid: str) -> Dict[str, Any]:
@@ -210,9 +212,8 @@ class DeepResearchEnv:
             return doc
 
         async def submit_answer(answer: str, evidence: str) -> Dict[str, Any]:
-            """Submit final answer for verification. Triggers a verify agent that checks the answer."""
             if not self._enable_verify:
-                return {"is_correct": True, "reason": "Verification disabled", "suggestions": ""}
+                return {"is_correct": True, "reason": "Verification disabled"}
             if self._verify_agent is None:
                 return {"error": "No verify agent configured"}
             return await self._verify_agent.run_verify(
@@ -221,13 +222,17 @@ class DeepResearchEnv:
                 max_turns_for_verify=self.max_turns,
             )
 
-        def give_feedback(is_correct: bool, reason: str, suggestions: str = "") -> Dict[str, Any]:
-            """Called by the verify agent to report its verification verdict.
-            Only available to the verify agent, NOT to the main agent."""
+        def give_feedback(is_correct: bool, reason: str, error_type: str = "") -> Dict[str, Any]:
+            """Called by the verify agent to report its verification verdict."""
+            rejection_nudge = ""
+            if not is_correct:
+                if error_type == "wrong_answer":
+                    rejection_nudge = "**DO NOT SUBMIT THIS ANSWER AGAIN. It is clearly wrong. Find a DIFFERENT answer.**"
+                elif error_type == "insufficient_evidence":
+                    rejection_nudge = "**INSUFFICIENT EVIDENCE. You MUST provide richer evidence than before. If you cannot, CHANGE your answer entirely.**"
             return {
                 "is_correct": is_correct,
-                "reason": reason,
-                "suggestions": suggestions,
+                "reason": (reason + " | " + rejection_nudge).strip(" |") if rejection_nudge else reason,
             }
 
         # ── Main agent tools ──
@@ -247,7 +252,7 @@ class DeepResearchEnv:
                             "found": {"type": "string", "description": "BEFORE this search: what specific names/dates/titles did you find in the LAST search results? List them."},
                             "next_reason": {"type": "string", "description": "Why this search? How does it use what you found to move toward the answer?"},
                         },
-                        "required": ["query", "found", "next_reason"],
+                        "required": ["query"],
                     },
                 },
             },
@@ -333,30 +338,25 @@ class DeepResearchEnv:
                 "type": "function",
                 "function": {
                     "name": "give_feedback",
-                    "description": (
-                        "Report your verification verdict. Call this AFTER thoroughly checking all claims. "
-                        "If the answer is wrong, provide specific, actionable suggestions for improvement."
-                    ),
+                    "description": "Report your verification verdict.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "is_correct": {
                                 "type": "boolean",
-                                "description": "True if the answer is fully correct, False otherwise",
+                                "description": "True if fully correct, False otherwise",
                             },
                             "reason": {
                                 "type": "string",
-                                "description": "Brief explanation of your verdict",
+                                "description": "What claims are wrong or unsupported",
                             },
-                            "suggestions": {
+                            "error_type": {
                                 "type": "string",
-                                "description": (
-                                    "If incorrect: specific suggestions for what to search next, "
-                                    "which claims to re-examine, or which angle to pursue"
-                                ),
+                                "enum": ["wrong_answer", "insufficient_evidence"],
+                                "description": "If incorrect: 'wrong_answer' means the answer is clearly wrong (change answer). 'insufficient_evidence' means not enough proof (provide richer evidence or change answer).",
                             },
                         },
-                        "required": ["is_correct", "reason"],
+                        "required": ["is_correct", "reason", "error_type"],
                     },
                 },
             },
