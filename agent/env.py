@@ -133,8 +133,17 @@ class DeepResearchEnv:
     def _build_tool_specs(self) -> Tuple[List[Dict[str, Any]], Dict[str, Callable[..., Any]]]:
         """Build OpenAI-format tool specs and callable registry for main agent + verify agent."""
 
-        async def search(query: str, found: str = "", next_reason: str = "") -> List[Dict[str, Any]]:
-            print(f"    [search] query='{query}' k={self.search_k} sub_agent={self._sub_agent is not None}", flush=True)
+        async def search(
+            query: str,
+            found: str = "",
+            history_found: str = "",
+            next_reason: str = "",
+        ) -> List[Dict[str, Any]]:
+            print(
+                f"    [search] query='{query}' k={self.search_k} sub_agent={self._sub_agent is not None}"
+                f" | found={found!r} history_found={history_found!r} next_reason={next_reason!r}",
+                flush=True,
+            )
             docs = self._searcher.search(query, k=self.search_k)
             print(f"    [search] found {len(docs)} docs", flush=True)
             if self._sub_agent is None:
@@ -274,7 +283,17 @@ class DeepResearchEnv:
                         "type": "object",
                         "properties": {
                             "query": {"type": "string", "description": "2-3 specific entity names, never generic words"},
-                            "found": {"type": "string", "description": "BEFORE this search: what specific names/dates/titles did you find in the LAST search results? List them."},
+                            "found": {"type": "string", "description": "BEFORE this search: what specific names/dates/titles did you find in the LAST search results? List them.NEVER USE a general description."},
+                            "history_found": {
+                                "type": "string",
+                                "description": (
+                                    "Cumulative record of ALL specific names/dates/titles found across "
+                                    "EVERY previous search so far (not just the last one). "
+                                    "Append each turn's new findings; keep prior entries."
+                                    "YOU SHOULD PROVIDE SPECIFIC FINDINGS RATHER THAN A GENERAL DESCRIPTION."
+                                    "For example,GOOD:B is a monkey king with constrain C,and you find it.BAD:monkey king or monkey king with constrain C "
+                                ),
+                            },
                             "next_reason": {"type": "string", "description": "Why this search? How does it use what you found to move toward the answer?"},
                         },
                         "required": ["query"],

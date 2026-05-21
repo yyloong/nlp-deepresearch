@@ -126,30 +126,24 @@ using `search` and `get_document`. Every answer must be grounded in retrieved ev
 **HOW TO SEARCH:**
 
 BM25 has NO understanding of word order or meaning. Your query is split into individual tokens, and each token is matched independently — a document matching any single token appears in results. Generic tokens match thousands of docs and bury the relevant one. Short queries (2-3 words) using rare, specific tokens work best.
-
-Example search chain:
-  Q: "A wizard won the Dragon Taming Cup at an academy built by the Elf King. Name his familiar."
-  1. search "Elf King academy" (3 words, rarest clue) → finds "Crystal Tower Academy"
-  2. search "Crystal Tower" "Dragon Cup" (entity + next clue) → finds "Gandalf"
-  3. search "Gandalf familiar" (2 words) → "Shadowfax". Done.
+YOUR SEARCH QUERY CANNOT BE MORE THAN 5 WORDS!!!
 
 CRITICAL SEARCH RULES:
 1. FIRST search = the RAREST clue word (profession, object, name). NEVER a vague description.
-   Vague queries return noise — \"third era\" matches 500+ docs, \"Elf King\" matches 5.
-2. 2-3 words per query, NEVER exceed 5. More words = worse.
-3. Chain: entity from result + one new clue.
-4. If stuck, completely DIFFERENT clue. Never rephrase a failed query.
-5. call get_document if you want to know more about the document.
-
-**Important Rules:**
-1.You are limited to call one tool per turn.
-2.Use search for documents, get_document for full text.
-3.Accuracy over speed. YOU ARE NOT EXPECTED TO ANSWER IMMEDIATELY.
+   Vague queries return noise , for example, 'book' is a vague description and it will match thousands of docs, but 'The Time' is a specific book and it will match only one doc.
+2. 2-3 words per query, **NEVER** exceed 5. More words = worse.
+3. NEVER ASSUME AN ANSWER BEFORE YOUR SEARCH,BECAUSE IF YOU ASSUME AN ANSWER,YOU WILL STUCK IN THE CIRCLE TO PROVE IT AND IGNORE THE CORRECT ANSWER.
+4. Always use the history found to help you search,not just the last search result.
+PAY ATTENTION,YOU SHOULD SELECT YOUR QUERY FROM YOUR HISTORY FINDINGS RATHER THAN USE THE WHOLE CONTENTS.
+5. It is highly suggested that you use the specific finding in your history findings with higher priority.Because specific query can get more information by bm25 search.
+6. The middle target that satisfies the constraints of the question maybe more than one.DON'T stuck in one possible target.
+For example,the question requires for the mom of a bird with blue wings,you find a bird A with wings and blue,but you cannot find any information of A's mom,there exists a situation that the bird with wings and blue is not only A.
 
 You MUST work in this order:
 1. Search for specific entities using 2-3 words.
-2. After reading search results, extract specific names/entities and use them in your next search.
+2. After reading search results, extract specific names/entities and use them in your next search,and collect the information in your history found.
 3. When a result looks relevant, call get_document to read the full text.
+4. According to your history found,continue to search until you find the answer.
 
 **CRITICAL: NEVER GUESS. NEVER USE PRIOR KNOWLEDGE.** If you cannot find the answer in documents, keep searching — try completely different search queries. Guessing from training data is WORSE than no answer. You are a RESEARCH agent, use the search tools until you find evidence.
 
@@ -159,7 +153,7 @@ You MUST work in this order:
 
 **CRITICAL: If the same answer has been rejected multiple times, change target and restart from a completely different angle.**
 
-**The search tool requires you to fill in `found` and `next_reason` fields — this forces you to reflect on what you learned before each search. Use specific entity names, never generic words.**
+**The search tool requires you to fill in `found` 'history found' and `next_reason` fields — this forces you to reflect on what you learned before each search. Use specific entity names, never generic words.**
 """
 
 
@@ -650,7 +644,7 @@ class Agent:
             print(f"    [verify] stage1 result: SURRENDER", flush=True)
             return {
                 "is_correct": False,
-                "reason": "Your answer is a surrender statement. The answer EXISTS in the corpus -- do NOT give up. Try completely different search angles: use different keywords, inverse relations, or split compound queries into simpler single-entity searches.",
+                "reason": "Your answer is a surrender statement. The answer EXISTS in the corpus -- do NOT give up.If you think a local information is missing,maybe the answer you want to verify is not correct and you NEED to **CHANGE** your target and restart,for example,if you think A satisfy the constraints of the question but cannot find the target B relates to A,it is very likely that the object satisfies the constraints is not only A,don't stuck in it ",
             }
         print(f"    [verify] verify_stage2_start", flush=True)
 
