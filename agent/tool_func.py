@@ -183,7 +183,7 @@ class ToolRegistry:
         async def _run_one(question: str, idx: int) -> Dict[str, Any]:
             try:
                 agent = self._agent_factory("configs/search_agent.yaml")
-                agent.tool_registry = self.build_registry("search")
+                agent.tool_registry = self.build_registry("search", enable_verify=False)
                 print(f"    [subagent-{idx}] started", flush=True)
                 traj = await agent.run(question)
                 # Extract answer from trajectory
@@ -324,19 +324,27 @@ class ToolRegistry:
     # Registry builders — return {tool_name: callable} per agent type
     # ═══════════════════════════════════════════════════════════════
 
-    def build_registry(self, agent_type: str) -> Dict[str, Callable[..., Any]]:
-        """Return a dict mapping tool names to bound callables for the given agent type."""
+    def build_registry(self, agent_type: str, *, enable_verify: bool = False) -> Dict[str, Callable[..., Any]]:
+        """Return a dict mapping tool names to bound callables for the given agent type.
+
+        Parameters
+        ----------
+        agent_type : str
+            The type of agent ("main", "search", "verify", "sub_summary", "surrender_check").
+        enable_verify : bool
+            If True, submit_answer triggers the verify agent. If False, it is a pass-through.
+        """
         if agent_type == "main":
             return {
                 "search": self.search,
                 "call_subagents": self.call_subagents,
-                "submit_answer": self.submit_answer,
+                "submit_answer": self.submit_answer if enable_verify else self._submit_answer_pass_through,
             }
         elif agent_type == "search":
             return {
                 "search": self.search,
                 "get_document": self.get_document,
-                "submit_answer": self.submit_answer,
+                "submit_answer": self.submit_answer if enable_verify else self._submit_answer_pass_through,
             }
         elif agent_type == "verify":
             return {
@@ -354,6 +362,11 @@ class ToolRegistry:
             }
         else:
             raise ValueError(f"Unknown agent_type: {agent_type}")
+
+    async def _submit_answer_pass_through(self, answer: str, evidence: str) -> Dict[str, Any]:
+        """Pass-through submit_answer for search agents — no verification."""
+        print(f"    [submit_answer] (pass-through) answer={answer[:200]}", flush=True)
+        return {"is_correct": True, "reason": "Pass-through (no verify for this agent)", "answer": answer, "evidence": evidence}
 
     async def _submit_summary_impl(self, relevant_info: str) -> Dict[str, str]:
         """Submit summary — pass-through; the caller extracts from trajectory."""

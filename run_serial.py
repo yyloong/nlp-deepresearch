@@ -217,6 +217,11 @@ async def _main_async(args: argparse.Namespace) -> None:
         sub_summary_agent.tool_registry = tool_registry.build_registry("sub_summary")
         tool_registry.set_sub_summary_agent(sub_summary_agent)
 
+    def _get_enable_verify(agent_type: str, default: bool = False) -> bool:
+        cfg_path = f"configs/{agent_type}_agent.yaml"
+        cfg = _load_yaml_config(cfg_path)
+        return bool(cfg.get("tool_config", {}).get("submit_answer", {}).get("enable_verify", default))
+
     # ── Create verify agent ──
     verify_agent = None
     if not args.no_verify:
@@ -241,7 +246,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     # ── Create main agent ──
     main_patched = _load_and_patch("configs/main_agent.yaml")
     main_agent = Agent(main_patched, client=client, tokenizer=_tok)
-    main_agent.tool_registry = tool_registry.build_registry("main")
+    main_agent.tool_registry = tool_registry.build_registry("main", enable_verify=_get_enable_verify("main", True))
     tool_registry.set_main_agent(main_agent)
 
     # ── Output setup ──
