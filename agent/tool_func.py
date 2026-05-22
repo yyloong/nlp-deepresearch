@@ -198,7 +198,9 @@ class ToolRegistry:
                                 except (json.JSONDecodeError, TypeError):
                                     pass
                 print(f"    [subagent-{idx}] finished, answer={answer[:200]}", flush=True)
-                return {"question": question, "answer": answer, "trajectory": traj}
+                # Only return question and answer — NOT the full trajectory
+                # to avoid polluting the main agent's context
+                return {"question": question, "answer": answer}
             except Exception as e:
                 print(f"    [subagent-{idx}] ERROR: {e}", flush=True)
                 traceback.print_exc()

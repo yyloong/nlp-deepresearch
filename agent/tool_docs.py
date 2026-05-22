@@ -99,6 +99,7 @@ def call_subagents_tool_spec() -> Dict[str, Any]:
                 "candidates. Each sub-agent independently searches the corpus and returns "
                 "findings. Pass a list of specific verification questions — one per candidate "
                 "or angle you want to check. Results are returned as a list of answers."
+                "Each agent will only receive one of the questions.Please make sure the questions are independent."
             ),
             "parameters": {
                 "type": "object",
@@ -109,9 +110,7 @@ def call_subagents_tool_spec() -> Dict[str, Any]:
                         "description": (
                             "List of specific verification questions. Each question should be "
                             "self-contained with all necessary context for the sub-agent to "
-                            "search independently. Example: ['What is the profession of the "
-                            "person with surname Franzini mentioned in document X?', "
-                            "'Find the club name starting with B that is linked to Latin music']"
+                            "search **independently**. "
                         ),
                     },
                 },
