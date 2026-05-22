@@ -211,7 +211,6 @@ class ToolRegistry:
                                     if relevance == "HELPFUL":
                                         return {
                                             "docid": doc["docid"],
-                                            "score": doc["score"],
                                             "snippet": snippetize(doc["text"], self._snippet_max_chars),
                                             "summary": summary,
                                             "url": doc.get("url", ""),
