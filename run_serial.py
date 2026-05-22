@@ -180,10 +180,11 @@ async def _main_async(args: argparse.Namespace) -> None:
         cfg["max_tool_calls_per_turn"] = args.max_tool_calls_per_turn
         if "tool_config" not in cfg:
             cfg["tool_config"] = {}
-        if "search" not in cfg["tool_config"]:
-            cfg["tool_config"]["search"] = {}
-        cfg["tool_config"]["search"]["search_k"] = args.search_k
-        cfg["tool_config"]["search"]["snippet_max_chars"] = args.snippet_max_chars
+        for key in ("search", "smart_search"):
+            if key in cfg["tool_config"] or key in cfg.get("tools", []):
+                cfg["tool_config"].setdefault(key, {})
+                cfg["tool_config"][key]["search_k"] = args.search_k
+                cfg["tool_config"][key]["snippet_max_chars"] = args.snippet_max_chars
         # Write patched config
         patched_path = f"/tmp/patched_{os.path.basename(config_path)}"
         with open(patched_path, "w", encoding="utf-8") as f:
@@ -243,9 +244,11 @@ async def _main_async(args: argparse.Namespace) -> None:
     relevance_judge_agent.tool_registry = tool_registry.build_registry("relevance_judge")
     tool_registry.set_relevance_judge_agent(relevance_judge_agent)
 
-    # ── Configure search ──
+    # ── Configure search (YAML tool_config value takes priority) ──
+    _yaml_search_k = int(main_cfg.get("tool_config", {}).get("smart_search", {}).get("search_k",
+                         main_cfg.get("tool_config", {}).get("search", {}).get("search_k", 5)))
     tool_registry.configure_search(
-        search_k=args.search_k,
+        search_k=_yaml_search_k,
         snippet_max_chars=args.snippet_max_chars,
         use_subagent_summary=use_subagent,
     )

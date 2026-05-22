@@ -145,7 +145,9 @@ class Agent:
         self.end_tool: str = cfg.get("end_tool", "submit_answer")
         self._tool_names: List[str] = list(cfg.get("tools", []))
         self._tool_config: Dict[str, Any] = dict(cfg.get("tool_config", {}))
-        self.search_k: int = int(self._tool_config.get("search", {}).get("search_k", 5))
+        # search_k priority: tool_config.<tool>.search_k > tool_config.search.search_k > default 5
+        _search_cfg = self._tool_config.get("smart_search", {}) or self._tool_config.get("search", {})
+        self.search_k: int = int(_search_cfg.get("search_k", 5))
         self.tool_specs: List[Dict[str, Any]] = self._build_tool_specs()
         self.tool_registry: Dict[str, Callable[..., Any]] = tool_registry or {}
 
@@ -167,7 +169,7 @@ class Agent:
 
     def _build_tool_specs(self) -> List[Dict[str, Any]]:
         """Build OpenAI-format tool specs based on the agent's tool list."""
-        search_k = int(self._tool_config.get("search", {}).get("search_k", 5))
+        search_k = self.search_k  # use the already-resolved search_k
         tool_names = set(self._tool_names)
 
         if self.agent_type == "main":
@@ -698,9 +700,24 @@ class Agent:
             turn_stats.append({"turn": turn + 1, "n_tokens_before": n_tokens_before, "n_tokens_after": n_tokens_after, "tool_calls": tc_names})
 
             if end_tool_called:
-                finish_reason = f"{self.end_tool}_confirmed"
-                print(f"    ✓ [{self.name}] end_tool '{self.end_tool}' called, terminating loop", flush=True)
-                break
+                # Check if submit_answer was rejected — if so, continue rather than terminate
+                should_stop = True
+                if self.end_tool == "submit_answer":
+                    # Look at the last tool result for submit_answer
+                    for m in reversed(messages):
+                        if m.get("role") == "tool":
+                            try:
+                                fb = json.loads(m.get("content", "{}"))
+                                if isinstance(fb, dict) and not fb.get("is_correct", True):
+                                    should_stop = False
+                                    print(f"    ⚠ [{self.name}] answer REJECTED by verify agent, continuing search...", flush=True)
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                            break
+                if should_stop:
+                    finish_reason = f"{self.end_tool}_confirmed"
+                    print(f"    ✓ [{self.name}] end_tool '{self.end_tool}' called, terminating loop", flush=True)
+                    break
 
             # ── Post-turn condense check ──
             used = count_tokens_messages(self.tokenizer, messages)

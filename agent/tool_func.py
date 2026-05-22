@@ -233,7 +233,7 @@ class ToolRegistry:
         result: Dict[str, Any] = {"results": filtered}
         if not filtered:
             hint = (f"ALL {len(docs)} search results were judged IRRELEVANT or CONFUSING. "
-                    f"PAY ATTENTION!!! it is not the limitation of the search tool but your query way or entity!!!Try to list all the clues you have and try one by one.Don't use similar query again!!!")
+                    f"PAY ATTENTION!!! it is not the limitation of the search tool but your query way or entity or your search direction has been away from the answer!!!Try to list all the clues you have and try one by one or reflect if your search entity is right for the question.Don't use similar query again!!!")
             result["hint"] = hint
             print(f"    [smart_search] {hint}", flush=True)
         for r in filtered:
