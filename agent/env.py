@@ -322,6 +322,7 @@ class DeepResearchEnv:
                         "Submit your final answer for verification. A verify agent will independently "
                         "check your answer against the document corpus and provide feedback. "
                         "If the answer is incorrect, you will receive suggestions and can continue searching."
+                        "[IMPORTANT]The verify agent has no memory or knowledge of your context,so you MUST provide whole evidence every time you submit your answer RATHER than the additional evidence from your last submit."
                     ),
                     "parameters": {
                         "type": "object",
