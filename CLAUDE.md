@@ -1,76 +1,37 @@
-# Deep Research Agent 开发规范
+1.不允许修改的内容: bm25 检索以及 eval相关逻辑,此外其他的 agent_loop.py agent.py env.py run_serial.py 允许大面积重构甚至删除
 
-## Prompt 设计原则
+2.重构后的代码架构如下:
+1.agent.py 
+- 只负责 agent 类的定义，接受 system prompt,user prompt, tool list,max_turn等参数,注意所有 agent 都需要共享这个 agent 结构包括 eval ,subagent 等,不同 agent 的功能可以根据上下文和工具来完全决定，不要分开多个类来写，然后用一个 yaml 来控制不同 agent 的配置
+- 需要定义chat和 chat_with_tool_retry 函数，chat 直接接受 user prompt 回答(请求的时候带上 agent 实例化时的 system prompt和 tool),chat with retry 调用 chat 函数但是在外层封装重试机制，注意重试机制需要在格式错误/没有调用 tool时使用提醒 prompt 引导模型重试，重试成功后重试部分的上下文应该移除避免上下文污染
+- 需要定义 run,即 agent 的循环逻辑不再由外部决定而是由类内部自己处理,run 终止条件有两个: 
+1.达到 max turn 
+2.agent 调用了 self.end_tool (end_tool是 agent 初始化时从 init 传入的某个工具,agent 通过 end_tool 提交最终回答)
+run 内部调用一个 condense 方法对上下文进行压缩,该 condense 不需要作为一个独立的 agent,但是需要预先给每个 agent 配置好 condense prompt, 然后通过 chat_with_tool_retry 直接调用 condense ,condense 请求提供的 tool 为 submit_condense,condense 之前 需要对agent 的 thinking block 和工具调用格式进行预处理避免 condense 模型被这些特殊格式影响
+- 需要定义轨迹收集逻辑,每个 agent 实例独立收集自己 run 的轨迹,注意处理路径名称避免覆盖，轨迹的格式需要和当前代码保持一致
 
-### 1. 工具调用强制规则
-所有要求 agent 通过 tool 来回答的 prompt，**必须**：
-- 明确声明 tool call 是**唯一**的响应方式（"You MUST call X tool"、"plain text is ignored"）
-- 提供**重试机制**：tool 调用失败时 inject nudge message 后重试（最多 2 次）
-- 重试 nudge 要**具体**指出缺少什么参数（"Missing field: key_thoughts"），不要泛泛说 "try again"
-- 重试机制必须有 prompt 提示，重试后必须清理重试部分上下文
+2.tool_docs.py 专门放置 tool 文档
+3.tool_func.py 专门放置 tool 函数
 
-### 2. 绝对禁止数据泄露
-prompt 中**绝对不能**出现：
-- BrowseComp 数据集相关实体名、线索词、答案片段
-- 任何可能出现在真实问题中的领域词汇（如 author/book/publisher/company/married/botanist/settlements 等）
-- 示例必须使用**完全虚构**的场景（如 wizard/Elf King/Dragon Taming Cup/recipe/ingredient）
+4.整个系统有一个 main agent 作为入口 ，从该 agent的 run 函数开始,随后通过 agent 调用 tool 作为驱动,tool 里面可能包含调用别的 agent 的逻辑 , 然后 别的 agnet 将处理结果通过 tool 返回，即 agent间的通信完全通过 tool 实现
 
-### 3. 禁止内部标记泄露
-以下标记**绝对不能**出现在 model-facing prompt 中：
-- `<think>`, `</think>` — 模型的内部思考格式
-- `[reasoning]`, `[/reasoning]` — 压缩时的内部替换标记
-- `[PROGRESS SUMMARY]` — 旧的压缩格式标记
+5.需要支持的 agent 类型和 tool 工具
+**所有 agent 都需要通过 chat_with_tool_retry 来确保工具调用正常
+- main agent 提供 search/submit answer/call_searchs_agent  执行的 workflow 为 main agent 先根据问题调用 search ,search 会返回一些候选样本，然后 main agent 根据 问题约束调用 sub agent 去验证候选集合不断缩小范围找到目标,end_tool 为 submit answer
 
-### 4. Condense prompt 规范
-- 让 condense 模型使用 tool（`submit_condensed_summary`）输出
-- condense 模型**不禁用 thinking**（让它思考才能压缩得好）
-- 用 `tool_summary` 参数让模型自己总结工具调用，不做机械截断
-- condense 输出要**从模型视角**提供有用信息（facts found, insights gained），不只是"做了什么"
-- 提供重试：参数缺失时 nudge，最多 2 次
+- search 工具参考当前实现,提供参数控制是否使用 subagent 总结(这个参数放到 yaml agent 配置那里,作为 tool 的控制参数)，但是注意该 subagent 也应该通过 agent.py 里的类实例化,改 subagent 无需任何工具，但是需要通过 submit_summary 工具返回 submit_summary是该 agent 的 end_tool,
 
-### 5. 主 Agent 搜索 prompt 规范
-- few-shot example 展示完整搜索链（用虚构场景）
-- 第一搜必须选最稀有/独特的词，不要泛泛描述
-- 2-3 词 per query，不超过 5 词
-- 链式推进：entity from result + next clue
-- 结尾规则（近因效应）
+- call_subagent 参数为一个问题列表由 main agent 提问 [question1,question2,question3,...],所有 search agent async 异步执行，去掉所有并发数限制 后期改为从整个端口层面设置转发限制并发即可
 
-### 6. Verify Agent prompt 规范
-- suggestions 不给具体搜索词（避免数据泄露）
-- 引导方向：证据不足→查某方面，约束不符→换角度
-- Stage 1 用 PASS/SURRENDER 分类，不是 ANSWER
-- keywords: "not found", "not mentioned", "not available", "no evidence" 等是 SURRENDER
+- call_agent  发起的 search agent 提供 search,get_document工具, 以及 submit_answer工具,search agent 的 work flow 和 prompt 参考当前的 main agent,但是一些关于没有答案的强调可能需要去掉因为 main agent 问的问题可能是没有答案的
 
-### 7. Sub-Agent prompt 规范
-- 读文档提取相关信息，用 `submit_information` 提交
-- 提供重试
+- verify agent 提供 search get_document工具
 
-## 轨迹分析流程
-
-每次测试后必须按以下流程分析：
-
-1. **根据答案推导标准搜索轨迹**：用 gold answer 反推需要搜索的关键词和文档，用 `BrowseCompBM25Searcher` 手动验证能否检索到目标文档
-2. **对比模型实际轨迹**：提取模型每一步的 search/get_document/submit_answer，与标准轨迹对比
-3. **定位偏差点**：找出模型从哪一步开始偏离标准轨迹，分析原因（query 太长/太泛/没链式推进/子 agent 信息丢失等）
-4.**分析模型的 thinking block**,这是体现模型为什么出现某些意料之外行为的**最好方法**，通过 thinking block 可以分析 prompt 的改进方向
-5. **针对性修改 prompt**：只改偏差点对应的 prompt 部分，不要大改
-6. **多样性测试**：每次修改后用**不同样本**测试，不要重复同一条
-7. 检查子 agent 提取质量：对比文档原文和子 agent 输出，看是否遗漏关键信息
-
-## 代码修改后必须检查
-
-1. `python -c "import py_compile; py_compile.compile(...)"` 编译检查
-2. 运行至少 1 个 query 测试
-3. 检查轨迹文件 `trajectories/<qid>.json` 格式正确、无重复消息
-
-## 日志规范
-
-- **任何工具执行异常必须打印详细错误信息**（包括 traceback），不能 silent fail
-- 子 agent 的输入（prompt + document）和输出（提取结果）必须打印，方便对比真正需要的信息
-- condense 前后的 token 数、消息数必须打印
-- 不要依赖反复跑代码来看 bug，日志要详尽到能直接定位问题
-
-## 要求模型输出规定格式规则
-1.必须要用 YOU MUST OUTPUT FOLLOWING THIS FORMAT (BEFORE YOU CALL TOOLS 这段如果同时有工具调用的时候加上):
-2.必须有规则提取+格式约束+重试
-3.重试机制必须有 prompt 提示，重试后必须清理重试部分上下文
+**整体要求** 
+- 终端打印日志必须详细，格式参考当前的代码,层次分明，信息具体，要求能从终端日志完全了解当前的进展
+- 所有 agent 的 system prompt 以下内容结尾,**IMPORTANT** using xxx tool is the **ONLY** way to submit your answer
+- 所有 agent 上下文长度，输出长度,压缩 token 线在 yaml 里配置,是否 thinking 也在 yaml 里配置,取消原来代码的 think 重试,只保留工具重试,所有上下文长度统计量必须为 token 而不是 char 
+- prompt 绝对禁止数据泄露, prompt 需要详细写出 agent 的 workflow,特殊 token 对应的符号绝对不能出现在 prompt 里面，比如think block
+- 多余代码直接删除
+- 需要 async 异步执行
+- 每个 agent 用一个独立的 yaml 文件配置 初始化需要的所有参数
