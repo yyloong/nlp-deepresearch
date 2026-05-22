@@ -214,8 +214,11 @@ async def _main_async(args: argparse.Namespace) -> None:
     use_subagent = (
         main_cfg.get("tool_config", {}).get("search", {}).get("use_subagent_summary", False)
     )
+    # Judge agent's search uses subagent_summary — enable it globally (main uses smart_search, unaffected)
+    _judge_use_subagent = bool(_load_yaml_config("configs/relevance_judge_agent.yaml")
+                               .get("tool_config", {}).get("search", {}).get("use_subagent_summary", False))
     sub_summary_agent = None
-    if use_subagent:
+    if use_subagent or _judge_use_subagent:
         sub_summary_agent = agent_factory("configs/sub_summary_agent.yaml")
         sub_summary_agent.tool_registry = tool_registry.build_registry("sub_summary")
         tool_registry.set_sub_summary_agent(sub_summary_agent)
@@ -250,7 +253,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     tool_registry.configure_search(
         search_k=_yaml_search_k,
         snippet_max_chars=args.snippet_max_chars,
-        use_subagent_summary=use_subagent,
+        use_subagent_summary=_judge_use_subagent or use_subagent,
     )
 
     # ── Create main agent ──

@@ -191,11 +191,30 @@ class ToolRegistry:
                 if self._main_agent is not None and self._main_agent.trajectory_dir:
                     judge.trajectory_dir = self._main_agent.trajectory_dir
                     judge.name = f"judge_{doc['docid']}"
+                # Token-based truncation: extract text around the best-matching region
+                _tok = self._main_agent.tokenizer if self._main_agent else None
+                _full_text = doc['text']
+                # Find where query terms appear in the document, extract surrounding context
+                _query_terms = query.lower().split()
+                _best_pos = 0
+                for term in _query_terms:
+                    pos = _full_text.lower().find(term)
+                    if pos >= 0:
+                        _best_pos = pos
+                        break
+                # Extract ~10000 tokens around the first match, with bias toward text after the match
+                _context_start = max(0, _best_pos - 1000)
+                _context_text = _full_text[_context_start:]
+                if _tok is not None:
+                    _doc_text = truncate_utf8_prefix_to_token_budget(_tok, _context_text, 10000)
+                else:
+                    _doc_text = _context_text[:12000]
                 prompt = (
-                    f"Question: {question}\n\n"
-                    f"Search Query Used: {query}\n\n"
-                    f"Document (docid={doc['docid']}):\n{doc['text'][:8000]}\n\n"
-                    f"Judge whether this document is HELPFUL, IRRELEVANT, or CONFUSING for answering the question."
+                    f"Main agent is researching:\n{question}\n\n"
+                    f"It searched for: '{query}'. This document was returned:\n"
+                    f"Document (docid={doc['docid']}):\n{_doc_text}\n\n"
+                    f"Does this document match '{query}'? "
+                    f"You are not required to answer immediately.Try to use tool to search for more information!"
                 )
                 traj = await judge.run(prompt)
                 # Extract judge_relevance result
@@ -208,19 +227,23 @@ class ToolRegistry:
                                     relevance = args.get("relevance", "IRRELEVANT")
                                     summary = args.get("summary", "")
                                     print(f"    [smart_search] docid={doc['docid']}: {relevance}", flush=True)
-                                    if relevance == "HELPFUL":
-                                        return {
-                                            "docid": doc["docid"],
-                                            "snippet": snippetize(doc["text"], self._snippet_max_chars),
-                                            "summary": summary,
-                                            "url": doc.get("url", ""),
-                                        }
-                                    else:
-                                        return None  # drop IRRELEVANT / CONFUSING
+                                    if relevance == "CONFUSING":
+                                        print(f"    [smart_search] docid={doc['docid']}: BLOCKED (confusing look-alike)", flush=True)
+                                        return None  # ONLY block CONFUSING
+                                    # HELPFUL or IRRELEVANT both pass through
+                                    return {
+                                        "docid": doc["docid"],
+                                        "summary": summary if summary else "(passed through)",
+                                        "url": doc.get("url", ""),
+                                    }
                                 except (json.JSONDecodeError, TypeError):
                                     pass
-                print(f"    [smart_search] docid={doc['docid']}: no valid judgment, dropping", flush=True)
-                return None
+                print(f"    [smart_search] docid={doc['docid']}: no valid judgment, defaulting to HELPFUL", flush=True)
+                return {
+                    "docid": doc["docid"],
+                    "summary": "(judge failed, passed through)",
+                    "url": doc.get("url", ""),
+                }
             except Exception as e:
                 print(f"    [smart_search] docid={doc['docid']}: ERROR {e}", flush=True)
                 return None

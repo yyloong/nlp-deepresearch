@@ -286,6 +286,23 @@ class Agent:
                     for line in args_preview.split("\n")[:10]:
                         print(f"    │     {line}", flush=True)
 
+            # ── Check: completion truncated (hit max_tokens) ──
+            comp_tokens = int(usage.get("completion_tokens", 0))
+            content_str = resp.get("content", "") or ""
+            think_open = content_str.count("<think>")
+            think_close = content_str.count("</think>")
+            truncated_think = think_open > think_close and comp_tokens >= self.max_tokens * 0.9
+
+            if truncated_think and tc and attempt < self.max_tool_retries:
+                print(f"    ⚠ completion truncated ({comp_tokens}/{self.max_tokens} tokens), unclosed think, retrying", flush=True)
+                internal_msgs.append(resp)
+                nudge = {
+                    "role": "user",
+                    "content": "Your response was cut off. Based on what you have so far, call your tools now. Be concise."
+                }
+                internal_msgs.append(nudge)
+                continue
+
             # ── Check: no tool calls ──
             if not tc:
                 if attempt < self.max_tool_retries:

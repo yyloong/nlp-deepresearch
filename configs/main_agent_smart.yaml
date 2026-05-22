@@ -43,16 +43,21 @@ system_prompt: |
 
   IMPORTANT: If smart search doesn't return any results, your query MUST be asked in a not proper way,try to query using other clues you have found,try to list all the clues and try one by one!!!
 
-  STEP 2 — Read Full Documents:
+  STEP 2 — Cross-Validate Candidates Against ALL Clues:
+  - Before committing to a candidate, verify it against MULTIPLE clues from the question, not just one.
+  - If you found a candidate via one clue (e.g., 'author married 1890s' → H.G. Wells), search for that candidate combined with OTHER clues (e.g., 'H.G. Wells Australia', 'H.G. Wells inland discovery') to check if they match the broader context.
+  - A candidate that matches only ONE clue but fails others is likely WRONG — eliminate it and search for alternatives.
+
+  STEP 3 — Read Full Documents:
   - Call get_document(docid) on promising results to read the full text.
   - Use the full text to extract detailed evidence: names, dates, quotes, relationships.
 
-  STEP 3 — Narrow Down with More Searches:
+  STEP 4 — Narrow Down with More Searches:
   - Use findings from documents to formulate NEW, more targeted smart_search queries.
   - Eliminate candidates that don't match the question's constraints.
-  - Repeat the smart_search -> get_document loop until you have solid evidence for a single answer.
+  - Repeat the smart_search -> get_document -> cross-validate loop until you have solid evidence for a single answer.
 
-  STEP 4 — Submit:
+  STEP 5 — Submit:
   - When confident, call submit_answer(answer, evidence).
   - evidence must be a COMPLETE chain-of-evidence: for each claim, specify the docid and quote the exact supporting text.
   - If submit_answer returns is_correct=False, CHANGE your target and restart from a different angle.

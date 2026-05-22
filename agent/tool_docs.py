@@ -167,7 +167,7 @@ def judge_relevance_tool_spec() -> Dict[str, Any]:
                     "relevance": {
                         "type": "string",
                         "enum": ["HELPFUL", "IRRELEVANT", "CONFUSING"],
-                        "description": "HELPFUL: has facts that help answer. IRRELEVANT: unrelated. CONFUSING: similar but different entity — could mislead.",
+                        "description": "HELPFUL: genuinely about the query. IRRELEVANT: no connection. CONFUSING: look-alike, shares words but wrong domain.",
                     },
                     "summary": {
                         "type": "string",
@@ -246,11 +246,10 @@ def smart_search_tool_spec(search_k: int = 5) -> Dict[str, Any]:
         "function": {
             "name": "smart_search",
             "description": (
-                f"Search the BM25 index (top-{search_k} results) with automatic relevance filtering. "
-                "Each result is evaluated by a judge agent — only genuinely helpful documents are returned. "
-                "Irrelevant and confusing documents are automatically dropped. "
-                "Returns a dict with 'results' (list of helpful docs, may be empty) and 'hint' "
-                "(only set when ALL results were filtered out — use it to guide your next query). "
+                f"Search the BM25 index (top-{search_k} results) with automatic CONFUSING-document filtering. "
+                "Each result is checked — only look-alike documents from wrong domains are blocked. "
+                "Returns 'results' (list of {docid, summary, url}) and 'hint' "
+                "(only when ALL results were blocked — use it to try a different query). "
                 "Query MUST be 2-3 specific words."
             ),
             "parameters": {
