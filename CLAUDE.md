@@ -1,4 +1,4 @@
-1.不允许修改的内容: bm25 检索以及 eval相关逻辑,此外其他的 agent_loop.py agent.py env.py run_serial.py 允许大面积重构甚至删除
+1.不允许修改的内容: CLAUDE.md,bm25 检索以及 eval相关逻辑,此外其他的 agent_loop.py agent.py env.py run_serial.py 允许大面积重构甚至删除
 
 2.重构后的代码架构如下:
 1.agent.py 

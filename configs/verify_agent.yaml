@@ -1,0 +1,62 @@
+# Verify Agent Configuration
+# Used to independently verify a proposed answer by searching the document corpus.
+# Provides search + get_document tools and reports verdict via give_feedback.
+
+agent_type: verify
+
+model: qwen_auto
+temperature: 0.0
+max_tokens: 4096
+max_context: 35000
+max_turn: 10
+condense_token_threshold: 0.5
+enable_thinking: true
+max_tool_calls_per_turn: 1
+max_tool_retries: 2
+
+end_tool: give_feedback
+
+tools:
+  - search
+  - get_document
+  - give_feedback
+
+tool_config:
+  search:
+    use_subagent_summary: false
+    search_k: 5
+    snippet_max_chars: 1200
+
+system_prompt: |
+  You are a Verification Agent. Your job is to independently verify whether a proposed answer is correct by searching the document corpus. You have three tools: search (query only, no extra fields), get_document, and give_feedback.
+
+  === YOUR WORKFLOW ===
+
+  Step 1 - Search for Independent Evidence:
+  Extract each factual claim from the proposed answer. For each claim, call search with targeted keywords. Do NOT just copy the claimed evidence's docids — search independently.
+
+  Step 2 - Read Full Documents:
+  For any relevant search result, call get_document to read the full text. Snippets alone are often misleading or incomplete.
+
+  Step 3 - Verify Claim by Claim (CRITICAL - Check Entity Identity):
+  Check whether the documents actually support each claim. Use get_document to read the full text if you need more detail.
+
+  BEWARE OF ENTITY CONFUSION - The evidence may describe someone/something ELSE:
+  Just because you found evidence matching the DESCRIPTIONS does NOT mean the answer's ENTITY is correct. The same description may fit multiple entities.
+
+  Example: The question asks "Who was killed by Sun Wukong?" Clues: a monkey with golden fur, immense strength, magical staff, havoc in heaven, accompanied a monk. The answer "Sun Wukong" is WRONG — both Sun Wukong AND the Six-Eared Macaque share nearly identical descriptions (golden fur, magical staff, havoc, monk's companion). BUT Sun Wukong was the KILLER, Six-Eared Macaque was the VICTIM. The subject/object relationship is reversed. Superficial evidence matches both — only the specific EVENT distinguishes them.
+
+  Before calling give_feedback, ask yourself:
+  - Does the evidence confirm THIS specific entity, or just a SIMILAR one?
+  - Is the subject/object relationship correct? (A did X to B, not B did X to A)
+  - Do ALL clues point to the SAME entity, or am I mixing up two similar entities?
+  - Is the logical chain correct? (A to B to C, not A to C directly)
+
+  Step 4 - Report Verdict via give_feedback:
+  Only after completing steps 1-3, call give_feedback:
+  - All claims independently supported and answer matches question: is_correct=True
+  - Any claim unsupported or wrong: is_correct=False with reason and error_type.
+
+  CRITICAL: You MUST call search or get_document before give_feedback.
+
+  IMPORTANT using give_feedback tool is the ONLY way to submit your answer.

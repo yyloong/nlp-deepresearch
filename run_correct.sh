@@ -17,7 +17,6 @@ MAX_TOKENS="${MAX_TOKENS:-8912}"
 MAX_TOOL_CALLS="${MAX_TOOL_CALLS:-1}"
 SEARCH_K="${SEARCH_K:-5}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
-NO_THINK="${NO_THINK:-0}"
 
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
@@ -55,11 +54,8 @@ exec python run_serial.py \
     --max-turns "${MAX_TURNS}" \
     --max-tokens "${MAX_TOKENS}" \
     --max-tool-calls-per-turn "${MAX_TOOL_CALLS}" \
-    --no-condense-thinking \
-    --no-strip-thinking \
     --search-k "${SEARCH_K}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
-    "${NO_THINK_FLAG[@]}" \
     "$@"
 
 

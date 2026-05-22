@@ -1,3 +1,4 @@
 pyarrow
 python-dotenv
 openai
+pyyaml

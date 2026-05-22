@@ -2,26 +2,17 @@
 """
 Serial (single-instance) agent evaluation — processes questions one at a time.
 
-Eliminates any variability from parallel batching / async interleaving by
-using n_envs=1 and executing all model calls sequentially.
-
-Defaults are aligned with run_agent.sh (env vars supported):
-    DATASET, INDEX_PATH, MODEL, BASE_URL, OUTPUT_DIR, MAX_TURNS,
-    MAX_TOKENS, MAX_TOOL_CALLS, SEARCH_K, EVAL_BATCH_SIZE, NO_THINK
+Uses the new refactored architecture:
+  - agent.py:      Unified Agent class (all agent types)
+  - tool_docs.py:  Tool specifications
+  - tool_func.py:  Tool implementations (ToolRegistry)
+  - configs/*.yaml: Per-agent-type configuration
 
 Usage:
-    # 完整运行 + 评估（使用环境变量默认值）
     DATASET=browsecomp_plus_hard50.jsonl \\
     INDEX_PATH=indexes/browsecomp_plus_bm25.sqlite \\
     python run_serial.py
 
-    # 命令行覆盖
-    python run_serial.py \\
-        --dataset data/browsecomp_plus_hard50.jsonl \\
-        --index-path indexes/browsecomp_plus_bm25.sqlite \\
-        --model qwen_auto --limit 10
-
-    # 跳过评估
     python run_serial.py --no-eval --limit 10
 """
 
@@ -35,11 +26,38 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+import yaml
+
+# Ensure agent/ is importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from agent.agent import Agent
+from agent.browsecomp_searcher import BrowseCompBM25Searcher, build_searcher  # noqa: E402
+from agent.dataset_utils import load_jsonl  # noqa: E402
 from agent.eval_async import evaluate_trajectories  # noqa: E402
+from agent.tool_docs import (  # noqa: E402
+    build_condense_tool_specs,
+    build_main_agent_tool_specs,
+    build_search_agent_tool_specs,
+    build_sub_summary_tool_specs,
+    build_verify_agent_tool_specs,
+)
+from agent.tool_func import ToolRegistry  # noqa: E402
+from agent.utils import extract_final_answer  # noqa: E402
+from agent.vllm_client_async import VLLMClientAsync  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+# Tokenizer
+_TOKENIZER_PATH = "Qwen/Qwen3-8B"
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+from transformers import AutoTokenizer  # noqa: E402
+
+_tok: Any = AutoTokenizer.from_pretrained(
+    _TOKENIZER_PATH, trust_remote_code=True, local_files_only=True,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -47,7 +65,6 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Serial agent evaluation — one question at a time",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    # ── 与 run_agent.sh 对齐的参数（支持环境变量覆盖）──
     p.add_argument("--dataset", default=os.environ.get("DATASET", ""),
                    help="Dataset jsonl path (env: DATASET)")
     p.add_argument("--index-path", default=os.environ.get("INDEX_PATH", ""),
@@ -71,23 +88,34 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Comma-separated list of query IDs to run (e.g. '442,26,471')")
     p.add_argument("--no-eval", action="store_true", help="Skip evaluation")
     p.add_argument("--eval-only", type=str, default=None,
-                   help="Only run eval on an existing submission.jsonl (provide path to submission)")
-    p.add_argument("--no-verify", action="store_true", help="Disable verify agent (submit_answer returns mock success)")
-    # ── Serial-only 或额外参数 ──
+                   help="Only run eval on an existing submission.jsonl")
+    p.add_argument("--no-verify", action="store_true", help="Disable verify agent")
     p.add_argument("--max-context", type=int, default=40960,
                    help="Max context window for auto-condensation")
     p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--think-trunc-no-think", action="store_true", default=False,
-                   help="When think-block is truncated, first retry with thinking disabled "
-                        "before falling back to RETRY_NUDGE")
+    p.add_argument("--tokenizer-path", default="Qwen/Qwen3-8B")
     return p
+
+
+def _load_yaml_config(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def build_searcher(index_path: str) -> BrowseCompBM25Searcher:
+    return BrowseCompBM25Searcher(index_path=index_path)
 
 
 async def _main_async(args: argparse.Namespace) -> None:
     from agent.dataset_utils import load_jsonl
-    from agent.agent_loop import generate_trajectories
 
-    # ── Eval-only mode: load existing submission.jsonl and evaluate ──
+    # ── Tokenizer ──
+    global _TOKENIZER_PATH, _tok
+    if args.tokenizer_path != _TOKENIZER_PATH:
+        _TOKENIZER_PATH = args.tokenizer_path
+        _tok = AutoTokenizer.from_pretrained(_TOKENIZER_PATH, trust_remote_code=True, local_files_only=True)
+
+    # ── Eval-only mode ──
     if args.eval_only:
         records = load_jsonl(args.eval_only)
         print(f"Loaded {len(records)} records from {args.eval_only}", flush=True)
@@ -96,14 +124,9 @@ async def _main_async(args: argparse.Namespace) -> None:
         eval_model = args.eval_model or args.model
         eval_path = str(Path(args.eval_only).parent / "eval.jsonl")
         summary, details = await evaluate_trajectories(
-            records=records,
-            dataset_path=args.dataset,
-            model=eval_model,
-            base_url=args.base_url,
-            api_key=args.api_key,
-            eval_batch_size=args.eval_batch_size,
-            temperature=0.0,
-            max_tokens=8192,
+            records=records, dataset_path=args.dataset, model=eval_model,
+            base_url=args.base_url, api_key=args.api_key,
+            eval_batch_size=args.eval_batch_size, temperature=0.0, max_tokens=8192,
             output_path=eval_path,
         )
         print(f"\nAccuracy: {summary['accuracy']:.2%} ({summary['correct']}/{summary['total_queries']})")
@@ -113,11 +136,11 @@ async def _main_async(args: argparse.Namespace) -> None:
 
     # Validate required args
     if not args.dataset:
-        sys.exit("ERROR: --dataset is required (set DATASET env var or pass --dataset)")
+        sys.exit("ERROR: --dataset is required")
     if not args.index_path:
-        sys.exit("ERROR: --index-path is required (set INDEX_PATH env var or pass --index-path)")
+        sys.exit("ERROR: --index-path is required")
 
-    print(f"=== Serial Agent (n_envs=1) ===")
+    print(f"=== Serial Agent (refactored) ===")
     print(f"Dataset:    {args.dataset}")
     print(f"Index:      {args.index_path}")
     print(f"Model:      {args.model}")
@@ -125,51 +148,212 @@ async def _main_async(args: argparse.Namespace) -> None:
     print(f"max_tokens: {args.max_tokens}")
     print(f"verify:     {not args.no_verify}")
     print(f"Output:     {args.output_dir}/")
-    print(f"===============================")
+    print(f"================================")
     print()
 
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    output_dir = str(Path(args.output_dir) / f"run_{ts}")
-    submission_path = str(Path(output_dir) / "submission.jsonl")
-
-    query_ids = None
+    # ── Load dataset ──
+    rows = load_jsonl(args.dataset, limit=args.limit)
     if args.query_ids:
-        query_ids = args.query_ids.replace(" ", "").split(",")
+        ids = set(args.query_ids.replace(" ", "").split(","))
+        rows = [r for r in rows if r.get("query_id", "") in ids]
+        print(f"Filtered to {len(rows)} queries by query_ids: {sorted(ids)}", flush=True)
+    total = len(rows)
 
-    records = await generate_trajectories(
-        dataset_path=args.dataset,
-        index_path=args.index_path,
-        model=args.model,
-        base_url=args.base_url,
-        api_key=args.api_key,
-        output_path=submission_path,
-        n_envs=1,
-        max_turns=args.max_turns,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-        max_context=args.max_context,
+    # ── Create shared client ──
+    client = VLLMClientAsync(base_url=args.base_url, api_key=args.api_key, max_concurrent=10)
+
+    # ── Create searcher ──
+    searcher = build_searcher(args.index_path)
+
+    # ── Override YAML config with CLI args ──
+    def _load_and_patch(config_path: str) -> str:
+        """Load YAML, patch with CLI args, write to temp, return path."""
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        cfg["model"] = args.model
+        cfg["max_tokens"] = args.max_tokens
+        cfg["max_turn"] = args.max_turns
+        cfg["max_context"] = args.max_context
+        cfg["temperature"] = args.temperature
+        cfg["max_tool_calls_per_turn"] = args.max_tool_calls_per_turn
+        if "tool_config" not in cfg:
+            cfg["tool_config"] = {}
+        if "search" not in cfg["tool_config"]:
+            cfg["tool_config"]["search"] = {}
+        cfg["tool_config"]["search"]["search_k"] = args.search_k
+        cfg["tool_config"]["search"]["snippet_max_chars"] = args.snippet_max_chars
+        # Write patched config
+        patched_path = f"/tmp/patched_{os.path.basename(config_path)}"
+        with open(patched_path, "w", encoding="utf-8") as f:
+            yaml.dump(cfg, f)
+        return patched_path
+
+    # ── Agent factory for call_subagents ──
+    def agent_factory(config_path: str) -> Agent:
+        patched = _load_and_patch(config_path)
+        return Agent(patched, client=client, tokenizer=_tok)
+
+    # ── Create ToolRegistry ──
+    tool_registry = ToolRegistry(searcher=searcher, agent_factory=agent_factory)
+
+    # ── Create sub_summary agent (if search uses subagent) ──
+    main_cfg = _load_yaml_config("configs/main_agent.yaml")
+    use_subagent = (
+        main_cfg.get("tool_config", {}).get("search", {}).get("use_subagent_summary", False)
+    )
+    sub_summary_agent = None
+    if use_subagent:
+        sub_summary_patched = _load_and_patch("configs/sub_summary_agent.yaml")
+        sub_summary_agent = Agent(sub_summary_patched, client=client, tokenizer=_tok)
+        sub_summary_agent.tool_registry = tool_registry.build_registry("sub_summary")
+        tool_registry.set_sub_summary_agent(sub_summary_agent)
+
+    # ── Create verify agent ──
+    verify_agent = None
+    if not args.no_verify:
+        verify_patched = _load_and_patch("configs/verify_agent.yaml")
+        verify_agent = Agent(verify_patched, client=client, tokenizer=_tok)
+        verify_agent.tool_registry = tool_registry.build_registry("verify")
+        tool_registry.set_verify_agent(verify_agent)
+
+    # ── Create surrender check agent ──
+    surrender_check_patched = _load_and_patch("configs/surrender_check_agent.yaml")
+    surrender_check_agent = Agent(surrender_check_patched, client=client, tokenizer=_tok)
+    surrender_check_agent.tool_registry = tool_registry.build_registry("surrender_check")
+    tool_registry.set_surrender_check_agent(surrender_check_agent)
+
+    # ── Configure search ──
+    tool_registry.configure_search(
         search_k=args.search_k,
         snippet_max_chars=args.snippet_max_chars,
-        limit=args.limit,
-        query_ids=query_ids,
-        max_tool_calls_per_turn=args.max_tool_calls_per_turn,
-        think_trunc_no_think=args.think_trunc_no_think,
+        use_subagent_summary=use_subagent,
     )
 
+    # ── Create main agent ──
+    main_patched = _load_and_patch("configs/main_agent.yaml")
+    main_agent = Agent(main_patched, client=client, tokenizer=_tok)
+    main_agent.tool_registry = tool_registry.build_registry("main")
+    tool_registry.set_main_agent(main_agent)
+
+    # ── Output setup ──
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    output_dir = str(Path(args.output_dir) / f"run_{ts}")
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    submission_path = str(Path(output_dir) / "submission.jsonl")
+    traj_dir = str(Path(output_dir) / "trajectories")
+    Path(traj_dir).mkdir(parents=True, exist_ok=True)
+
+    # ── Process each question ──
+    records: List[Dict[str, Any]] = []
+    try:
+        for i, row in enumerate(rows):
+            qid = row["query_id"]
+            question = row["query"]
+            gold_answer = row.get("answer", "") or row.get("gold_answer", "") or ""
+
+            t0 = time.time()
+            q_preview = question[:200].replace("\n", " ")
+            if len(question) > 200:
+                q_preview += "..."
+            print(f"┌{'─'*78}┐\n│ [{i+1}/{total}]  qid={qid}\n├{'─'*78}┤\n│ Question: {q_preview}")
+            if gold_answer:
+                gold_preview = gold_answer[:150].replace("\n", " ")
+                if len(gold_answer) > 150:
+                    gold_preview += "..."
+                print(f"│ Gold Ans: {gold_preview}")
+            print(f"└{'─'*78}┘\n  Running...", flush=True)
+
+            # Run main agent
+            traj = await main_agent.run(question)
+            answer = extract_final_answer(traj) or ""
+
+            # Determine finish reason
+            finish_reason = "max_turns"
+            for msg in reversed(traj):
+                if msg.get("role") == "assistant":
+                    tc = msg.get("tool_calls")
+                    if tc:
+                        tc_names = [t["function"]["name"] for t in tc]
+                        if "submit_answer" in tc_names:
+                            finish_reason = "submit_answer_confirmed"
+                    break
+
+            elapsed = time.time() - t0
+            rec = {
+                "query_id": qid,
+                "status": finish_reason,
+                "predicted_answer": answer,
+                "messages": traj,
+            }
+            records.append(rec)
+
+            # Save trajectory
+            with Path(traj_dir, f"{qid}.json").open("w", encoding="utf-8") as f:
+                json.dump(rec, f, ensure_ascii=False, indent=2)
+
+            # Save condense sessions
+            if main_agent.get_condense_sessions():
+                with Path(traj_dir, f"{qid}_condense.json").open("w", encoding="utf-8") as f:
+                    json.dump(
+                        {"query_id": qid, "sessions": main_agent.get_condense_sessions()},
+                        f, ensure_ascii=False, indent=2,
+                    )
+
+            # Save verify trajectories
+            if verify_agent is not None:
+                verify_traj = verify_agent.get_trajectory()
+                if verify_traj:
+                    with Path(traj_dir, f"{qid}_verify.json").open("w", encoding="utf-8") as f:
+                        json.dump(
+                            {"query_id": qid, "messages": verify_traj},
+                            f, ensure_ascii=False, indent=2,
+                        )
+                verify_condense = verify_agent.get_condense_sessions()
+                if verify_condense:
+                    with Path(traj_dir, f"{qid}_verify_condense.json").open("w", encoding="utf-8") as f:
+                        json.dump(
+                            {"query_id": qid, "sessions": verify_condense},
+                            f, ensure_ascii=False, indent=2,
+                        )
+
+            # Reset agent state for next question
+            main_agent.reset_state()
+            if verify_agent is not None:
+                verify_agent.reset_state()
+
+            ans_preview = answer[:200].replace("\n", " ")
+            if len(answer) > 200:
+                ans_preview += "..."
+            print(
+                f"  ┌{'─'*76}┐\n"
+                f"  | ✓ [{i+1}/{total}] qid={qid}  finished in {elapsed:.1f}s\n"
+                f"  ├{'─'*76}┤\n"
+                f"  | status:     {finish_reason}\n"
+                f"  └{'─'*76}┘\n",
+                flush=True,
+            )
+
+        print(f"[generate] {len(records)}/{total} queries done", flush=True)
+    finally:
+        searcher.connection.close()
+        await client._client.close()
+
+    # ── Save submission ──
+    with open(submission_path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"[generate] saved {len(records)} trajectories -> {submission_path}", flush=True)
+
+    # ── Eval ──
     if args.no_eval:
         return
 
     eval_model = args.eval_model or args.model
     eval_path = str(Path(output_dir) / "eval.jsonl")
     summary, details = await evaluate_trajectories(
-        records=records,
-        dataset_path=args.dataset,
-        model=eval_model,
-        base_url=args.base_url,
-        api_key=args.api_key,
-        eval_batch_size=args.eval_batch_size,
-        temperature=0.0,
-        max_tokens=8192,
+        records=records, dataset_path=args.dataset, model=eval_model,
+        base_url=args.base_url, api_key=args.api_key,
+        eval_batch_size=args.eval_batch_size, temperature=0.0, max_tokens=8192,
         output_path=eval_path,
     )
 
@@ -190,13 +374,12 @@ async def _main_async(args: argparse.Namespace) -> None:
 
     _write_jsonl(Path(output_dir) / "correct.json", correct_recs)
     _write_jsonl(Path(output_dir) / "incorrect.json", incorrect_recs)
-
     eval_correct = [d for d in details if d["eval_judgment"] == "CORRECT"]
     eval_incorrect = [d for d in details if d["eval_judgment"] == "INCORRECT"]
     _write_jsonl(Path(output_dir) / "eval_correct.json", eval_correct)
     _write_jsonl(Path(output_dir) / "eval_incorrect.json", eval_incorrect)
 
-    print(f"\nSaved: {len(correct_recs)} correct, {len(incorrect_recs)} incorrect → {output_dir}")
+    print(f"\nSaved: {len(correct_recs)} correct, {len(incorrect_recs)} incorrect -> {output_dir}")
 
 
 def main() -> None:

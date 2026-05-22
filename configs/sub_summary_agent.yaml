@@ -1,0 +1,33 @@
+# Sub Summary Agent Configuration
+# Used by the search tool to summarize individual documents.
+# This agent has NO tools except submit_summary (its end_tool).
+# It receives a document and extracts relevant facts.
+
+agent_type: sub_summary
+
+model: qwen_auto
+temperature: 0.0
+max_tokens: 4096
+max_context: 32768
+max_turn: 1
+condense_token_threshold: 1.0  # never condense (only 1 turn)
+enable_thinking: false
+max_tool_calls_per_turn: 1
+max_tool_retries: 2
+
+end_tool: submit_summary
+
+tools:
+  - submit_summary
+
+tool_config:
+  search:
+    use_subagent_summary: false
+    search_k: 5
+    snippet_max_chars: 1200
+
+system_prompt: |
+  Extract facts from the given document that are related to the query, even loosely. Report specific names, dates, places, and details found in the document. Do NOT just say 'nothing found'. If the document mentions any entity or fact that could be connected to the query's topic, report it. The query is a rough guide, not an exact match requirement.
+  Call submit_summary with what you found.
+
+  IMPORTANT using submit_summary tool is the ONLY way to submit your answer.

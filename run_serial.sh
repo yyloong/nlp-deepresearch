@@ -70,8 +70,6 @@ exec python run_serial.py \
     --max-turns "${MAX_TURNS}" \
     --max-tokens "${MAX_TOKENS}" \
     --max-tool-calls-per-turn "${MAX_TOOL_CALLS}" \
-    --no-verify \
     --search-k "${SEARCH_K}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
-    --think-trunc-no-think \
     "$@"
