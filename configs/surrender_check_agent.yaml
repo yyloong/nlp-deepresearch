@@ -10,7 +10,7 @@ max_tokens: 1024
 max_context: 8192
 max_turn: 1
 condense_token_threshold: 1.0
-enable_thinking: false
+enable_thinking: true
 max_tool_calls_per_turn: 1
 max_tool_retries: 2
 

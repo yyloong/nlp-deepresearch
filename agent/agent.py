@@ -139,8 +139,13 @@ class Agent:
         self.end_tool: str = cfg.get("end_tool", "submit_answer")
         self._tool_names: List[str] = list(cfg.get("tools", []))
         self._tool_config: Dict[str, Any] = dict(cfg.get("tool_config", {}))
+        self.search_k: int = int(self._tool_config.get("search", {}).get("search_k", 5))
         self.tool_specs: List[Dict[str, Any]] = self._build_tool_specs()
         self.tool_registry: Dict[str, Callable[..., Any]] = tool_registry or {}
+
+        # Interpolate placeholders in prompt
+        self.system_prompt = self.system_prompt.replace("{search_k}", str(self.search_k))
+        self.condense_prompt = self.condense_prompt.replace("{search_k}", str(self.search_k))
 
         # Extra payload for model calls
         self.extra_payload: Dict[str, Any] = {}
@@ -229,14 +234,17 @@ class Agent:
             comp_tok = usage.get("completion_tokens", "?")
             print(f"    │ [model] prompt_tokens={prompt_tok}  completion_tokens={comp_tok}", flush=True)
 
-            # Log think blocks
+            # Log think blocks (avoid double-counting: if unclosed, don't count closed blocks)
             think_blocks = re.findall(r"<think>(.*?)</think>", content, re.DOTALL)
-            unclosed = re.search(r"<think>(.*)$", content, re.DOTALL)
+            # Only flag unclosed if </think> is truly missing after the last <think>
+            last_think = content.rfind("<think>")
+            last_close = content.rfind("</think>")
+            unclosed = last_think > last_close
             if think_blocks or unclosed:
                 n_blocks = len(think_blocks) + (1 if unclosed else 0)
                 total_tok = sum(len(self.tokenizer.encode(b)) for b in think_blocks)
-                if unclosed:
-                    total_tok += len(self.tokenizer.encode(unclosed.group(1)))
+                if unclosed and last_think >= 0:
+                    total_tok += len(self.tokenizer.encode(content[last_think + len("<think>"):]))
                 print(f"    │ [think] {n_blocks} block(s), {total_tok} tokens total", flush=True)
 
             # Strip think blocks for content display

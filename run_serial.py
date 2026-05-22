@@ -34,7 +34,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from agent.agent import Agent
-from agent.browsecomp_searcher import BrowseCompBM25Searcher, build_searcher  # noqa: E402
+from agent.browsecomp_searcher import BrowseCompBM25Searcher  # noqa: E402
 from agent.dataset_utils import load_jsonl  # noqa: E402
 from agent.eval_async import evaluate_trajectories  # noqa: E402
 from agent.tool_docs import (  # noqa: E402
@@ -188,10 +188,20 @@ async def _main_async(args: argparse.Namespace) -> None:
             yaml.dump(cfg, f)
         return patched_path
 
-    # ── Agent factory for call_subagents ──
+    # ── Agent factory for call_subagents (light patch: only model/search_k, keep own max_turn etc.) ──
     def agent_factory(config_path: str) -> Agent:
-        patched = _load_and_patch(config_path)
-        return Agent(patched, client=client, tokenizer=_tok)
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        cfg["model"] = args.model
+        cfg["max_tokens"] = args.max_tokens
+        cfg["temperature"] = args.temperature
+        cfg.setdefault("tool_config", {}).setdefault("search", {})
+        cfg["tool_config"]["search"]["search_k"] = args.search_k
+        cfg["tool_config"]["search"]["snippet_max_chars"] = args.snippet_max_chars
+        patched_path = f"/tmp/patched_{os.path.basename(config_path)}"
+        with open(patched_path, "w", encoding="utf-8") as f:
+            yaml.dump(cfg, f)
+        return Agent(patched_path, client=client, tokenizer=_tok)
 
     # ── Create ToolRegistry ──
     tool_registry = ToolRegistry(searcher=searcher, agent_factory=agent_factory)
@@ -203,8 +213,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     )
     sub_summary_agent = None
     if use_subagent:
-        sub_summary_patched = _load_and_patch("configs/sub_summary_agent.yaml")
-        sub_summary_agent = Agent(sub_summary_patched, client=client, tokenizer=_tok)
+        sub_summary_agent = agent_factory("configs/sub_summary_agent.yaml")
         sub_summary_agent.tool_registry = tool_registry.build_registry("sub_summary")
         tool_registry.set_sub_summary_agent(sub_summary_agent)
 

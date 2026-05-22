@@ -11,65 +11,20 @@ from typing import Any, Dict, List
 
 
 def search_tool_spec(search_k: int = 5) -> Dict[str, Any]:
-    """Search tool spec for main agent and search agent (with found/history_found/next_reason fields)."""
-    return {
-        "type": "function",
-        "function": {
-            "name": "search",
-            "description": (
-                f"Search the BM25 index (top-{search_k} results). "
-                "Query MUST be 2-3 specific words (names/dates/titles), NOT generic descriptions."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "2-3 specific entity names, never generic words",
-                    },
-                    "found": {
-                        "type": "string",
-                        "description": (
-                            "BEFORE this search: what specific names/dates/titles did you find "
-                            "in the LAST search results? List them. NEVER use a general description."
-                        ),
-                    },
-                    "history_found": {
-                        "type": "string",
-                        "description": (
-                            "Cumulative record of ALL specific names/dates/titles found across "
-                            "EVERY previous search so far (not just the last one). "
-                            "Append each turn's new findings; keep prior entries. "
-                            "PROVIDE SPECIFIC FINDINGS RATHER THAN A GENERAL DESCRIPTION. "
-                            "For example, GOOD: 'B is a monkey king with constrain C, and you find it.' "
-                            "BAD: 'monkey king' or 'monkey king with constrain C'."
-                        ),
-                    },
-                    "next_reason": {
-                        "type": "string",
-                        "description": "Why this search? How does it use what you found to move toward the answer?",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    }
-
-
-def search_simple_tool_spec(search_k: int = 5) -> Dict[str, Any]:
-    """Simplified search tool spec for verify agent (query only)."""
+    """Search tool spec — query only, used by all agents."""
     return {
         "type": "function",
         "function": {
             "name": "search",
             "description": (
                 f"Search the BM25 index and return top-{search_k} results "
-                "with docid, score, and snippet."
+                "with docid, score, and snippet. "
+                "Query MUST be 2-3 specific words (names/dates/titles), NOT generic descriptions."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query"},
+                    "query": {"type": "string", "description": "2-3 specific entity names, never generic words"},
                 },
                 "required": ["query"],
             },
@@ -260,17 +215,16 @@ def submit_condensed_summary_tool_spec() -> Dict[str, Any]:
 # ── Convenience: build tool spec lists for each agent type ──
 
 def build_main_agent_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
-    """Tool specs for main agent: search, get_document, call_subagents, submit_answer."""
+    """Tool specs for main agent: search (query only), call_subagents, submit_answer."""
     return [
         search_tool_spec(search_k),
-        get_document_tool_spec(),
         call_subagents_tool_spec(),
         submit_answer_tool_spec(),
     ]
 
 
 def build_search_agent_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
-    """Tool specs for search agent: search, get_document, submit_answer."""
+    """Tool specs for search agent: search (query only), get_document, submit_answer."""
     return [
         search_tool_spec(search_k),
         get_document_tool_spec(),
@@ -281,7 +235,7 @@ def build_search_agent_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
 def build_verify_agent_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
     """Tool specs for verify agent: search (simple), get_document, give_feedback."""
     return [
-        search_simple_tool_spec(search_k),
+        search_tool_spec(search_k),
         get_document_tool_spec(),
         give_feedback_tool_spec(),
     ]

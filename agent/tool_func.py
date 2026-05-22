@@ -78,20 +78,10 @@ class ToolRegistry:
     # Main / Search Agent Tools
     # ═══════════════════════════════════════════════════════════════
 
-    async def search(
-        self,
-        query: str,
-        found: str = "",
-        history_found: str = "",
-        next_reason: str = "",
-    ) -> List[Dict[str, Any]]:
+    async def search(self, query: str) -> List[Dict[str, Any]]:
         """BM25 search with optional sub-agent document summarization."""
-        print(
-            f"    [search] query='{query}' k={self._search_k} "
-            f"sub_agent={self._use_subagent_summary} | "
-            f"found={found!r} history_found={history_found!r} next_reason={next_reason!r}",
-            flush=True,
-        )
+        print(f"    [search] query='{query}' k={self._search_k} "
+              f"sub_agent={self._use_subagent_summary}", flush=True)
         docs = self._searcher.search(query, k=self._search_k)
         print(f"    [search] found {len(docs)} docs", flush=True)
 
@@ -175,9 +165,16 @@ class ToolRegistry:
         """Spawn search agents in parallel for each question. No concurrency limit.
 
         Each search agent independently searches the corpus and submits findings.
+        The number of subagents is capped at ``_search_k`` to match search result limits.
         """
         if self._agent_factory is None:
             return [{"error": "agent_factory not configured"}]
+
+        # Enforce limit: number of subagents <= search_k
+        max_questions = self._search_k
+        if len(questions) > max_questions:
+            print(f"    [call_subagents] truncating {len(questions)} questions to {max_questions} (search_k limit)", flush=True)
+            questions = questions[:max_questions]
 
         print(f"    [call_subagents] spawning {len(questions)} search agents in parallel", flush=True)
         for i, q in enumerate(questions):
@@ -186,7 +183,7 @@ class ToolRegistry:
         async def _run_one(question: str, idx: int) -> Dict[str, Any]:
             try:
                 agent = self._agent_factory("configs/search_agent.yaml")
-                agent.tool_registry = self  # share tool registry
+                agent.tool_registry = self.build_registry("search")
                 print(f"    [subagent-{idx}] started", flush=True)
                 traj = await agent.run(question)
                 # Extract answer from trajectory
@@ -332,7 +329,6 @@ class ToolRegistry:
         if agent_type == "main":
             return {
                 "search": self.search,
-                "get_document": self.get_document,
                 "call_subagents": self.call_subagents,
                 "submit_answer": self.submit_answer,
             }
