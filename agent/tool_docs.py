@@ -154,6 +154,32 @@ def give_feedback_tool_spec() -> Dict[str, Any]:
     }
 
 
+def judge_relevance_tool_spec() -> Dict[str, Any]:
+    """Relevance judge agent end_tool — report HELPFUL / IRRELEVANT / CONFUSING."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "judge_relevance",
+            "description": "Judge whether the document is relevant to the question. You MUST use this tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "relevance": {
+                        "type": "string",
+                        "enum": ["HELPFUL", "IRRELEVANT", "CONFUSING"],
+                        "description": "HELPFUL: has facts that help answer. IRRELEVANT: unrelated. CONFUSING: similar but different entity — could mislead.",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "If HELPFUL: concise summary of relevant facts with specific names/dates/quotes. Otherwise leave empty.",
+                    },
+                },
+                "required": ["relevance"],
+            },
+        },
+    }
+
+
 def submit_summary_tool_spec() -> Dict[str, Any]:
     """Sub-summary agent end_tool — submit extracted facts."""
     return {
@@ -213,6 +239,40 @@ def submit_condensed_summary_tool_spec() -> Dict[str, Any]:
 
 # ── Convenience: build tool spec lists for each agent type ──
 
+def smart_search_tool_spec(search_k: int = 5) -> Dict[str, Any]:
+    """Enhanced search tool spec — auto relevance-filtered results."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "smart_search",
+            "description": (
+                f"Search the BM25 index (top-{search_k} results) with automatic relevance filtering. "
+                "Each result is evaluated by a judge agent — only genuinely helpful documents are returned. "
+                "Irrelevant and confusing documents are automatically dropped. "
+                "Returns a dict with 'results' (list of helpful docs, may be empty) and 'hint' "
+                "(only set when ALL results were filtered out — use it to guide your next query). "
+                "Query MUST be 2-3 specific words."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "2-3 specific entity names, never generic words"},
+                },
+                "required": ["query"],
+            },
+        },
+    }
+
+
+def build_main_agent_smart_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
+    """Tool specs for main agent (smart): smart_search, get_document, submit_answer."""
+    return [
+        smart_search_tool_spec(search_k),
+        get_document_tool_spec(),
+        submit_answer_tool_spec(),
+    ]
+
+
 def build_main_agent_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
     """Tool specs for main agent: search (query only), call_subagents, submit_answer."""
     return [
@@ -268,6 +328,15 @@ def report_surrender_verdict_tool_spec() -> Dict[str, Any]:
 def build_sub_summary_tool_specs() -> List[Dict[str, Any]]:
     """Tool specs for sub-summary agent: submit_summary only."""
     return [submit_summary_tool_spec()]
+
+
+def build_relevance_judge_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
+    """Tool specs for relevance judge agent: search, get_document, judge_relevance."""
+    return [
+        search_tool_spec(search_k),
+        get_document_tool_spec(),
+        judge_relevance_tool_spec(),
+    ]
 
 
 def build_surrender_check_tool_specs() -> List[Dict[str, Any]]:

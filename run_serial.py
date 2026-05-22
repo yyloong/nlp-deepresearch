@@ -94,6 +94,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Max context window for auto-condensation")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--tokenizer-path", default="Qwen/Qwen3-8B")
+    p.add_argument("--agent-config", default="configs/main_agent_smart.yaml",
+                   help="Path to main agent YAML config")
     return p
 
 
@@ -207,7 +209,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     tool_registry = ToolRegistry(searcher=searcher, agent_factory=agent_factory)
 
     # ── Create sub_summary agent (if search uses subagent) ──
-    main_cfg = _load_yaml_config("configs/main_agent.yaml")
+    main_cfg = _load_yaml_config(args.agent_config)
     use_subagent = (
         main_cfg.get("tool_config", {}).get("search", {}).get("use_subagent_summary", False)
     )
@@ -217,9 +219,9 @@ async def _main_async(args: argparse.Namespace) -> None:
         sub_summary_agent.tool_registry = tool_registry.build_registry("sub_summary")
         tool_registry.set_sub_summary_agent(sub_summary_agent)
 
-    def _get_enable_verify(agent_type: str, default: bool = False) -> bool:
-        cfg_path = f"configs/{agent_type}_agent.yaml"
-        cfg = _load_yaml_config(cfg_path)
+    def _get_enable_verify(default: bool = False) -> bool:
+        """Read enable_verify from the actual main agent config being used."""
+        cfg = _load_yaml_config(args.agent_config)
         return bool(cfg.get("tool_config", {}).get("submit_answer", {}).get("enable_verify", default))
 
     # ── Create verify agent ──
@@ -236,6 +238,11 @@ async def _main_async(args: argparse.Namespace) -> None:
     surrender_check_agent.tool_registry = tool_registry.build_registry("surrender_check")
     tool_registry.set_surrender_check_agent(surrender_check_agent)
 
+    # ── Create relevance judge agent ──
+    relevance_judge_agent = agent_factory("configs/relevance_judge_agent.yaml")
+    relevance_judge_agent.tool_registry = tool_registry.build_registry("relevance_judge")
+    tool_registry.set_relevance_judge_agent(relevance_judge_agent)
+
     # ── Configure search ──
     tool_registry.configure_search(
         search_k=args.search_k,
@@ -244,9 +251,9 @@ async def _main_async(args: argparse.Namespace) -> None:
     )
 
     # ── Create main agent ──
-    main_patched = _load_and_patch("configs/main_agent.yaml")
+    main_patched = _load_and_patch(args.agent_config)
     main_agent = Agent(main_patched, client=client, tokenizer=_tok)
-    main_agent.tool_registry = tool_registry.build_registry("main", enable_verify=_get_enable_verify("main", True))
+    main_agent.tool_registry = tool_registry.build_registry("main", enable_verify=_get_enable_verify(True))
     tool_registry.set_main_agent(main_agent)
 
     # ── Output setup ──
@@ -277,6 +284,13 @@ async def _main_async(args: argparse.Namespace) -> None:
                 print(f"│ Gold Ans: {gold_preview}")
             print(f"└{'─'*78}┘\n  Running...", flush=True)
 
+            # Set trajectory dir for this question (agent saves internally)
+            main_agent.trajectory_dir = traj_dir
+            main_agent.name = qid
+            if verify_agent is not None:
+                verify_agent.trajectory_dir = traj_dir
+                verify_agent.name = f"{qid}_verify"
+
             # Run main agent
             traj = await main_agent.run(question)
             answer = extract_final_answer(traj) or ""
@@ -300,35 +314,6 @@ async def _main_async(args: argparse.Namespace) -> None:
                 "messages": traj,
             }
             records.append(rec)
-
-            # Save trajectory
-            with Path(traj_dir, f"{qid}.json").open("w", encoding="utf-8") as f:
-                json.dump(rec, f, ensure_ascii=False, indent=2)
-
-            # Save condense sessions
-            if main_agent.get_condense_sessions():
-                with Path(traj_dir, f"{qid}_condense.json").open("w", encoding="utf-8") as f:
-                    json.dump(
-                        {"query_id": qid, "sessions": main_agent.get_condense_sessions()},
-                        f, ensure_ascii=False, indent=2,
-                    )
-
-            # Save verify trajectories
-            if verify_agent is not None:
-                verify_traj = verify_agent.get_trajectory()
-                if verify_traj:
-                    with Path(traj_dir, f"{qid}_verify.json").open("w", encoding="utf-8") as f:
-                        json.dump(
-                            {"query_id": qid, "messages": verify_traj},
-                            f, ensure_ascii=False, indent=2,
-                        )
-                verify_condense = verify_agent.get_condense_sessions()
-                if verify_condense:
-                    with Path(traj_dir, f"{qid}_verify_condense.json").open("w", encoding="utf-8") as f:
-                        json.dump(
-                            {"query_id": qid, "sessions": verify_condense},
-                            f, ensure_ascii=False, indent=2,
-                        )
 
             # Reset agent state for next question
             main_agent.reset_state()

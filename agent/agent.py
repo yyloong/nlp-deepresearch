@@ -26,7 +26,9 @@ import yaml
 
 from .tool_docs import (
     build_condense_tool_specs,
+    build_main_agent_smart_tool_specs,
     build_main_agent_tool_specs,
+    build_relevance_judge_tool_specs,
     build_search_agent_tool_specs,
     build_sub_summary_tool_specs,
     build_surrender_check_tool_specs,
@@ -105,12 +107,16 @@ class Agent:
         client: Any = None,
         tokenizer: Any = None,
         tool_registry: Optional[Dict[str, Callable[..., Any]]] = None,
+        name: str = "",
+        trajectory_dir: str = "",
     ) -> None:
         # ── Load YAML config ──
         with open(config_path, "r", encoding="utf-8") as f:
             cfg: Dict[str, Any] = yaml.safe_load(f)
 
         self.config_path = config_path
+        self.name: str = name or cfg.get("agent_type", "agent")
+        self.trajectory_dir: str = trajectory_dir
         self.agent_type: str = cfg.get("agent_type", "main")
 
         # Model / client
@@ -165,6 +171,8 @@ class Agent:
         tool_names = set(self._tool_names)
 
         if self.agent_type == "main":
+            if "smart_search" in tool_names:
+                return build_main_agent_smart_tool_specs(search_k)
             return build_main_agent_tool_specs(search_k)
         elif self.agent_type == "search":
             return build_search_agent_tool_specs(search_k)
@@ -172,6 +180,8 @@ class Agent:
             return build_verify_agent_tool_specs(search_k)
         elif self.agent_type == "sub_summary":
             return build_sub_summary_tool_specs()
+        elif self.agent_type == "relevance_judge":
+            return build_relevance_judge_tool_specs(search_k)
         elif self.agent_type == "surrender_check":
             return build_surrender_check_tool_specs()
         else:
@@ -533,7 +543,7 @@ class Agent:
                 "tool": sum(1 for m in messages if m.get("role") == "tool"),
             }
             print(
-                f"  ┌─ Turn {turn + 1}/{self.max_turn} | "
+                f"  ┌─ [{self.name}] Turn {turn + 1}/{self.max_turn} | "
                 f"msgs: {n_msgs} (sys:{role_counts['sys']} usr:{role_counts['usr']} "
                 f"asst:{role_counts['asst']} tool:{role_counts['tool']}) | "
                 f"tokens: {n_tokens_before} | {time.strftime('%H:%M:%S')}",
@@ -684,12 +694,12 @@ class Agent:
             n_tokens_after = count_tokens_messages(self.tokenizer, messages)
             tc_str = ", ".join(tc_names) if tc_names else "(none)"
             elapsed = time.time() - t_turn_start
-            print(f"  └─ turn {turn + 1:2d} done | tokens: {n_tokens_before:5d} -> {n_tokens_after:5d} (Δ{n_tokens_after - n_tokens_before:+d}) | tools: {tc_str} | {elapsed:.1f}s", flush=True)
+            print(f"  └─ [{self.name}] turn {turn + 1:2d} done | tokens: {n_tokens_before:5d} -> {n_tokens_after:5d} (Δ{n_tokens_after - n_tokens_before:+d}) | tools: {tc_str} | {elapsed:.1f}s", flush=True)
             turn_stats.append({"turn": turn + 1, "n_tokens_before": n_tokens_before, "n_tokens_after": n_tokens_after, "tool_calls": tc_names})
 
             if end_tool_called:
                 finish_reason = f"{self.end_tool}_confirmed"
-                print(f"    ✓ end_tool '{self.end_tool}' called, terminating loop", flush=True)
+                print(f"    ✓ [{self.name}] end_tool '{self.end_tool}' called, terminating loop", flush=True)
                 break
 
             # ── Post-turn condense check ──
@@ -722,11 +732,33 @@ class Agent:
 
             print()
 
+        self._save_trajectory()
         return list(self._trajectory)
 
     # ═══════════════════════════════════════════════════════════════
     # Trajectory helpers
     # ═══════════════════════════════════════════════════════════════
+
+    def _save_trajectory(self) -> None:
+        """Save current trajectory and condense sessions to disk."""
+        if not self.trajectory_dir:
+            return
+        try:
+            Path(self.trajectory_dir).mkdir(parents=True, exist_ok=True)
+
+            traj_file = Path(self.trajectory_dir, f"{self.name}.json")
+            with open(traj_file, "w", encoding="utf-8") as f:
+                json.dump({"name": self.name, "agent_type": self.agent_type,
+                           "messages": self._trajectory}, f, ensure_ascii=False, indent=2)
+            print(f"    [{self.name}] trajectory saved -> {traj_file}", flush=True)
+
+            if self._condense_sessions:
+                cond_file = Path(self.trajectory_dir, f"{self.name}_condense.json")
+                with open(cond_file, "w", encoding="utf-8") as f:
+                    json.dump({"name": self.name, "sessions": self._condense_sessions},
+                              f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"    [{self.name}] failed to save trajectory: {e}", flush=True)
 
     def get_trajectory(self) -> List[Dict[str, Any]]:
         return list(self._trajectory)

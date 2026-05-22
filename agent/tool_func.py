@@ -49,6 +49,7 @@ class ToolRegistry:
         self._sub_summary_agent: Optional[Any] = None
         self._main_agent: Optional[Any] = None
         self._surrender_check_agent: Optional[Any] = None
+        self._relevance_judge_agent: Optional[Any] = None
 
         # Config overrides
         self._search_k: int = 5
@@ -68,6 +69,9 @@ class ToolRegistry:
 
     def set_surrender_check_agent(self, agent: Any) -> None:
         self._surrender_check_agent = agent
+
+    def set_relevance_judge_agent(self, agent: Any) -> None:
+        self._relevance_judge_agent = agent
 
     def configure_search(self, search_k: int, snippet_max_chars: int, use_subagent_summary: bool) -> None:
         self._search_k = search_k
@@ -153,6 +157,89 @@ class ToolRegistry:
             print(f"    [search-result] docid={r.get('docid','?')}: {r.get('summary','?')}", flush=True)
         return list(results)
 
+    async def smart_search(self, query: str) -> List[Dict[str, Any]]:
+        """Enhanced search: BM25 + relevance filtering via judge sub-agents.
+
+        Each search result is evaluated by a relevance judge agent that has
+        search + get_document tools. Only HELPFUL docs are returned.
+        IRRELEVANT and CONFUSING docs are silently dropped.
+        """
+        docs = self._searcher.search(query, k=self._search_k)
+        print(f"    [smart_search] query='{query}' k={self._search_k}, found {len(docs)} raw docs", flush=True)
+
+        if self._relevance_judge_agent is None or self._agent_factory is None:
+            # Fallback: return snippets without filtering
+            print(f"    [smart_search] no judge agent configured, returning all {len(docs)} docs", flush=True)
+            return [
+                {
+                    "docid": doc["docid"],
+                    "score": doc["score"],
+                    "snippet": snippetize(doc["text"], self._snippet_max_chars),
+                    "url": doc.get("url", ""),
+                }
+                for doc in docs
+            ]
+
+        question = ""
+        if self._main_agent is not None:
+            question = getattr(self._main_agent, "_current_question", "")
+
+        async def _judge_one(doc: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
+            try:
+                judge = self._agent_factory("configs/relevance_judge_agent.yaml")
+                judge.tool_registry = self.build_registry("relevance_judge")
+                if self._main_agent is not None and self._main_agent.trajectory_dir:
+                    judge.trajectory_dir = self._main_agent.trajectory_dir
+                    judge.name = f"judge_{doc['docid']}"
+                prompt = (
+                    f"Question: {question}\n\n"
+                    f"Search Query Used: {query}\n\n"
+                    f"Document (docid={doc['docid']}):\n{doc['text'][:8000]}\n\n"
+                    f"Judge whether this document is HELPFUL, IRRELEVANT, or CONFUSING for answering the question."
+                )
+                traj = await judge.run(prompt)
+                # Extract judge_relevance result
+                for msg in reversed(traj):
+                    if msg.get("role") == "assistant":
+                        for tc in (msg.get("tool_calls") or []):
+                            if tc.get("function", {}).get("name") == "judge_relevance":
+                                try:
+                                    args = json.loads(tc["function"].get("arguments", "{}"))
+                                    relevance = args.get("relevance", "IRRELEVANT")
+                                    summary = args.get("summary", "")
+                                    print(f"    [smart_search] docid={doc['docid']}: {relevance}", flush=True)
+                                    if relevance == "HELPFUL":
+                                        return {
+                                            "docid": doc["docid"],
+                                            "score": doc["score"],
+                                            "snippet": snippetize(doc["text"], self._snippet_max_chars),
+                                            "summary": summary,
+                                            "url": doc.get("url", ""),
+                                        }
+                                    else:
+                                        return None  # drop IRRELEVANT / CONFUSING
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+                print(f"    [smart_search] docid={doc['docid']}: no valid judgment, dropping", flush=True)
+                return None
+            except Exception as e:
+                print(f"    [smart_search] docid={doc['docid']}: ERROR {e}", flush=True)
+                return None
+
+        tasks = [_judge_one(d, i) for i, d in enumerate(docs)]
+        results = await asyncio.gather(*tasks)
+        filtered = [r for r in results if r is not None]
+        print(f"    [smart_search] {len(docs)} raw -> {len(filtered)} helpful docs", flush=True)
+        result: Dict[str, Any] = {"results": filtered}
+        if not filtered:
+            hint = (f"ALL {len(docs)} search results were judged IRRELEVANT or CONFUSING. "
+                    f"PAY ATTENTION!!! it is not the limitation of the search tool but your query way or entity!!!Try to list all the clues you have and try one by one.Don't use similar query again!!!")
+            result["hint"] = hint
+            print(f"    [smart_search] {hint}", flush=True)
+        for r in filtered:
+            print(f"    [smart_search-result] docid={r['docid']}: {r.get('summary','')[:200]}", flush=True)
+        return result
+
     def get_document(self, docid: str) -> Dict[str, Any]:
         """Retrieve full document by docid."""
         doc = self._searcher.get_document(docid)
@@ -184,6 +271,9 @@ class ToolRegistry:
             try:
                 agent = self._agent_factory("configs/search_agent.yaml")
                 agent.tool_registry = self.build_registry("search", enable_verify=False)
+                if self._main_agent is not None and self._main_agent.trajectory_dir:
+                    agent.trajectory_dir = self._main_agent.trajectory_dir
+                    agent.name = f"subagent_{idx}"
                 print(f"    [subagent-{idx}] started", flush=True)
                 traj = await agent.run(question)
                 # Extract answer from trajectory
@@ -338,7 +428,9 @@ class ToolRegistry:
         """
         if agent_type == "main":
             return {
+                "smart_search": self.smart_search,
                 "search": self.search,
+                "get_document": self.get_document,
                 "call_subagents": self.call_subagents,
                 "submit_answer": self.submit_answer if enable_verify else self._submit_answer_pass_through,
             }
@@ -358,6 +450,12 @@ class ToolRegistry:
             return {
                 "submit_summary": self._submit_summary_impl,
             }
+        elif agent_type == "relevance_judge":
+            return {
+                "search": self.search,
+                "get_document": self.get_document,
+                "judge_relevance": self._judge_relevance_impl,
+            }
         elif agent_type == "surrender_check":
             return {
                 "report_surrender_verdict": self._report_surrender_verdict_impl,
@@ -373,6 +471,10 @@ class ToolRegistry:
     async def _submit_summary_impl(self, relevant_info: str) -> Dict[str, str]:
         """Submit summary — pass-through; the caller extracts from trajectory."""
         return {"relevant_info": relevant_info}
+
+    def _judge_relevance_impl(self, relevance: str, summary: str = "") -> Dict[str, Any]:
+        """Relevance judgment — pass-through; the caller extracts from trajectory."""
+        return {"relevance": relevance, "summary": summary}
 
     def _report_surrender_verdict_impl(self, is_pass: bool, reason: str) -> Dict[str, Any]:
         """Surrender verdict — pass-through; the caller extracts from trajectory."""
