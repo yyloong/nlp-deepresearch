@@ -26,13 +26,17 @@ import yaml
 
 from .tool_docs import (
     build_condense_tool_specs,
-    build_main_agent_smart_tool_specs,
     build_main_agent_tool_specs,
     build_relevance_judge_tool_specs,
     build_search_agent_tool_specs,
     build_sub_summary_tool_specs,
     build_surrender_check_tool_specs,
     build_verify_agent_tool_specs,
+    call_subagents_tool_spec,
+    get_document_tool_spec,
+    search_tool_spec,
+    smart_search_tool_spec,
+    submit_answer_tool_spec,
 )
 from .utils import count_tokens_messages, hard_truncate_tail_tool_messages
 
@@ -167,15 +171,29 @@ class Agent:
 
     # ── Tool spec builder ─────────────────────────
 
+    def _build_main_tool_specs(self, search_k: int, tool_names: set) -> List[Dict[str, Any]]:
+        """Build tool specs for main agent dynamically from its tool list."""
+        specs = []
+        for name in self._tool_names:
+            if name == "search":
+                specs.append(search_tool_spec(search_k))
+            elif name == "smart_search":
+                specs.append(smart_search_tool_spec(search_k))
+            elif name == "get_document":
+                specs.append(get_document_tool_spec())
+            elif name == "call_subagents":
+                specs.append(call_subagents_tool_spec())
+            elif name == "submit_answer":
+                specs.append(submit_answer_tool_spec())
+        return specs
+
     def _build_tool_specs(self) -> List[Dict[str, Any]]:
         """Build OpenAI-format tool specs based on the agent's tool list."""
         search_k = self.search_k  # use the already-resolved search_k
         tool_names = set(self._tool_names)
 
         if self.agent_type == "main":
-            if "smart_search" in tool_names:
-                return build_main_agent_smart_tool_specs(search_k)
-            return build_main_agent_tool_specs(search_k)
+            return self._build_main_tool_specs(search_k, tool_names)
         elif self.agent_type == "search":
             return build_search_agent_tool_specs(search_k)
         elif self.agent_type == "verify":

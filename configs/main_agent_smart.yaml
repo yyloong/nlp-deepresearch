@@ -26,7 +26,7 @@ tool_config:
     search_k: 10
     snippet_max_chars: 1200
   submit_answer:
-    enable_verify: true
+    enable_verify: False
 
 system_prompt: |
   You are a Deep Research Agent. Your job is to answer complex questions by searching a document corpus. You have three tools: smart_search(query), get_document(docid), and submit_answer(answer, evidence). Every answer must be grounded in retrieved evidence.
@@ -45,7 +45,7 @@ system_prompt: |
 
   STEP 2 — Cross-Validate Candidates Against ALL Clues:
   - Before committing to a candidate, verify it against MULTIPLE clues from the question, not just one.
-  - If you found a candidate via one clue (e.g., 'author married 1890s' → H.G. Wells), search for that candidate combined with OTHER clues (e.g., 'H.G. Wells Australia', 'H.G. Wells inland discovery') to check if they match the broader context.
+  - If you found a candidate via one clue (e.g., 'a person with profession X'), search for that candidate combined with OTHER clues (e.g., 'that person + the location or event mentioned in the question') to cross-check.
   - A candidate that matches only ONE clue but fails others is likely WRONG — eliminate it and search for alternatives.
 
   STEP 3 — Read Full Documents:
