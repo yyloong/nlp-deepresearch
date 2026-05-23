@@ -301,16 +301,36 @@ async def _main_async(args: argparse.Namespace) -> None:
             traj = await main_agent.run(question)
             answer = extract_final_answer(traj) or ""
 
-            # Determine finish reason
+            # Determine finish reason and first submission
             finish_reason = "max_turns"
-            for msg in reversed(traj):
+            first_submit_answer = ""
+            last_submit_was_accepted = False
+            for i, msg in enumerate(traj):
                 if msg.get("role") == "assistant":
-                    tc = msg.get("tool_calls")
-                    if tc:
-                        tc_names = [t["function"]["name"] for t in tc]
-                        if "submit_answer" in tc_names:
-                            finish_reason = "submit_answer_confirmed"
-                    break
+                    for t in (msg.get("tool_calls") or []):
+                        if t["function"]["name"] == "submit_answer":
+                            if not first_submit_answer:
+                                try:
+                                    args = json.loads(t["function"].get("arguments", "{}"))
+                                    first_submit_answer = args.get("answer", "")
+                                except Exception:
+                                    pass
+                            # Check tool result for acceptance
+                            for j in range(i+1, min(i+3, len(traj))):
+                                tm = traj[j]
+                                if tm.get("role") == "tool":
+                                    try:
+                                        fb = json.loads(tm.get("content", "{}"))
+                                        if fb.get("is_correct"):
+                                            last_submit_was_accepted = True
+                                    except Exception:
+                                        pass
+            if last_submit_was_accepted:
+                finish_reason = "submit_answer_confirmed"
+
+            # If max_turns, use first submission (not the desperate last one)
+            if finish_reason == "max_turns" and first_submit_answer:
+                answer = first_submit_answer
 
             elapsed = time.time() - t0
             rec = {
