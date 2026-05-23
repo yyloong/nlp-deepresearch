@@ -16,8 +16,10 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 # ── 固定默认值 ──
 DATASET="${ROOT}/browsecomp_plus_hard50.jsonl"
 INDEX_PATH="${ROOT}/indexes/browsecomp_plus_bm25.sqlite"
-MODEL="${MODEL:-qwen_auto}"
-BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
+#MODEL="${MODEL:-qwen_auto}"
+MODEL="${MODEL:-DeepSeek-V4-Flash}"
+#BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
+BASE_URL="${BASE_URL:-https://api.zinyy.tech/v1}"
 OUTPUT_DIR="${ROOT}/runs"
 MAX_TURNS="${MAX_TURNS:-30}"
 MAX_TOKENS="${MAX_TOKENS:-8912}"
@@ -26,6 +28,9 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 
 # ── 清理代理变量 ──
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
+export http_proxy=http://pc.zinyy.tech:7899 
+export https_proxy=http://pc.zinyy.tech:7899 
+
 
 # ── 激活 conda 环境 ──
 CONDA_ENV="${CONDA_ENV:-server}"

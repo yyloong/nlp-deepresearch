@@ -27,6 +27,8 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 
 # ── 清理代理变量（vLLM 在 localhost，不能走 proxy）──
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
+export http_proxy=http://pc.zinyy.tech:7899 
+export https_proxy=http://pc.zinyy.tech:7899 
 
 # ── 激活 conda 环境 ──
 CONDA_ENV="${CONDA_ENV:-server}"

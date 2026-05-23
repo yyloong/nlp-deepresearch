@@ -22,7 +22,7 @@ tools:
 
 tool_config:
   search:
-    use_subagent_summary: false
+    use_subagent_summary: False
     search_k: 5
     snippet_max_chars: 1200
   submit_answer:
