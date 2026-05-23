@@ -186,10 +186,10 @@ async def _main_async(args: argparse.Namespace) -> None:
                 cfg["tool_config"][key]["search_k"] = args.search_k
                 cfg["tool_config"][key]["snippet_max_tokens"] = args.snippet_max_tokens
         # Write patched config
-        patched_path = f"/tmp/patched_{os.path.basename(config_path)}"
-        with open(patched_path, "w", encoding="utf-8") as f:
-            yaml.dump(cfg, f)
-        return patched_path
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tf:
+            yaml.dump(cfg, tf)
+            return tf.name
 
     # ── Agent factory for call_subagents (light patch: only model/search_k, keep own max_turn etc.) ──
     def agent_factory(config_path: str) -> Agent:
@@ -201,7 +201,8 @@ async def _main_async(args: argparse.Namespace) -> None:
         cfg.setdefault("tool_config", {}).setdefault("search", {})
         cfg["tool_config"]["search"]["search_k"] = args.search_k
         cfg["tool_config"]["search"]["snippet_max_tokens"] = args.snippet_max_tokens
-        patched_path = f"/tmp/patched_{os.path.basename(config_path)}"
+        import uuid, tempfile
+        patched_path = os.path.join(tempfile.gettempdir(), f"agent_{uuid.uuid4().hex}.yaml")
         with open(patched_path, "w", encoding="utf-8") as f:
             yaml.dump(cfg, f)
         return Agent(patched_path, client=client, tokenizer=_tok)

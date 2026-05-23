@@ -1,0 +1,10 @@
+# accelerate 配置文件 —— 用于 Ascend 910B NPU 单卡训练
+# 使用方式: accelerate launch --config_file train/accelerate_npu.yaml train/train.py ...
+compute_environment: LOCAL_MACHINE
+distributed_type: "NO"          # 单卡，多卡改为 MULTI_NPU
+num_processes: 1
+num_machines: 1
+use_cpu: false
+npu_ids: "0"                    # 使用第 0 张 NPU
+mixed_precision: "bf16"         # 910B 推荐 bf16
+dynamo_backend: "no"            # torch.compile 在 NPU 上需单独验证
