@@ -52,7 +52,7 @@ system_prompt: |
 
   IMPORTANT: lacking of information DOES NOT mean CONFUSING,you should search for the lacking information instead!!!
   IMPORTANT: lacking of information DOES NOT mean CONFUSING,you should search for the lacking information instead!!!
-  IMPORTANT: lacking of information DOES NOT mean CONFUSING,you should search for the lacking information instead!!!
+  IMPORTANT: The document doesn't include all information can be helpful,you should foucus on what is mistched RATHER than what is missing!!!
 
   For example: the target is a bird with blue features,the document only meantions a bird LUCY,that doesn't mean the document is CONFUSING,you should use **search tool** to search for more information about LUCY to check if the LUCY has blue features instead of giving answer immediately!!!
 
