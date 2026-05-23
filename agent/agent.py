@@ -45,6 +45,8 @@ from .utils import count_tokens_messages, hard_truncate_tail_tool_messages
 # ═══════════════════════════════════════════════════════════════
 
 _DEFAULT_CONDENSE_PROMPT = """\
+There is a conversation between a user and an agent. The user asked a question and the agent used tools to answer the question.
+Try to condense the conversation into a summary of the key information to help the agent work better.
 Extract key information from the conversation into four fields. \
 Call submit_condensed_summary with ALL four fields filled in.
 
@@ -432,27 +434,25 @@ class Agent:
 
         # Extract original question
         question = self._current_question
-        if not question:
-            raw = messages[1].get("content", "")
-            raw = re.sub(r"^Following is your previous progress:\n\n", "", raw)
-            raw = re.sub(r"^Original question:\s*", "", raw)
-            raw = re.sub(r"\n\nYour previous.*$", "", raw, flags=re.DOTALL)
-            question = raw.strip()
 
         analysis_context = self._preprocess_for_condense(messages)
         ctx_tokens = count_tokens_messages(self.tokenizer, [{"role": "user", "content": analysis_context}])
 
         condense_tools = build_condense_tool_specs()
 
+        condense_user_msg = (
+            f"Here is the user question:\n{question}\n\n"
+            f"Here is the agent history, condense it and use tools to submit your condense result:\n\n{analysis_context}"
+        )
         condense_messages = [
             {"role": "system", "content": self.condense_prompt},
-            {"role": "user", "content": f"Here is the agent history, condense it and use tools to submit your answer:\n\n{analysis_context}"},
+            {"role": "user", "content": condense_user_msg},
         ]
 
         # Record condense session
         session_msgs: List[Dict[str, Any]] = [
             {"role": "system", "content": self.condense_prompt},
-            {"role": "user", "content": f"Here is the agent history, condense it and use tools to submit your answer:\n\n{analysis_context}"},
+            {"role": "user", "content": condense_user_msg},
         ]
 
         analysis = ""
@@ -521,7 +521,10 @@ class Agent:
 
         summary_msg: Dict[str, Any] = {
             "role": "user",
-            "content": f"Following is your previous progress:\n\n{analysis}",
+            "content": (
+                f"{question}"
+                f"Following is your previous progress:\n\n{analysis}"
+            ),
         }
 
         condensed: List[Dict[str, Any]] = [
