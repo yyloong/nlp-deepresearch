@@ -148,7 +148,7 @@ def give_feedback_tool_spec() -> Dict[str, Any]:
                         ),
                     },
                 },
-                "required": ["is_correct", "reason", "error_type"],
+                "required": ["is_correct", "reason"],
             },
         },
     }
