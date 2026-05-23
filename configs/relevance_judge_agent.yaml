@@ -25,7 +25,7 @@ tool_config:
   search:
     use_subagent_summary: false
     search_k: 3
-    snippet_max_chars: 1200
+    snippet_max_tokens: 1200
 
 system_prompt: |
   You are a Document Relevance Judge. 

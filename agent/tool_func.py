@@ -17,7 +17,7 @@ import json
 import traceback
 from typing import Any, Callable, Dict, List, Optional
 
-from .browsecomp_searcher import BrowseCompBM25Searcher, snippetize
+from .browsecomp_searcher import BrowseCompBM25Searcher
 from .utils import count_tokens_messages, truncate_utf8_prefix_to_token_budget
 
 
@@ -53,7 +53,7 @@ class ToolRegistry:
 
         # Config overrides
         self._search_k: int = 5
-        self._snippet_max_chars: int = 1200
+        self._snippet_max_tokens: int = 600
         self._use_subagent_summary: bool = False
 
     # ── Setters for dependencies wired after construction ──
@@ -73,10 +73,17 @@ class ToolRegistry:
     def set_relevance_judge_agent(self, agent: Any) -> None:
         self._relevance_judge_agent = agent
 
-    def configure_search(self, search_k: int, snippet_max_chars: int, use_subagent_summary: bool) -> None:
+    def configure_search(self, search_k: int, snippet_max_tokens: int, use_subagent_summary: bool) -> None:
         self._search_k = search_k
-        self._snippet_max_chars = snippet_max_chars
+        self._snippet_max_tokens = snippet_max_tokens
         self._use_subagent_summary = use_subagent_summary
+
+    def _snippet(self, text: str) -> str:
+        """Token-based snippet truncation."""
+        tok = getattr(self._main_agent, 'tokenizer', None) if self._main_agent else None
+        if tok is not None:
+            return truncate_utf8_prefix_to_token_budget(tok, text, self._snippet_max_tokens)
+        return text[:self._snippet_max_tokens * 4]  # char fallback
 
     # ═══════════════════════════════════════════════════════════════
     # Main / Search Agent Tools
@@ -94,7 +101,7 @@ class ToolRegistry:
                 {
                     "docid": doc["docid"],
                     "score": doc["score"],
-                    "snippet": snippetize(doc["text"], self._snippet_max_chars),
+                    "snippet": self._snippet(doc["text"]),
                     "url": doc.get("url", ""),
                 }
                 for doc in docs
@@ -149,7 +156,7 @@ class ToolRegistry:
                     _tb.print_exc()
                     break
             print(f"    [sub] docid={doc['docid']}: all attempts failed, using snippet fallback", flush=True)
-            return {"docid": doc["docid"], "summary": snippetize(doc["text"], 300)}
+            return {"docid": doc["docid"], "summary": self._snippet(doc["text"])}
 
         tasks = [_process_one(d) for d in docs]
         results = await asyncio.gather(*tasks)
@@ -174,7 +181,7 @@ class ToolRegistry:
                 {
                     "docid": doc["docid"],
                     "score": doc["score"],
-                    "snippet": snippetize(doc["text"], self._snippet_max_chars),
+                    "snippet": self._snippet(doc["text"]),
                     "url": doc.get("url", ""),
                 }
                 for doc in docs
@@ -408,7 +415,7 @@ class ToolRegistry:
             {
                 "docid": doc["docid"],
                 "score": doc["score"],
-                "snippet": snippetize(doc["text"], self._snippet_max_chars),
+                "snippet": self._snippet(doc["text"]),
                 "url": doc.get("url", ""),
             }
             for doc in docs

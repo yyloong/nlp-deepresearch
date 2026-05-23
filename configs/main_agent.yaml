@@ -25,7 +25,7 @@ tool_config:
   search:
     use_subagent_summary: True  # whether to use sub-agent for summarizing search results
     search_k: 5
-    snippet_max_chars: 1200
+    snippet_max_tokens: 1200
   submit_answer:
     enable_verify: false
 

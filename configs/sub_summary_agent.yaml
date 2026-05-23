@@ -24,7 +24,7 @@ tool_config:
   search:
     use_subagent_summary: false
     search_k: 5
-    snippet_max_chars: 1200
+    snippet_max_tokens: 1200
 
 system_prompt: |
   Extract facts from the given document that are related to the query, even loosely. Report specific names, dates, places, and details found in the document. Do NOT just say 'nothing found'. If the document mentions any entity or fact that could be connected to the query's topic, report it. The query is a rough guide, not an exact match requirement.

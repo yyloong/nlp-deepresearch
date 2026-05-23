@@ -25,7 +25,7 @@ tool_config:
   search:
     use_subagent_summary: false
     search_k: 5
-    snippet_max_chars: 1200
+    snippet_max_tokens: 1200
 
 system_prompt: |
   You are a Verification Agent. Your job is to independently verify whether a proposed answer is correct by searching the document corpus. You have three tools: search (query only, no extra fields), get_document, and give_feedback.

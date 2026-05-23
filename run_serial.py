@@ -79,7 +79,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-tool-calls-per-turn", type=int,
                    default=int(os.environ.get("MAX_TOOL_CALLS", "1")))
     p.add_argument("--search-k", type=int, default=int(os.environ.get("SEARCH_K", "5")))
-    p.add_argument("--snippet-max-chars", type=int, default=1200)
+    p.add_argument("--snippet-max-tokens", type=int, default=600)
     p.add_argument("--eval-batch-size", type=int, default=1,
                    help="Eval batch size (default: 1 for serial eval)")
     p.add_argument("--eval-model", default=None, help="Eval model (defaults to --model)")
@@ -184,7 +184,7 @@ async def _main_async(args: argparse.Namespace) -> None:
             if key in cfg["tool_config"] or key in cfg.get("tools", []):
                 cfg["tool_config"].setdefault(key, {})
                 cfg["tool_config"][key]["search_k"] = args.search_k
-                cfg["tool_config"][key]["snippet_max_chars"] = args.snippet_max_chars
+                cfg["tool_config"][key]["snippet_max_tokens"] = args.snippet_max_tokens
         # Write patched config
         patched_path = f"/tmp/patched_{os.path.basename(config_path)}"
         with open(patched_path, "w", encoding="utf-8") as f:
@@ -200,7 +200,7 @@ async def _main_async(args: argparse.Namespace) -> None:
         cfg["temperature"] = args.temperature
         cfg.setdefault("tool_config", {}).setdefault("search", {})
         cfg["tool_config"]["search"]["search_k"] = args.search_k
-        cfg["tool_config"]["search"]["snippet_max_chars"] = args.snippet_max_chars
+        cfg["tool_config"]["search"]["snippet_max_tokens"] = args.snippet_max_tokens
         patched_path = f"/tmp/patched_{os.path.basename(config_path)}"
         with open(patched_path, "w", encoding="utf-8") as f:
             yaml.dump(cfg, f)
@@ -252,7 +252,7 @@ async def _main_async(args: argparse.Namespace) -> None:
                          main_cfg.get("tool_config", {}).get("search", {}).get("search_k", 5)))
     tool_registry.configure_search(
         search_k=_yaml_search_k,
-        snippet_max_chars=args.snippet_max_chars,
+        snippet_max_tokens=args.snippet_max_tokens,
         use_subagent_summary=_judge_use_subagent or use_subagent,
     )
 

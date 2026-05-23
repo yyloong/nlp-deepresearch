@@ -24,7 +24,7 @@ tool_config:
   search:
     use_subagent_summary: False
     search_k: 5
-    snippet_max_chars: 1200
+    snippet_max_tokens: 4096
   submit_answer:
     enable_verify: false
 

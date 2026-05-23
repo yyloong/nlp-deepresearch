@@ -24,7 +24,7 @@ tools:
 tool_config:
   smart_search:
     search_k: 10
-    snippet_max_chars: 1200
+    snippet_max_tokens: 1200
   submit_answer:
     enable_verify: False
 
