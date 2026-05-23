@@ -7,7 +7,7 @@ model: qwen_auto
 temperature: 0.0
 max_tokens: 4096
 max_context: 40960
-max_turn: 30
+max_turn: 10
 condense_token_threshold: 0.5
 enable_thinking: true
 max_tool_calls_per_turn: 1
@@ -22,7 +22,7 @@ tools:
 
 tool_config:
   search:
-    use_subagent_summary: False
+    use_subagent_summary: True
     search_k: 5
     snippet_max_tokens: 4096
   submit_answer:
@@ -62,5 +62,6 @@ system_prompt: |
   3. NEVER ASSUME AN ANSWER BEFORE SEARCHING.
   4. Use specific names/dates/titles from previous results to guide your next search.
   5. Multiple intermediate targets may satisfy the constraints. Do NOT get stuck on one.
+  6. Don't try to search the same query repeatedly,they will return the same results.
 
   IMPORTANT using submit_answer tool is the ONLY way to submit your answer.

@@ -26,7 +26,7 @@ tool_config:
     search_k: 10
     snippet_max_tokens: 1200
   submit_answer:
-    enable_verify: False
+    enable_verify: True
 
 system_prompt: |
   You are a Deep Research Agent. Your job is to answer complex questions by searching a document corpus. You have three tools: smart_search(query), get_document(docid), and submit_answer(answer, evidence). Every answer must be grounded in retrieved evidence.

@@ -602,7 +602,7 @@ class Agent:
                 })
                 self._trajectory.append({
                     "role": "user",
-                    "content": f"[LIMIT] Turn limit reached, nudging to call {self.end_tool}.",
+                    "content": f"You have reached your max turn,now you need to call {self.end_tool} to submit your answer immediately.",
                 })
 
             # ── Pre-call condense ──

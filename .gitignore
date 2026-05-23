@@ -1,4 +1,5 @@
 runs/
+distill/
 
 # Local BM25 / SQLite indexes (often >100MB; do not push to GitHub)
 indexes/*.sqlite

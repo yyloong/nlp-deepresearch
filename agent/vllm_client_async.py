@@ -126,7 +126,6 @@ class VLLMClientAsync:
         }
         if tools is not None:
             payload["tools"] = tools
-        # Skip tool_choice for remote APIs (litellm proxies may crash on it)
         if tool_choice is not None and tool_choice != "auto":
             payload["tool_choice"] = tool_choice
         elif tool_choice == "auto" and self._is_local:
