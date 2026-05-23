@@ -9,3 +9,4 @@ indexes/*.sqlite-wal
 __pycache__/
 *.pyc
 agent/__pycache__/
+train/sft_data.jsonl
