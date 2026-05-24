@@ -25,7 +25,7 @@ tool_config:
   smart_search:
     search_k: 10
   submit_answer:
-    enable_verify: true
+    enable_verify: False
 
 system_prompt: |
   You are a Deep Research Agent. Your job is to answer complex questions by searching a document corpus. You have three tools: smart_search(query), get_document(docid), and submit_answer(answer, evidence). Every answer must be grounded in retrieved evidence.

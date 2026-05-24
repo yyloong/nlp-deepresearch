@@ -144,7 +144,6 @@ async def _main_async(args: argparse.Namespace) -> None:
     main_agent = _make_agent(args.agent_config)
     tool_registry = ToolRegistry(searcher=searcher, agent_factory=agent_factory, main_agent=main_agent)
     main_agent.tool_registry = tool_registry.build_registry(main_agent._tool_names, main_agent._tool_config)
-    tool_registry.set_main_agent(main_agent)
 
     # ── Output setup ──
     ts = time.strftime("%Y%m%d_%H%M%S")
