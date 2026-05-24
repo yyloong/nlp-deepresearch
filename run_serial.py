@@ -258,6 +258,16 @@ async def _main_async(args: argparse.Namespace) -> None:
             }
             records.append(rec)
 
+            # Update trajectory file with predicted answer
+            traj_path = Path(traj_dir) / f"{qid}.json"
+            if traj_path.exists():
+                with open(traj_path) as f:
+                    traj_data = json.load(f)
+                traj_data["predicted_answer"] = answer
+                traj_data["status"] = finish_reason
+                with open(traj_path, "w") as f:
+                    json.dump(traj_data, f, ensure_ascii=False, indent=2)
+
             main_agent.reset_state()
             if verify_agent is not None:
                 verify_agent.reset_state()
