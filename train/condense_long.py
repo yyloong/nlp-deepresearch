@@ -279,10 +279,22 @@ def extract_question(messages: List[Dict]) -> str:
     """
     提取原始问题（完整内容，不截断）。
     SFT 数据的第一条 user message 即为原始问题，与框架中 self._current_question 一致。
+    原始数据集中部分 user message 开头内嵌了 system prompt 模板，需剥离。
     """
     for m in messages:
         if m["role"] == "user":
-            return (m.get("content") or "").strip()
+            content = (m.get("content") or "").strip()
+            # 原始数据集有些样本把 system instruction 内嵌在 user 消息里，格式为：
+            # 'The user: "You are a deep research agent. ...\n\nQuestion: ...'
+            # 或 'We need to parse ... The user says: "You are a deep research agent...'
+            # 剥离这段前缀，只保留实际问题
+            import re
+            # 尝试找到 "Question:" 或 question 引号内的实际内容
+            # 模式1: 内容里有 "Question:\n" 或 "Question: "
+            m_q = re.search(r'Question:\s*["\']?(.*)', content, re.DOTALL | re.IGNORECASE)
+            if m_q and 'You are a deep research' in content[:500]:
+                return m_q.group(1).strip().lstrip('"').rstrip('"').strip()
+            return content
     return ""
 
 
@@ -490,9 +502,16 @@ async def main(args: argparse.Namespace) -> None:
         f"already short: {len(samples) - len(long_indices)}"
     )
 
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
     if not long_indices:
         logger.info("Nothing to condense, writing output as-is.")
-        all_output = samples
+        with open(out_path, "w", encoding="utf-8") as f:
+            for s in samples:
+                f.write(json.dumps(s, ensure_ascii=False) + "\n")
+        logger.info(f"Written {len(samples)} samples to {out_path}")
+        return
     else:
         client    = VLLMClientAsync(
             base_url=args.base_url,
@@ -501,7 +520,22 @@ async def main(args: argparse.Namespace) -> None:
         )
         semaphore = asyncio.Semaphore(args.concurrency)
 
-        async def _process(i: int) -> tuple[int, List[List[Dict]], int]:
+        # 短样本先写入输出文件
+        long_set = set(long_indices)
+        short_samples = [s for i, s in enumerate(samples) if i not in long_set]
+        n_short = len(short_samples)
+        with open(out_path, "w", encoding="utf-8") as f:
+            for s in short_samples:
+                f.write(json.dumps(s, ensure_ascii=False) + "\n")
+        logger.info(f"Pre-wrote {n_short} short samples to {out_path}")
+
+        # 长样本实时处理、实时写入
+        total_condensed = 0
+        n_done = 0
+        pbar = tqdm_asyncio(total=len(long_indices), desc="Condensing", unit="sample")
+
+        async def _process_and_write(i: int, out_f) -> None:
+            nonlocal total_condensed, n_done
             orig_tokens = token_counts[i]
             versions    = await process_sample(
                 client, args.model, tokenizer,
@@ -510,27 +544,26 @@ async def main(args: argparse.Namespace) -> None:
                 args.condense_max_tokens,
                 semaphore,
                 api_context_limit=args.api_context_limit,
-                initial_tokens=orig_tokens,  # 避免第一轮重复 tokenize 整个对话
+                initial_tokens=orig_tokens,
             )
-            return i, versions, orig_tokens
-
-        tasks   = [_process(i) for i in long_indices]
-        results = await tqdm_asyncio.gather(*tasks, desc="Condensing", unit="sample")
-
-        long_set = set(long_indices)
-        # 短样本直接保留
-        all_output: List[Dict] = [s for i, s in enumerate(samples) if i not in long_set]
-        n_short = len(all_output)
-
-        # 长样本：用所有 versions 完全替换原始样本（不保留原始超长版本）
-        total_condensed = 0
-        for i, versions, orig_tok in results:
-            if not versions:
-                continue
             meta = {k: samples[i][k] for k in samples[i] if k != "messages"}
+            n_new = 0
             for v in versions:
-                all_output.append({"messages": v, **meta})
-                total_condensed += 1
+                out_f.write(json.dumps({"messages": v, **meta}, ensure_ascii=False) + "\n")
+                out_f.flush()
+                n_new += 1
+            total_condensed += n_new
+            n_done += 1
+            pbar.update(1)
+            if n_done % 50 == 0 or n_new > 0:
+                logger.info(
+                    f"[{n_done}/{len(long_indices)}] sample {i}: "
+                    f"+{n_new} versions → total condensed so far: {total_condensed}"
+                )
+
+        with open(out_path, "a", encoding="utf-8") as out_f:
+            await asyncio.gather(*[_process_and_write(i, out_f) for i in long_indices])
+        pbar.close()
 
         logger.info(
             f"Condense complete: {len(long_indices)} long samples → "
@@ -539,25 +572,11 @@ async def main(args: argparse.Namespace) -> None:
         )
         logger.info(
             f"Output composition: {n_short} short (kept as-is) + "
-            f"{total_condensed} condensed = {len(all_output)} total"
+            f"{total_condensed} condensed = {n_short + total_condensed} total"
         )
+        all_output_count = n_short + total_condensed
 
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        for s in all_output:
-            f.write(json.dumps(s, ensure_ascii=False) + "\n")
-    logger.info(f"Written {len(all_output)} samples to {out_path}")
-
-    # 压缩后统计
-    still_long = sum(
-        1 for s in all_output
-        if count_tokens(tokenizer, s["messages"]) > args.target_length
-    )
-    logger.info(
-        f"Still exceeding {args.target_length} tokens: "
-        f"{still_long} / {len(all_output)}"
-    )
+    logger.info(f"Written {all_output_count} samples to {out_path}")
 
 
 if __name__ == "__main__":
