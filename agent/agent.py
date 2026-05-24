@@ -377,167 +377,76 @@ class Agent:
     # Context condensation
     # ═══════════════════════════════════════════════════════════════
 
-    def _preprocess_for_condense(self, messages: List[Dict[str, Any]]) -> str:
-        """Strip think blocks and tool-call markers from messages before condensing.
-
-        Returns a plain-text analysis context string.
-        """
-        analysis_lines: List[str] = []
-        for m in messages[2:]:  # skip system and first user message
-            role = m.get("role", "?")
-            content = str(m.get("content", "") or "")
-
-            # Strip condensation artifacts
-            content = re.sub(r"\[PROGRESS SUMMARY[^\]]*\]", "", content)
-            content = re.sub(r"\[VERIFY PROGRESS SUMMARY\]\n?", "", content)
-            content = re.sub(r"^Following is your previous progress:\n\n", "", content)
-            content = re.sub(r"^Original question:.*?\n\n", "", content)
-
-            # Replace think blocks with neutral format
-            content = re.sub(r"<think>(.*?)</think>", r"[reasoning]\n\1\n[/reasoning]", content, flags=re.DOTALL)
-            content = re.sub(r"<think>(.*)$", r"[reasoning]\n\1\n[/reasoning]", content, flags=re.DOTALL)
-            content = re.sub(r"\[TOOL_CALL:\s*(\w+)\((.*?)\)\s*\]", r"[tool \1: \2]", content)
-
-            content = content.strip()
-            if not content:
-                continue
-
-            if role == "tool":
-                content_tokens = count_tokens_messages(self.tokenizer, [{"role": "user", "content": content}])
-                if content_tokens > 1500:
-                    ids = self.tokenizer.encode(content, add_special_tokens=False)
-                    if len(ids) > 1500:
-                        content = self.tokenizer.decode(ids[:1500], skip_special_tokens=True) + "\n...[truncated]"
-
-            analysis_lines.append(f"[{role}]: {content}")
-
-        analysis_context = "\n\n".join(analysis_lines)
-
-        # Truncate to max_transcript tokens
-        ctx_tokens = count_tokens_messages(self.tokenizer, [{"role": "user", "content": analysis_context}])
-        max_transcript = 25000
-        if ctx_tokens > max_transcript:
-            ids = self.tokenizer.encode(analysis_context, add_special_tokens=False)
-            analysis_context = self.tokenizer.decode(ids[:max_transcript], skip_special_tokens=True) + "\n\n...[truncated]"
-
-        return analysis_context
-
     async def condense(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Compress conversation history into a structured progress summary.
+        """Self-condense: ask the model to summarize its own progress.
 
-        Preprocesses messages to strip internal format markers, then calls
-        chat_with_tool_retry with the condense prompt + submit_condensed_summary tool.
+        Injects a user message asking the model to summarize, then the model
+        calls submit_condensed_summary. The model sees its own context naturally
+        -- no preprocessing of think blocks or tool calls needed.
         Returns ``[system_msg, summary_user_msg]``.
         """
         if len(messages) <= 4:
             return messages
 
-        # Extract original question
         question = self._current_question
+        before = count_tokens_messages(self.tokenizer, messages)
 
-        analysis_context = self._preprocess_for_condense(messages)
-        ctx_tokens = count_tokens_messages(self.tokenizer, [{"role": "user", "content": analysis_context}])
-
+        condense_nudge = {
+            "role": "user",
+            "content": (
+                "Your context has been long so far"
+                "Please summarize your progress for better perform in the following turn. "
+                "Report what tools you used, your key findings with docid references, "
+                "your reasoning strategy, and what remains to be found. "
+                "You should call submit_condensed_summary to submit your summary."
+            ),
+        }
+        condense_msgs = list(messages) + [condense_nudge]
         condense_tools = build_condense_tool_specs()
 
-        condense_user_msg = (
-            f"Here is the user question:\n{question}\n\n"
-            f"Here is the agent history, condense it and use tools to submit your condense result:\n\n{analysis_context}"
-        )
-        condense_messages = [
-            {"role": "system", "content": self.condense_prompt},
-            {"role": "user", "content": condense_user_msg},
-        ]
-
-        # Record condense session
-        session_msgs: List[Dict[str, Any]] = [
-            {"role": "system", "content": self.condense_prompt},
-            {"role": "user", "content": condense_user_msg},
-        ]
+        print(f"  [condense] self-condense (context~{before} tokens)...", flush=True)
 
         analysis = ""
-        print(f"  [condense] calling model for analysis (context~{ctx_tokens} tokens)...", flush=True)
+        session_msgs: List[Dict[str, Any]] = [{"role": "system", "content": self.condense_prompt}]
 
-        for attempt in range(2):
-            try:
-                resp = await self.chat_with_tool_retry(condense_messages, condense_tools, "auto")
-                tc = resp.get("tool_calls")
-                if tc:
-                    for t in tc:
-                        fn = t.get("function", {})
-                        if fn.get("name") == "submit_condensed_summary":
-                            try:
-                                args = json.loads(fn.get("arguments", "{}"))
-                                missing = [k for k in ("tool_summary", "key_thoughts", "key_findings", "remaining_to_find") if not args.get(k)]
-                                if missing:
-                                    if attempt == 0:
-                                        nudge = {
-                                            "role": "user",
-                                            "content": f"Missing required fields in submit_condensed_summary: {', '.join(missing)}. Please provide ALL required fields and try again.",
-                                        }
-                                        condense_messages.append(nudge)
-                                        session_msgs.append(nudge)
-                                    continue
-                                parts = []
-                                if args.get("tool_summary"):
-                                    parts.append(args["tool_summary"])
-                                parts.append(f"Your previous analysis: {args['key_thoughts']}")
-                                parts.append(f"Your previous findings:\n{args['key_findings']}")
-                                parts.append(f"What you still need to find: {args['remaining_to_find']}")
-                                analysis = "\n\n".join(parts)
-                            except (json.JSONDecodeError, TypeError):
-                                if attempt == 0:
-                                    nudge = {
-                                        "role": "user",
-                                        "content": "Invalid JSON in submit_condensed_summary arguments. Please provide valid JSON with all required fields.",
-                                    }
-                                    condense_messages.append(nudge)
-                                    session_msgs.append(nudge)
-                if not analysis and not tc:
-                    raw_text = resp.get("content", "")
-                    raw_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL)
-                    raw_text = re.sub(r"<think>.*$", "", raw_text, flags=re.DOTALL)
-                    analysis = raw_text.strip()
-                if analysis:
-                    analysis_tokens = len(self.tokenizer.encode(analysis))
-                    print(f"  [condense] model response: {analysis_tokens} tokens", flush=True)
-                    session_msgs.append(resp)
-                    break
-                if attempt == 0 and not analysis:
-                    nudge = {
-                        "role": "user",
-                        "content": "You must call submit_condensed_summary to provide your analysis. Plain text is not accepted.",
-                    }
-                    condense_messages.append(nudge)
-                    session_msgs.append(nudge)
-            except Exception:
-                if attempt == 1:
-                    analysis = "(analysis unavailable -- model error)"
-                else:
-                    raise
+        try:
+            resp = await self.chat_with_tool_retry(condense_msgs, condense_tools, "auto")
+        except Exception:
+            analysis = "(condense failed)"
+        else:
+            for t in (resp.get("tool_calls") or []):
+                fn = t.get("function", {})
+                if fn.get("name") == "submit_condensed_summary":
+                    try:
+                        args = json.loads(fn.get("arguments", "{}"))
+                        parts = [v for k in ("tool_summary", "key_thoughts", "key_findings", "remaining_to_find")
+                                 if (v := args.get(k, "").strip())]
+                        analysis = "\n\n".join(parts)
+                    except Exception:
+                        pass
+            if not analysis:
+                raw = resp.get("content", "") or ""
+                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+                analysis = raw or "(progress summary unavailable)"
 
-        if not analysis:
-            analysis = "(progress summary unavailable)"
+        session_msgs.append(resp)
 
         summary_msg: Dict[str, Any] = {
             "role": "user",
             "content": (
-                f"{question}"
+                f"{question}\n\n"
                 f"Following is your previous progress:\n\n{analysis}"
             ),
         }
 
-        condensed: List[Dict[str, Any]] = [
-            messages[0],
-            summary_msg,
-        ]
+        condensed: List[Dict[str, Any]] = [messages[0], summary_msg]
 
-        before = count_tokens_messages(self.tokenizer, messages)
         after = count_tokens_messages(self.tokenizer, condensed)
         print(f"  [condense] {before} -> {after} tokens ({len(messages)} -> {len(condensed)} messages)", flush=True)
 
         self._condense_sessions.append({"messages": session_msgs})
         return condensed
+
 
     # ═══════════════════════════════════════════════════════════════
     # Main agent loop
