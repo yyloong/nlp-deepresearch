@@ -44,61 +44,6 @@ from .utils import count_tokens_messages, hard_truncate_tail_tool_messages
 # Default condense prompts (override-able via YAML)
 # ═══════════════════════════════════════════════════════════════
 
-_DEFAULT_CONDENSE_PROMPT = """\
-There is a conversation between a user and an agent. The user asked a question and the agent used tools to answer the question.
-Try to condense the conversation into a summary of the key information to help the agent work better.
-Extract key information from the conversation into four fields. \
-Call submit_condensed_summary with ALL four fields filled in.
-
-tool_summary: Summarize what tools were used and what was found. \
-Deduplicate repeated searches -- mention each unique query once with its top results. \
-List each unique document read with key content extracted (not just docid). \
-Summarize each unique answer submission and the feedback received. \
-Be concise but include specific names, docids, and key details from results.
-
-key_thoughts: The reasoning strategy -- what hypotheses were being tested, \
-what logical chains were being followed, what clue connections were being explored. \
-Capture the thinking process so dead ends are not repeated.
-
-key_findings: What FACTS were actually found in documents. Include specific names, \
-dates, numbers, titles, relationships, quotes with docid references. \
-Include both supporting and contradictory evidence.
-
-remaining_to_find: Which specific clues from the question are still unsolved. \
-Be precise -- not "identify the club" but "find club name starting with B, \
-4 syllables, linked to Latin music, connected to surname Franzini".
-
-RULES:
-- Be dense: every sentence should contain a useful fact or insight
-- If an answer was rejected, extract what was learned from the feedback
-"""
-
-_DEFAULT_VERIFY_CONDENSE_PROMPT = """\
-Extract key information from the verification conversation into four fields. \
-Call submit_condensed_summary with ALL four fields filled in.
-
-tool_summary: Summarize what searches were performed (deduplicated), \
-what documents were read with key content, and what feedback was given. \
-Be concise but include specific queries, docids, and key details.
-
-key_thoughts: The verification strategy -- why those searches were chosen, \
-what hypotheses about the answer were being tested.
-
-key_findings: Key evidence found in documents with docid references. \
-Which claims are supported, which are contradicted, which lack evidence.
-
-remaining_to_find: What still needs to be verified -- specific claims \
-not yet checked, documents not yet read, angles not yet explored.
-
-RULES:
-- Be dense: every sentence should contain a useful fact or insight
-"""
-
-
-# ═══════════════════════════════════════════════════════════════
-# Agent class
-# ═══════════════════════════════════════════════════════════════
-
 class Agent:
     """Unified agent for all roles: main research, search, verify, sub_summary.
 
@@ -142,10 +87,6 @@ class Agent:
 
         # Prompts
         self.system_prompt: str = cfg.get("system_prompt", "").strip()
-        self.condense_prompt: str = (
-            cfg.get("condense_prompt", "").strip()
-            or (_DEFAULT_VERIFY_CONDENSE_PROMPT if self.agent_type == "verify" else _DEFAULT_CONDENSE_PROMPT)
-        )
 
         # Tool setup
         self.end_tool: str = cfg.get("end_tool", "submit_answer")
@@ -159,7 +100,6 @@ class Agent:
 
         # Interpolate placeholders in prompt
         self.system_prompt = self.system_prompt.replace("{search_k}", str(self.search_k))
-        self.condense_prompt = self.condense_prompt.replace("{search_k}", str(self.search_k))
 
         # Extra payload for model calls
         self.extra_payload: Dict[str, Any] = {}
@@ -407,7 +347,7 @@ class Agent:
         print(f"  [condense] self-condense (context~{before} tokens)...", flush=True)
 
         analysis = ""
-        session_msgs: List[Dict[str, Any]] = [{"role": "system", "content": self.condense_prompt}]
+        session_msgs: List[Dict[str, Any]] = []
 
         try:
             resp = await self.chat_with_tool_retry(condense_msgs, condense_tools, "auto")
