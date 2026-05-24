@@ -60,7 +60,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-eval", action="store_true")
     p.add_argument("--eval-only", type=str, default=None,
                    help="Only eval existing submission.jsonl")
-    p.add_argument("--no-verify", action="store_true")
     p.add_argument("--agent-config", default="configs/main_agent_smart.yaml",
                    help="Path to main agent YAML config")
     return p
@@ -140,51 +139,11 @@ async def _main_async(args: argparse.Namespace) -> None:
     def agent_factory(config_path: str) -> Agent:
         return _make_agent(config_path, override_model=True)
 
-    # ── ToolRegistry ──
-    tool_registry = ToolRegistry(searcher=searcher, agent_factory=agent_factory)
-
-    # ── Read main agent config ──
-    main_cfg = _load_yaml_config(args.agent_config)
-    _search_cfg = main_cfg.get("tool_config", {}).get("smart_search") or main_cfg.get("tool_config", {}).get("search", {})
-
-    # ── Sub summary agent (if needed) ──
-    use_subagent = bool(main_cfg.get("tool_config", {}).get("search", {}).get("use_subagent_summary", False))
-    _judge_use_subagent = bool(_load_yaml_config("configs/relevance_judge_agent.yaml")
-                               .get("tool_config", {}).get("search", {}).get("use_subagent_summary", False))
-    sub_summary_agent = None
-    if use_subagent or _judge_use_subagent:
-        sub_summary_agent = agent_factory("configs/sub_summary_agent.yaml")
-        sub_summary_agent.tool_registry = tool_registry.build_registry("sub_summary")
-        tool_registry.set_sub_summary_agent(sub_summary_agent)
-
-    # ── Verify agent ──
-    verify_agent = None
-    if not args.no_verify:
-        verify_agent = _make_agent("configs/verify_agent.yaml")
-        verify_agent.tool_registry = tool_registry.build_registry("verify")
-        tool_registry.set_verify_agent(verify_agent)
-
-    # ── Surrender check agent ──
-    sc_agent = _make_agent("configs/surrender_check_agent.yaml")
-    sc_agent.tool_registry = tool_registry.build_registry("surrender_check")
-    tool_registry.set_surrender_check_agent(sc_agent)
-
-    # ── Relevance judge agent ──
-    judge_agent = agent_factory("configs/relevance_judge_agent.yaml")
-    judge_agent.tool_registry = tool_registry.build_registry("relevance_judge")
-    tool_registry.set_relevance_judge_agent(judge_agent)
-
-    # ── Configure search from YAML ──
-    tool_registry.configure_search(
-        search_k=int(_search_cfg.get("search_k", 5)),
-        snippet_max_tokens=int(_search_cfg.get("snippet_max_tokens", 600)),
-        use_subagent_summary=_judge_use_subagent or use_subagent,
-    )
-
-    # ── Main agent ──
-    enable_verify = bool(main_cfg.get("tool_config", {}).get("submit_answer", {}).get("enable_verify", False))
+    # ── ToolRegistry with agent_factory ──
+    # ── Main agent — created first so ToolRegistry can reference it ──
     main_agent = _make_agent(args.agent_config)
-    main_agent.tool_registry = tool_registry.build_registry("main", enable_verify=enable_verify)
+    tool_registry = ToolRegistry(searcher=searcher, agent_factory=agent_factory, main_agent=main_agent)
+    main_agent.tool_registry = tool_registry.build_registry(main_agent._tool_names, main_agent._tool_config)
     tool_registry.set_main_agent(main_agent)
 
     # ── Output setup ──
@@ -217,9 +176,9 @@ async def _main_async(args: argparse.Namespace) -> None:
 
             main_agent.trajectory_dir = traj_dir
             main_agent.name = qid
-            if verify_agent is not None:
-                verify_agent.trajectory_dir = traj_dir
-                verify_agent.name = f"{qid}_verify"
+            if tool_registry._verify_agent is not None:
+                tool_registry._verify_agent.trajectory_dir = traj_dir
+                tool_registry._verify_agent.name = f"{qid}_verify"
 
             traj = await main_agent.run(question)
             answer = extract_final_answer(traj) or ""
@@ -269,8 +228,8 @@ async def _main_async(args: argparse.Namespace) -> None:
                     json.dump(traj_data, f, ensure_ascii=False, indent=2)
 
             main_agent.reset_state()
-            if verify_agent is not None:
-                verify_agent.reset_state()
+            if tool_registry._verify_agent is not None:
+                tool_registry._verify_agent.reset_state()
 
             ans_preview = answer[:200].replace("\n", " ")
             if len(answer) > 200:

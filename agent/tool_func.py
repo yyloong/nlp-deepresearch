@@ -40,43 +40,29 @@ class ToolRegistry:
         *,
         searcher: BrowseCompBM25Searcher,
         agent_factory: Optional[Callable[..., Any]] = None,
+        main_agent: Any = None,
     ) -> None:
         self._searcher = searcher
         self._agent_factory = agent_factory
+        self._main_agent = main_agent
 
-        # These are set after construction by the orchestrator
-        self._verify_agent: Optional[Any] = None
-        self._sub_summary_agent: Optional[Any] = None
-        self._main_agent: Optional[Any] = None
-        self._surrender_check_agent: Optional[Any] = None
-        self._relevance_judge_agent: Optional[Any] = None
+        if agent_factory is not None:
+            self._sub_summary_agent = agent_factory("configs/sub_summary_agent.yaml")
+            self._sub_summary_agent.tool_registry = self.build_registry(self._sub_summary_agent._tool_names)
+            self._verify_agent = agent_factory("configs/verify_agent.yaml")
+            self._verify_agent.tool_registry = self.build_registry(self._verify_agent._tool_names)
+            self._surrender_check_agent = agent_factory("configs/surrender_check_agent.yaml")
+            self._surrender_check_agent.tool_registry = self.build_registry(self._surrender_check_agent._tool_names)
+            self._relevance_judge_agent = agent_factory("configs/relevance_judge_agent.yaml")
+            self._relevance_judge_agent.tool_registry = self.build_registry(self._relevance_judge_agent._tool_names)
+        else:
+            self._sub_summary_agent = self._verify_agent = None
+            self._surrender_check_agent = self._relevance_judge_agent = None
 
         # Config overrides
         self._search_k: int = 5
         self._snippet_max_tokens: int = 600
         self._use_subagent_summary: bool = False
-
-    # ── Setters for dependencies wired after construction ──
-
-    def set_verify_agent(self, agent: Any) -> None:
-        self._verify_agent = agent
-
-    def set_sub_summary_agent(self, agent: Any) -> None:
-        self._sub_summary_agent = agent
-
-    def set_main_agent(self, agent: Any) -> None:
-        self._main_agent = agent
-
-    def set_surrender_check_agent(self, agent: Any) -> None:
-        self._surrender_check_agent = agent
-
-    def set_relevance_judge_agent(self, agent: Any) -> None:
-        self._relevance_judge_agent = agent
-
-    def configure_search(self, search_k: int, snippet_max_tokens: int, use_subagent_summary: bool) -> None:
-        self._search_k = search_k
-        self._snippet_max_tokens = snippet_max_tokens
-        self._use_subagent_summary = use_subagent_summary
 
     def _snippet(self, text: str) -> str:
         """Token-based snippet truncation."""
@@ -194,7 +180,7 @@ class ToolRegistry:
         async def _judge_one(doc: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
             try:
                 judge = self._agent_factory("configs/relevance_judge_agent.yaml")
-                judge.tool_registry = self.build_registry("relevance_judge")
+                judge.tool_registry = self.build_registry(judge._tool_names)
                 if self._main_agent is not None and self._main_agent.trajectory_dir:
                     judge.trajectory_dir = self._main_agent.trajectory_dir
                     judge.name = f"judge_{doc['docid']}"
@@ -299,7 +285,7 @@ class ToolRegistry:
         async def _run_one(question: str, idx: int) -> Dict[str, Any]:
             try:
                 agent = self._agent_factory("configs/search_agent.yaml")
-                agent.tool_registry = self.build_registry("search", enable_verify=False)
+                agent.tool_registry = self.build_registry(agent._tool_names)
                 if self._main_agent is not None and self._main_agent.trajectory_dir:
                     agent.trajectory_dir = self._main_agent.trajectory_dir
                     agent.name = f"subagent_{idx}"
@@ -406,22 +392,6 @@ class ToolRegistry:
     # Verify Agent Tools
     # ═══════════════════════════════════════════════════════════════
 
-    async def verify_search(self, query: str) -> List[Dict[str, Any]]:
-        """Simplified search for verify agent (no found/history_found fields)."""
-        print(f"    [verify-search] query='{query}' k={self._search_k}", flush=True)
-        docs = self._searcher.search(query, k=self._search_k)
-        print(f"    [verify-search] found {len(docs)} docs", flush=True)
-        results = [
-            {
-                "docid": doc["docid"],
-                "score": doc["score"],
-                "snippet": self._snippet(doc["text"]),
-                "url": doc.get("url", ""),
-            }
-            for doc in docs
-        ]
-        return results
-
     def give_feedback(self, is_correct: bool, reason: str, error_type: str = "") -> Dict[str, Any]:
         """Called by verify agent to report verification verdict."""
         rejection_nudge = ""
@@ -442,55 +412,34 @@ class ToolRegistry:
         }
 
     # ═══════════════════════════════════════════════════════════════
-    # Registry builders — return {tool_name: callable} per agent type
+    # Registry builder
     # ═══════════════════════════════════════════════════════════════
 
-    def build_registry(self, agent_type: str, *, enable_verify: bool = False) -> Dict[str, Callable[..., Any]]:
-        """Return a dict mapping tool names to bound callables for the given agent type.
+    def build_registry(
+        self,
+        tool_names: List[str],
+        tool_config: Dict[str, Any] = None,
+    ) -> Dict[str, Callable[..., Any]]:
+        """Return ``{tool_name: callable}``. Reads enable_verify and use_subagent from tool_config."""
+        if tool_config:
+            _sa_cfg = tool_config.get("submit_answer", {})
+            self._enable_verify = bool(_sa_cfg.get("enable_verify", False))
+            _search_cfg = tool_config.get("search", {})
+            self._use_subagent_summary = bool(_search_cfg.get("use_subagent_summary", False))
 
-        Parameters
-        ----------
-        agent_type : str
-            The type of agent ("main", "search", "verify", "sub_summary", "surrender_check").
-        enable_verify : bool
-            If True, submit_answer triggers the verify agent. If False, it is a pass-through.
-        """
-        if agent_type == "main":
-            return {
-                "smart_search": self.smart_search,
-                "search": self.search,
-                "get_document": self.get_document,
-                "call_subagents": self.call_subagents,
-                "submit_answer": self.submit_answer if enable_verify else self._submit_answer_pass_through,
-            }
-        elif agent_type == "search":
-            return {
-                "search": self.search,
-                "get_document": self.get_document,
-                "submit_answer": self.submit_answer if enable_verify else self._submit_answer_pass_through,
-            }
-        elif agent_type == "verify":
-            return {
-                "search": self.verify_search,
-                "get_document": self.get_document,
-                "give_feedback": self.give_feedback,
-            }
-        elif agent_type == "sub_summary":
-            return {
-                "submit_summary": self._submit_summary_impl,
-            }
-        elif agent_type == "relevance_judge":
-            return {
-                "search": self.search,
-                "get_document": self.get_document,
-                "judge_relevance": self._judge_relevance_impl,
-            }
-        elif agent_type == "surrender_check":
-            return {
-                "report_surrender_verdict": self._report_surrender_verdict_impl,
-            }
-        else:
-            raise ValueError(f"Unknown agent_type: {agent_type}")
+        _enable = getattr(self, '_enable_verify', False)
+        _all: Dict[str, Any] = {
+            "search": self.search,
+            "smart_search": self.smart_search,
+            "get_document": self.get_document,
+            "call_subagents": self.call_subagents,
+            "submit_answer": self.submit_answer if _enable else self._submit_answer_pass_through,
+            "give_feedback": self.give_feedback,
+            "submit_summary": self._submit_summary_impl,
+            "judge_relevance": self._judge_relevance_impl,
+            "report_surrender_verdict": self._report_surrender_verdict_impl,
+        }
+        return {k: _all[k] for k in tool_names if k in _all}
 
     async def _submit_answer_pass_through(self, answer: str, evidence: str) -> Dict[str, Any]:
         """Pass-through submit_answer for search agents — no verification."""
