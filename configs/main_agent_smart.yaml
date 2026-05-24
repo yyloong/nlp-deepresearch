@@ -6,9 +6,9 @@ agent_type: main
 
 model: qwen_auto
 temperature: 0.0
-max_tokens: 10240
+max_tokens: 4096
 max_context: 40960
-max_turn: 20
+max_turn: 30
 condense_token_threshold: 0.5
 enable_thinking: true
 max_tool_calls_per_turn: 1
@@ -25,7 +25,7 @@ tool_config:
   smart_search:
     search_k: 10
   submit_answer:
-    enable_verify: False
+    enable_verify: True
 
 system_prompt: |
   You are a Deep Research Agent. Your job is to answer complex questions by searching a document corpus. You have three tools: smart_search(query), get_document(docid), and submit_answer(answer, evidence). Every answer must be grounded in retrieved evidence.

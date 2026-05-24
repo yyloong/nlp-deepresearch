@@ -341,8 +341,17 @@ class Agent:
                 if fn.get("name") == "submit_condensed_summary":
                     try:
                         args = json.loads(fn.get("arguments", "{}"))
-                        parts = [v for k in ("tool_summary", "key_thoughts", "key_findings", "remaining_to_find")
-                                 if (v := args.get(k, "").strip())]
+                        _LABELS = [
+                            ("tool_summary",       "### Tools & Documents"),
+                            ("key_thoughts",       "### Reasoning"),
+                            ("key_findings",       "### Key Findings"),
+                            ("remaining_to_find",  "### Remaining"),
+                        ]
+                        parts = [
+                            f"{label}\n{args[k].strip()}"
+                            for k, label in _LABELS
+                            if args.get(k, "").strip()
+                        ]
                         analysis = "\n\n".join(parts)
                     except Exception:
                         pass

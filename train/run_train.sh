@@ -13,12 +13,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # ── 基础配置（按需修改）────────────────────────────────────────────────────
-MODEL_PATH="/path/to/Qwen3-8B"          # 模型路径
+MODEL_PATH="Qwen/Qwen3-8B"          # 模型路径
 DATA_PATH="${SCRIPT_DIR}/sft_data.jsonl" # 转换后的训练数据
 OUTPUT_DIR="${SCRIPT_DIR}/output"
 
 # ── 训练超参 ────────────────────────────────────────────────────────────────
-MAX_LENGTH=32768
+MAX_LENGTH=16384
 EPOCHS=3
 BATCH_SIZE=1                            # 单卡 per-device batch size
 GRAD_ACC=16                             # 等效 global batch = 16
@@ -48,6 +48,10 @@ if [ "$DEVICE" = "auto" ]; then
         DEVICE="gpu"
     fi
 fi
+
+# ── 显存优化环境变量 ────────────────────────────────────────────────────────
+# 减少 PyTorch 显存碎片，对长序列训练尤为重要
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
 
 echo "=================================================="
 echo "  Device : ${DEVICE}"
@@ -90,9 +94,10 @@ if [ "$DEVICE" = "gpu" ]; then
         --gradient_accumulation_steps "$GRAD_ACC"  \
         --learning_rate     "$LR"                  \
         --lr_scheduler_type "$LR_SCHEDULER"        \
+        --drop_long         True                   \
         --warmup_ratio      "$WARMUP_RATIO"        \
         --weight_decay      "$WEIGHT_DECAY"        \
-        --bf16              True                   \
+        --bf16              False                  \
         --gradient_checkpointing True              \
         --save_strategy     steps                  \
         --save_steps        "$SAVE_STEPS"          \
@@ -133,7 +138,7 @@ elif [ "$DEVICE" = "npu" ]; then
         --lr_scheduler_type "$LR_SCHEDULER"        \
         --warmup_ratio      "$WARMUP_RATIO"        \
         --weight_decay      "$WEIGHT_DECAY"        \
-        --bf16              True                   \
+        --bf16              False                  \
         --gradient_checkpointing True              \
         --save_strategy     steps                  \
         --save_steps        "$SAVE_STEPS"          \
@@ -141,6 +146,7 @@ elif [ "$DEVICE" = "npu" ]; then
         --logging_steps     "$LOGGING_STEPS"       \
         --optim             adamw_torch            \
         --dataloader_num_workers 2                 \
+        --drop_long         True                   \
         --report_to         none
 
 else

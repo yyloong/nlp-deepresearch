@@ -16,10 +16,17 @@ NPU 注意事项:
     5. PEFT LoRA 通过 peft 库实现，与 torch_npu 兼容
 """
 
+import hashlib
 import json
 import logging
+import os
+import pickle
 import sys
 from dataclasses import dataclass, field
+from functools import partial
+from multiprocessing.pool import ThreadPool
+
+from tqdm import tqdm
 
 import torch
 from peft import LoraConfig, TaskType, get_peft_model
@@ -55,92 +62,169 @@ logger = logging.getLogger(__name__)
 IGNORE_INDEX = -100
 
 
+def _encode_message(msg: dict, tokenizer) -> tuple[list[int], list[int]]:
+    """将单条消息编码为 (input_ids, labels)，assistant 轮次 labels = token ids，其余 = IGNORE_INDEX。"""
+    role    = msg["role"]
+    content = msg["content"]
+    if role == "tool":
+        content = f"<tool_response>\n{content}\n</tool_response>"
+
+    prefix_ids  = tokenizer.encode(f"<|im_start|>{role}\n", add_special_tokens=False)
+    content_ids = tokenizer.encode(content,                  add_special_tokens=False)
+    suffix_ids  = tokenizer.encode("<|im_end|>\n",           add_special_tokens=False)
+
+    ids = prefix_ids + content_ids + suffix_ids
+    if role == "assistant":
+        lbls = [IGNORE_INDEX] * len(prefix_ids) + content_ids + suffix_ids
+    else:
+        lbls = [IGNORE_INDEX] * len(ids)
+    return ids, lbls
+
+
 def build_input_and_labels(
     messages: list[dict],
     tokenizer,
     max_length: int,
-) -> dict | None:
+    drop_long: bool = False,
+) -> tuple[dict | None, bool]:
     """
     将 Qwen3 格式的 messages 逐段 tokenize 并构建 labels。
 
-    assistant 轮次（content + <|im_end|>）计算 loss，
-    其余轮次（system / user / tool）的 label 设为 IGNORE_INDEX。
+    返回 (item, is_long)：
+      item    —— 训练样本字典，None 表示丢弃
+      is_long —— 原始序列是否超过 max_length
 
-    手动分段 tokenize 而非对整体字符串做 offset mapping，
-    是为了在 NPU 上避免 offset_mapping 可能带来的兼容性问题。
-
-    注意: BPE 在段落边界处可能与整体编码略有不同，
-    但实测影响极小，是 SFT 训练的通行做法。
+    drop_long=True : 超过 max_length 的样本直接丢弃
+    drop_long=False: 从尾部截断，优先保留最后的 answer 轮次（默认）
     """
-    all_input_ids: list[int] = []
-    all_labels: list[int] = []
+    # 一次性 tokenize 所有消息段
+    segments: list[tuple[list[int], list[int]]] = [
+        _encode_message(msg, tokenizer) for msg in messages
+    ]
+    total = sum(len(ids) for ids, _ in segments)
+    is_long = total > max_length
 
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
+    if is_long:
+        if drop_long:
+            return None, True
 
-        # tool role 内容需要加 <tool_response> 包裹（Qwen3 推理时 template 会加，训练时手动加）
-        if role == "tool":
-            content = f"<tool_response>\n{content}\n</tool_response>"
+        # 从尾部保留：先固定 system / user 轮次作为 head
+        head_ids, head_lbls = [], []
+        tail_segments = []
+        for msg, seg in zip(messages, segments):
+            if msg["role"] in ("system", "user"):
+                head_ids.extend(seg[0])
+                head_lbls.extend(seg[1])
+            else:
+                tail_segments.append(seg)
 
-        prefix = f"<|im_start|>{role}\n"
-        suffix = "<|im_end|>\n"
+        budget = max_length - len(head_ids)
+        tail_ids, tail_lbls = [], []
+        for ids, lbls in reversed(tail_segments):
+            if len(ids) <= budget:
+                tail_ids  = ids  + tail_ids
+                tail_lbls = lbls + tail_lbls
+                budget -= len(ids)
+            else:
+                break  # 整段塞不下则跳过，保证不截断单轮
 
-        prefix_ids  = tokenizer.encode(prefix,  add_special_tokens=False)
-        content_ids = tokenizer.encode(content, add_special_tokens=False)
-        suffix_ids  = tokenizer.encode(suffix,  add_special_tokens=False)
+        all_input_ids = head_ids + tail_ids
+        all_labels    = head_lbls + tail_lbls
+    else:
+        all_input_ids = [id_ for ids, _ in segments for id_ in ids]
+        all_labels    = [lbl  for _, lbls in segments for lbl in lbls]
 
-        all_input_ids.extend(prefix_ids + content_ids + suffix_ids)
-
-        if role == "assistant":
-            # 对 content + <|im_end|> 计算 loss，prefix 忽略
-            all_labels.extend(
-                [IGNORE_INDEX] * len(prefix_ids)
-                + content_ids
-                + suffix_ids
-            )
-        else:
-            all_labels.extend([IGNORE_INDEX] * (len(prefix_ids) + len(content_ids) + len(suffix_ids)))
-
-    # 截断
+    # 安全截断（边界保护）
     all_input_ids = all_input_ids[:max_length]
     all_labels    = all_labels[:max_length]
 
-    # 如果整条样本没有任何可学习 token，丢弃
+    # 整条样本没有任何可学习 token，丢弃
     if all(lbl == IGNORE_INDEX for lbl in all_labels):
-        return None
+        return None, is_long
 
     return {
         "input_ids":      all_input_ids,
         "labels":         all_labels,
         "attention_mask": [1] * len(all_input_ids),
-    }
+    }, is_long
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ──────────────────────────────────────────────────────────────────────────────
 class SFTDataset(Dataset):
-    def __init__(self, data_path: str, tokenizer, max_length: int):
-        self.tokenizer  = tokenizer
-        self.max_length = max_length
+    def __init__(self, data_path: str, tokenizer, max_length: int, drop_long: bool = False):
         self.samples: list[dict] = []
 
         logger.info(f"Loading data from {data_path} ...")
+        logger.info(f"max_length={max_length}, drop_long={drop_long}")
+
+        # ── 缓存路径：根据数据文件 mtime + max_length + drop_long 生成唯一 key ──
+        cache_key = hashlib.md5(
+            f"{data_path}|{os.path.getmtime(data_path)}|{max_length}|{drop_long}".encode()
+        ).hexdigest()[:12]
+        cache_path = os.path.join(os.path.dirname(data_path), f".cache_{cache_key}.pkl")
+
+        if os.path.exists(cache_path):
+            logger.info(f"Cache hit, loading from {cache_path} ...")
+            with open(cache_path, "rb") as f:
+                self.samples = pickle.load(f)
+            logger.info(f"Loaded {len(self.samples)} samples from cache.")
+            return
+
+        # ── 无缓存，重新 tokenize ──────────────────────────────────────────────
         raw: list[list[dict]] = []
         with open(data_path, encoding="utf-8") as f:
             for line in f:
                 raw.append(json.loads(line)["messages"])
+        logger.info(f"Raw samples: {len(raw)}")
 
-        skipped = 0
-        for messages in raw:
-            item = build_input_and_labels(messages, tokenizer, max_length)
+        n_truncated    = 0  # 超长但被截断保留
+        n_dropped_long = 0  # 超长被直接丢弃（drop_long=True）
+        n_no_label     = 0  # 截断后无可学习 token 被丢弃
+
+        num_threads = min(os.cpu_count() or 1, 16)
+        logger.info(f"Tokenizing with {num_threads} threads ...")
+        process_fn = partial(
+            build_input_and_labels,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            drop_long=drop_long,
+        )
+        with ThreadPool(num_threads) as pool:
+            results = list(tqdm(
+                pool.imap(process_fn, raw),
+                total=len(raw),
+                desc="Tokenizing",
+                unit="sample",
+                dynamic_ncols=True,
+            ))
+
+        for (item, is_long) in results:
             if item is None:
-                skipped += 1
-                continue
-            self.samples.append(item)
+                if is_long and drop_long:
+                    n_dropped_long += 1
+                else:
+                    n_no_label += 1
+            else:
+                if is_long:
+                    n_truncated += 1
+                self.samples.append(item)
 
-        logger.info(f"Loaded {len(self.samples)} samples (skipped {skipped} empty)")
+        logger.info(
+            f"Dataset stats:\n"
+            f"  Total raw       : {len(raw)}\n"
+            f"  Truncated (kept): {n_truncated}\n"
+            f"  Dropped (long)  : {n_dropped_long}\n"
+            f"  Dropped (no lbl): {n_no_label}\n"
+            f"  Final samples   : {len(self.samples)}"
+        )
+
+        # ── 写入缓存 ──────────────────────────────────────────────────────────
+        logger.info(f"Saving cache to {cache_path} ...")
+        with open(cache_path, "wb") as f:
+            pickle.dump(self.samples, f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info("Cache saved.")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -185,14 +269,65 @@ class SFTDataCollator:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Trainer：分块 cross-entropy，避免 logits.float() OOM
+# ──────────────────────────────────────────────────────────────────────────────
+class SFTTrainer(Trainer):
+    """
+    覆盖 compute_loss，解决两个 OOM 来源：
+    1. accelerate 的 ConvertOutputsToFp32 包装器：会在 model(**inputs) 返回时
+       把整个 logits 张量转为 fp32，导致 OOM。通过 unwrap_model + autocast 绕过。
+    2. transformers ForCausalLMLoss 内部 logits.float()：通过分块（chunked）
+       cross-entropy 只在小 chunk 上升精度，峰值显存从 ~20 GiB 降到 ~几百 MB。
+    """
+
+    # 每次转为 fp32 计算的 token 数量；越小越省显存，但略慢
+    _LOSS_CHUNK = 512
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")   # [B, T]
+
+        # 模型权重已是 bf16（torch_dtype=bfloat16），不开 accelerate mixed precision。
+        # 手动加 autocast 确保 forward 内所有激活保持 bf16，节省约一半激活显存。
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            outputs = model(**inputs)
+        logits  = outputs.logits        # [B, T, V]  bf16
+
+        # ── 因果 LM shift ────────────────────────────────────────────────────
+        shift_logits = logits[..., :-1, :].contiguous()    # [B, T-1, V]
+        shift_labels = labels[..., 1:].contiguous()         # [B, T-1]
+
+        B, T, V     = shift_logits.shape
+        flat_logits = shift_logits.view(-1, V)              # [B*(T-1), V]  bf16
+        flat_labels = shift_labels.view(-1)                 # [B*(T-1)]
+
+        # ── 分块 cross-entropy：每次只升精度 _LOSS_CHUNK 个 token ───────────
+        total_loss = flat_logits.new_zeros((), dtype=torch.float32)
+        n_valid    = 0
+        for start in range(0, flat_logits.size(0), self._LOSS_CHUNK):
+            end         = min(start + self._LOSS_CHUNK, flat_logits.size(0))
+            chunk_logit = flat_logits[start:end].float()    # 仅此 chunk 升精度
+            chunk_label = flat_labels[start:end]
+            n_valid    += (chunk_label != IGNORE_INDEX).sum().item()
+            total_loss += torch.nn.functional.cross_entropy(
+                chunk_logit, chunk_label,
+                ignore_index=IGNORE_INDEX,
+                reduction="sum",
+            )
+
+        loss = total_loss / max(n_valid, 1)
+        return (loss, outputs) if return_outputs else loss
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 参数
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ScriptArguments:
-    model_path: str = field(metadata={"help": "Qwen3-8B 模型路径"})
-    data:       str = field(default="train/sft_data.jsonl", metadata={"help": "训练数据 jsonl 路径"})
-    max_length: int = field(default=32768, metadata={"help": "最大序列长度（需要 SDPA 或 flash_attn）"})
-    seed:       int = field(default=42,    metadata={"help": "随机种子"})
+    model_path:  str  = field(metadata={"help": "Qwen3-8B 模型路径"})
+    data:        str  = field(default="train/sft_data.jsonl", metadata={"help": "训练数据 jsonl 路径"})
+    max_length:  int  = field(default=16384, metadata={"help": "最大序列长度（需要 SDPA 或 flash_attn）"})
+    drop_long:   bool = field(default=False, metadata={"help": "True=直接丢弃超长序列；False=从尾部截断保留 answer"})
     # ── LoRA 参数 ──────────────────────────────────────────────────────────────
     lora_r:       int   = field(default=64,    metadata={"help": "LoRA rank"})
     lora_alpha:   int   = field(default=128,   metadata={"help": "LoRA alpha（通常为 2*r）"})
@@ -220,7 +355,9 @@ def main():
         "--lr_scheduler_type",      "cosine",
         "--warmup_ratio",           "0.05",
         "--weight_decay",           "0.01",
-        "--bf16",                   "True",
+        # bf16 由模型权重本身保证（torch_dtype=bfloat16），不走 accelerate mixed precision，
+        # 避免 ConvertOutputsToFp32 把整个 logits 张量转 fp32 导致 OOM。
+        "--bf16",                   "False",
         "--logging_steps",          "10",
         "--save_strategy",          "steps",
         "--save_steps",             "200",
@@ -238,17 +375,19 @@ def main():
         args=all_args, look_for_args_file=False
     )
 
-    set_seed(script_args.seed)
+    set_seed(training_args.seed)
 
     logger.info(f"Model: {script_args.model_path}")
     logger.info(f"Data:  {script_args.data}")
     logger.info(f"NPU available: {_HAS_NPU}")
 
     # ── Tokenizer ──────────────────────────────────────────────────────────────
+    _is_local = os.path.isdir(script_args.model_path)
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.model_path,
         trust_remote_code=True,
         padding_side="right",   # SFT 右 padding
+        local_files_only=_is_local,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -273,6 +412,7 @@ def main():
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,   # 910B 原生支持 bf16
         attn_implementation=attn_impl,
+        local_files_only=_is_local,
     )
     model.enable_input_require_grads()  # LoRA + gradient_checkpointing 必须
 
@@ -299,13 +439,14 @@ def main():
         data_path=script_args.data,
         tokenizer=tokenizer,
         max_length=script_args.max_length,
+        drop_long=script_args.drop_long,
     )
     collator = SFTDataCollator(tokenizer=tokenizer)
 
     # ── Trainer ────────────────────────────────────────────────────────────────
     # HuggingFace Trainer 通过 accelerate 管理设备，torch_npu 注册 'npu'
     # 后 Trainer 会自动使用 NPU；无需修改任何训练逻辑。
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,

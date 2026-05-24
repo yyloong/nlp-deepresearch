@@ -12,7 +12,7 @@ INDEX_PATH="${ROOT}/indexes/browsecomp_plus_bm25.sqlite"
 MODEL="${MODEL:-qwen_auto}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
 OUTPUT_DIR="${ROOT}/runs"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
 
