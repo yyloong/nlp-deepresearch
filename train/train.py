@@ -191,7 +191,7 @@ class SFTDataCollator:
 class ScriptArguments:
     model_path: str = field(metadata={"help": "Qwen3-8B 模型路径"})
     data:       str = field(default="train/sft_data.jsonl", metadata={"help": "训练数据 jsonl 路径"})
-    max_length: int = field(default=8192,  metadata={"help": "最大序列长度"})
+    max_length: int = field(default=32768, metadata={"help": "最大序列长度（需要 SDPA 或 flash_attn）"})
     seed:       int = field(default=42,    metadata={"help": "随机种子"})
     # ── LoRA 参数 ──────────────────────────────────────────────────────────────
     lora_r:       int   = field(default=64,    metadata={"help": "LoRA rank"})
@@ -253,13 +253,26 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # ── Attention 实现选择 ─────────────────────────────────────────────────────
+    # GPU:  优先 flash_attention_2（需要 pip install flash-attn），否则 sdpa
+    # NPU:  sdpa（torch_npu ≥2.1 将 SDPA 路由到 npu_fusion_attention，O(n) 内存）
+    # 两者内存复杂度均为 O(n)，支持 32K+ 序列长度
+    if _HAS_NPU:
+        attn_impl = "sdpa"
+    else:
+        try:
+            import flash_attn  # noqa: F401
+            attn_impl = "flash_attention_2"
+        except ImportError:
+            attn_impl = "sdpa"
+    logger.info(f"attn_implementation: {attn_impl}")
+
     # ── 模型 ───────────────────────────────────────────────────────────────────
     model = AutoModelForCausalLM.from_pretrained(
         script_args.model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,   # 910B 原生支持 bf16
-        # attn_implementation="flash_attention_2"  # NPU 上暂不启用，需要验证支持情况
-        attn_implementation="eager",   # NPU/GPU 均兼容
+        attn_implementation=attn_impl,
     )
     model.enable_input_require_grads()  # LoRA + gradient_checkpointing 必须
 

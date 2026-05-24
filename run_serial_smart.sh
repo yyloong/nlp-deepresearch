@@ -1,38 +1,21 @@
 #!/usr/bin/env bash
 #
-# Deep Research Agent — Smart Search 串行轨迹生成 + 评估
-#
-# Usage:
-#   ./run_serial_smart.sh                           # 使用默认参数
-#   ./run_serial_smart.sh --limit 10 --no-eval      # 只跑 10 条，跳过评估
-#   ./run_serial_smart.sh --no-verify               # 禁用 verify agent
-#   ./run_serial_smart.sh --help                    # 查看所有参数
-#
+# Smart Agent — smart_search + get_document + submit_answer.
+# All agent params from YAML. Only MODEL/BASE_URL from env.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-# ── 固定默认值 ──
 DATASET="${ROOT}/browsecomp_plus_hard50.jsonl"
 INDEX_PATH="${ROOT}/indexes/browsecomp_plus_bm25.sqlite"
 MODEL="${MODEL:-qwen_auto}"
-#MODEL="${MODEL:-DeepSeek-V4-Flash}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
-#BASE_URL="${BASE_URL:-https://api.zinyy.tech/v1}"
 OUTPUT_DIR="${ROOT}/runs"
-MAX_TURNS="${MAX_TURNS:-30}"
-MAX_TOKENS="${MAX_TOKENS:-8912}"
-SEARCH_K="${SEARCH_K:-5}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 
-# ── 清理代理变量 ──
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
-#export http_proxy=http://pc.zinyy.tech:7899 
-#export https_proxy=http://pc.zinyy.tech:7899 
 
-
-# ── 激活 conda 环境 ──
 CONDA_ENV="${CONDA_ENV:-server}"
 if command -v conda &>/dev/null; then
     eval "$(conda shell.bash hook 2>/dev/null)" || true
@@ -41,27 +24,17 @@ if command -v conda &>/dev/null; then
     }
 fi
 
-# ── 检查前置条件 ──
 if [ ! -f "${INDEX_PATH}" ]; then
     echo "ERROR: BM25 index not found at ${INDEX_PATH}"
     exit 1
 fi
-if [ ! -f "${DATASET}" ]; then
-    echo "ERROR: Dataset not found at ${DATASET}"
-    exit 1
-fi
 
-# ── 运行 ──
-echo "=== Deep Research Agent (Smart Search) ==="
-echo "Dataset:    ${DATASET}"
-echo "Index:      ${INDEX_PATH}"
-echo "Model:      ${MODEL}"
-echo "Base URL:   ${BASE_URL}"
-echo "max_turns:  ${MAX_TURNS}"
-echo "max_tokens: ${MAX_TOKENS}"
-echo "search_k:   ${SEARCH_K}"
-echo "Output:     ${OUTPUT_DIR}/"
-echo "=========================================="
+echo "=== Smart Agent ==="
+echo "Dataset:  ${DATASET}"
+echo "Model:    ${MODEL}"
+echo "Base URL: ${BASE_URL}"
+echo "Output:   ${OUTPUT_DIR}/"
+echo "===================="
 echo
 
 cd "${ROOT}"
@@ -73,8 +46,5 @@ exec python run_serial.py \
     --model "${MODEL}" \
     --base-url "${BASE_URL}" \
     --output-dir "${OUTPUT_DIR}" \
-    --max-turns "${MAX_TURNS}" \
-    --max-tokens "${MAX_TOKENS}" \
-    --search-k "${SEARCH_K}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
     "$@"

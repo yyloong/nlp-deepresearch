@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 #
-# Deep Research Agent — Basic (search + get_document + submit_answer, no verify, no subagent)
-#
-# Usage:
-#   ./run_basic.sh                           # 使用默认参数
-#   ./run_basic.sh --limit 10 --no-eval      # 只跑 10 条，跳过评估
-#   ./run_basic.sh --max-tokens 8192         # 自定义参数
-#
+# Basic Agent — search + get_document + submit_answer, no verify.
+# All agent params from YAML. Only MODEL/BASE_URL from env.
 
 set -euo pipefail
 
@@ -14,23 +9,12 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 DATASET="${ROOT}/browsecomp_plus_hard50.jsonl"
 INDEX_PATH="${ROOT}/indexes/browsecomp_plus_bm25.sqlite"
-#MODEL="${MODEL:-qwen_auto}"
-#MODEL="${MODEL:-DeepSeek-V4-Flash}"
-MODEL="${MODEL:-deepseek-v4-flash}"
-#BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
-#BASE_URL="${BASE_URL:-https://api.zinyy.tech/v1}"
-BASE_URL="${BASE_URL:-https://api.deepseek.com/v1}"
+MODEL="${MODEL:-qwen_auto}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
 OUTPUT_DIR="${ROOT}/runs"
-MAX_TURNS="${MAX_TURNS:-10}"
-MAX_TOKENS="${MAX_TOKENS:-4096}"
-SEARCH_K="${SEARCH_K:-5}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
-export http_proxy=http://pc.zinyy.tech:7899 
-export https_proxy=http://pc.zinyy.tech:7899 
-
-
 
 CONDA_ENV="${CONDA_ENV:-server}"
 if command -v conda &>/dev/null; then
@@ -44,21 +28,13 @@ if [ ! -f "${INDEX_PATH}" ]; then
     echo "ERROR: BM25 index not found at ${INDEX_PATH}"
     exit 1
 fi
-if [ ! -f "${DATASET}" ]; then
-    echo "ERROR: Dataset not found at ${DATASET}"
-    exit 1
-fi
 
-echo "=== Deep Research Agent (Basic) ==="
-echo "Dataset:    ${DATASET}"
-echo "Index:      ${INDEX_PATH}"
-echo "Model:      ${MODEL}"
-echo "Base URL:   ${BASE_URL}"
-echo "max_turns:  ${MAX_TURNS}"
-echo "max_tokens: ${MAX_TOKENS}"
-echo "search_k:   ${SEARCH_K}"
-echo "Output:     ${OUTPUT_DIR}/"
-echo "===================================="
+echo "=== Basic Agent ==="
+echo "Dataset:  ${DATASET}"
+echo "Model:    ${MODEL}"
+echo "Base URL: ${BASE_URL}"
+echo "Output:   ${OUTPUT_DIR}/"
+echo "===================="
 echo
 
 cd "${ROOT}"
@@ -70,9 +46,6 @@ exec python run_serial.py \
     --model "${MODEL}" \
     --base-url "${BASE_URL}" \
     --output-dir "${OUTPUT_DIR}" \
-    --max-turns "${MAX_TURNS}" \
-    --max-tokens "${MAX_TOKENS}" \
-    --search-k "${SEARCH_K}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
     --no-verify \
     "$@"
