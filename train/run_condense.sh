@@ -11,8 +11,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-# vLLM 监听本地端口，代理会导致连接失败
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+# vLLM 监听本地端口，代理会导致连接失败（显式清空比 unset 更彻底）
+export http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY=""
+export no_proxy="*" NO_PROXY="*"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -99,7 +100,7 @@ echo "=================================================="
 # ─────────────────────────────────────────────────────────────────────────────
 cd "$ROOT_DIR"
 
-conda run -n server python train/condense_long.py \
+python -u train/condense_long.py \
     --input               "$INPUT"               \
     --output              "$OUTPUT"              \
     --tokenizer           "$TOKENIZER"           \

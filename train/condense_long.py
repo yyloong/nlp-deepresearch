@@ -225,7 +225,14 @@ async def self_condense_front(
                     tool_choice="auto",
                 )
             except Exception as e:
-                logger.warning(f"Condense API call failed (attempt {attempt}): {e}")
+                import traceback
+                logger.error(
+                    f"Condense API call failed (attempt {attempt}/{MAX_CONDENSE_RETRIES}):\n"
+                    f"  Type   : {type(e).__name__}\n"
+                    f"  Message: {e}\n"
+                    f"  Traceback:\n"
+                    + "".join(f"    {l}" for l in traceback.format_exc().splitlines(keepends=True))
+                )
                 return "", None
 
         choices = raw.get("choices") or []
@@ -291,6 +298,7 @@ async def process_sample(
     condense_max_tokens: int,
     semaphore: asyncio.Semaphore,
     api_context_limit: int = 40960,
+    initial_tokens: int = 0,
 ) -> List[List[Dict]]:
     """
     从前往后滑动压缩，直到剩余对话 ≤ target_length：
@@ -305,14 +313,20 @@ async def process_sample(
          → 存为最终训练样本（含最终 answer），不再压缩
 
     返回：所有训练样本的列表（每个元素 ≤ target_length）。
+    initial_tokens: 第一轮直接使用预计算的 token 数，避免重复 tokenize 大对话。
     """
     question  = extract_question(messages)
     sys_msg   = messages[0]
     remaining = list(messages)
     all_versions: List[List[Dict]] = []
 
+    # 第一轮用调用方预计算的 token 数（来自缓存），避免在事件循环里阻塞性地 tokenize 整个对话
+    total = initial_tokens
+
     for round_idx in range(MAX_CONDENSE_ROUNDS):
-        total = count_tokens(tokenizer, remaining)
+        if round_idx > 0:
+            # remaining 已经被压缩重建，需要重新计算；放到线程池避免阻塞事件循环
+            total = await asyncio.to_thread(count_tokens, tokenizer, remaining)
 
         if total <= target_length:
             # remaining 已足够短，直接存为最终训练样本（含最终 answer）
@@ -323,25 +337,25 @@ async def process_sample(
             )
             break
 
-        # ── 从开头取最大前缀（≤ target_length，末尾必须是 assistant 消息） ─
-        end_i = find_front_chunk(tokenizer, remaining, target_length)
+        # ── 从开头取最大前缀（≤ target_length，末尾必须是 tool 消息） ──────
+        # 放入线程池，避免逐条 tokenize 阻塞事件循环
+        end_i = await asyncio.to_thread(find_front_chunk, tokenizer, remaining, target_length)
 
         if end_i <= 1:
-            # 连 system + 一条消息都超 target_length，无法处理
+            # 单条消息本身超过 target_length，无法再切分，直接停止。
+            # 之前已产出的样本正常保留，本轮 remaining 不可用，丢弃。
             logger.warning(
                 f"Round {round_idx + 1}: single message exceeds target_length; "
-                f"saving remaining as-is and stopping."
+                f"stopping (keeping {len(all_versions)} samples already produced)."
             )
-            all_versions.append(remaining)
             break
 
         front = remaining[:end_i]   # [sys, m1...mk]，token ≤ target_length
         back  = remaining[end_i:]   # [m_{k+1}, ...]，不含 system
 
-        front_tok = count_tokens(tokenizer, front)
         logger.debug(
             f"Round {round_idx + 1}: total={total}, "
-            f"front={len(front)} msgs ({front_tok} tok), back={len(back)} msgs"
+            f"front={len(front)} msgs, back={len(back)} msgs"
         )
 
         # ── 训练样本①：front 直接存 ──────────────────────────────────────
@@ -390,14 +404,13 @@ async def process_sample(
             ),
         }
         remaining = [sys_msg, summary_user] + back
-        new_total = count_tokens(tokenizer, remaining)
         logger.debug(
-            f"  → new remaining: {new_total} tokens, {len(remaining)} msgs"
+            f"  → new remaining: {len(remaining)} msgs (token count computed next round)"
         )
     else:
         logger.warning(
             f"Reached MAX_CONDENSE_ROUNDS={MAX_CONDENSE_ROUNDS}; "
-            f"saving remaining as-is ({count_tokens(tokenizer, remaining)} tokens)."
+            f"saving remaining as-is ({total} tokens)."
         )
         all_versions.append(remaining)
 
@@ -439,12 +452,22 @@ async def main(args: argparse.Namespace) -> None:
         token_counts = None
 
     if token_counts is None:
-        logger.info("Counting tokens for all samples (this may take a while) ...")
+        import os
+        from multiprocessing.pool import ThreadPool
+        from functools import partial
         from tqdm import tqdm
-        token_counts = [
-            count_tokens(tokenizer, s["messages"])
-            for s in tqdm(samples, desc="Counting tokens", unit="sample", dynamic_ncols=True)
-        ]
+
+        num_threads = min(os.cpu_count() or 1, 16)
+        logger.info(f"Counting tokens with {num_threads} threads ...")
+        _count_fn = partial(count_tokens, tokenizer)
+        with ThreadPool(num_threads) as pool:
+            token_counts = list(tqdm(
+                pool.imap(_count_fn, [s["messages"] for s in samples]),
+                total=len(samples),
+                desc="Counting tokens",
+                unit="sample",
+                dynamic_ncols=True,
+            ))
         cache_path.write_text(json.dumps(token_counts), encoding="utf-8")
         logger.info(f"Token counts saved to cache: {cache_path}")
 
@@ -487,6 +510,7 @@ async def main(args: argparse.Namespace) -> None:
                 args.condense_max_tokens,
                 semaphore,
                 api_context_limit=args.api_context_limit,
+                initial_tokens=orig_tokens,  # 避免第一轮重复 tokenize 整个对话
             )
             return i, versions, orig_tokens
 
