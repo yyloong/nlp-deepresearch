@@ -316,11 +316,12 @@ class Agent:
         condense_nudge = {
             "role": "user",
             "content": (
-                "Your context has been long so far"
-                "Please summarize your progress for better perform in the following turn. "
-                "Report what tools you used, your key findings with docid references, "
-                "your reasoning strategy, and what remains to be found. "
-                "You should call submit_condensed_summary to submit your summary."
+                "Your context is getting long. Before continuing, please summarize your progress so far. "
+                "Report: (1) which tools you used and which documents you retrieved, "
+                "(2) your current reasoning strategy, "
+                "(3) key findings with docid references, "
+                "(4) what still needs to be found. "
+                "Call submit_condensed_summary to submit your summary."
             ),
         }
         condense_msgs = list(messages) + [condense_nudge]
@@ -342,8 +343,8 @@ class Agent:
                     try:
                         args = json.loads(fn.get("arguments", "{}"))
                         _LABELS = [
-                            ("tool_summary",       "### Tools & Documents"),
                             ("key_thoughts",       "### Reasoning"),
+                            ("tool_summary",       "### Tools & Documents"),
                             ("key_findings",       "### Key Findings"),
                             ("remaining_to_find",  "### Remaining"),
                         ]
@@ -366,7 +367,11 @@ class Agent:
             "role": "user",
             "content": (
                 f"{question}\n\n"
-                f"Following is your previous progress:\n\n{analysis}"
+                f"[Research Progress Summary]\n"
+                f"Your earlier context has been compressed into the following structured summary. "
+                f"Use it to continue your research efficiently without repeating work already done.\n\n"
+                f"{analysis}\n\n"
+                f"Continue your research from where you left off."
             ),
         }
 

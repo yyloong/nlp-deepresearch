@@ -1,16 +1,19 @@
 """
 condense_long.py — 对超长 SFT 样本做离线摘要压缩（复用 Agent.condense 逻辑）
 
-对于 token 数超过 target_length 的样本，将其拆分为：
-  前半段：system + 早期 tool-use 轮次（探索过程）
-  后半段：剩余轮次（含最终 reasoning + answer）
+算法（从前往后滑动压缩）：
+  对于 token 数超过 target_length 的样本，反复执行：
+  1. 从 remaining 开头取最大能放进 target_length 的前缀 front
+     → 直接存为训练样本（完整可学，≤ target_length，无需截断）
+  2. 把 front 送去 LLM 压缩（condense nudge → submit_condensed_summary）
+     → 若模型成功调用工具，存为 condense process 训练样本
+  3. remaining = [sys, summary_user] + front 之后的消息
+  4. 重复，直到 remaining ≤ target_length
+     → 存为最终训练样本（含最终 answer），不再压缩
 
-把前半段作为一个完整对话喂给 Agent.condense()，得到 submit_condensed_summary
-的四字段结构化摘要，拼合成：
-  [system, 摘要_user, 后半段...]
-
-这样既保留了最终 answer，又不完全丢弃早期探索信息，且摘要格式与
-正式 condense 完全一致（同一个 submit_condensed_summary 工具调用）。
+每个原始超长样本可产生多条训练样本：
+  - 若压缩 k 轮：产生 k 个 front 片段 + 最多 k 个 condense process + 1 个最终 continuation
+  - 所有样本均 ≤ target_length，可直接用于训练
 
 用法:
     python train/condense_long.py \
@@ -65,49 +68,31 @@ def count_tokens(tokenizer, messages: List[Dict]) -> int:
     return total
 
 
-def find_split_point(tokenizer, messages: List[Dict], target_length: int) -> int:
+def find_front_chunk(tokenizer, messages: List[Dict], budget: int) -> int:
     """
-    找最大切分索引 split_i，满足：
-      1. messages[split_i:] 的 token ≤ target_length
-      2. messages[split_i] 的 role 是 'user' 或 'assistant'（不能是 'tool'）
-         —— 避免后半段以孤立的 tool response 开头（缺少前置 tool_call）
-      3. 后半段至少含一条 assistant 消息（有可学习 token）
+    从对话开头向后贪心，找最大前缀使 messages[:end_i] 的 token ≤ budget。
 
-    strategy：从尾部向前贪心积累；找到合法候选后，若该位置是 'tool' 消息，
-    则继续向前推直到找到 'user' 或 'assistant' 边界。
+    合法的切分点在 **tool 消息之后**：
+      front = [..., asst(tool_call), tool]   ← 以完整工具调用+响应结尾
+      back  = [asst(继续推理), ...]           ← 以 assistant 消息开头
+
+    压缩完 front 后，summary_user 拼上 back 构成合法对话：
+      [sys, summary_user, asst, ...]
+
+    返回 end_i，即 front = messages[:end_i]。
     """
-    n = len(messages)
-    acc = 0
-    candidate = n  # 默认：全部归入前半段
+    acc     = 0
+    last_ok = 0  # 最近一个合法切分点（在 tool 之后）
 
-    for i in range(n - 1, 0, -1):
-        t = count_tokens(tokenizer, [messages[i]])
-        if acc + t <= target_length:
-            acc += t
-            candidate = i
-        else:
+    for i, m in enumerate(messages):
+        t = count_tokens(tokenizer, [m])
+        if acc + t > budget:
             break
+        acc += t
+        if m["role"] == "tool":
+            last_ok = i + 1  # tool 消息之后是合法切分点
 
-    # 向前移动直到 candidate 落在合法边界（user 或 assistant）
-    split_i = candidate
-    while split_i < n and messages[split_i]["role"] == "tool":
-        split_i += 1  # 跳过 tool 消息，让它归入前半段（随所属 tool_call 一起被 condense）
-
-    # 如果跳过 tool 后超出范围，退到最后一个 assistant 位置
-    if split_i >= n:
-        for k in range(n - 1, 0, -1):
-            if messages[k]["role"] in ("user", "assistant"):
-                split_i = k
-                break
-
-    # 确保后半段有 assistant 消息（有可学习 token）
-    if not any(m["role"] == "assistant" for m in messages[split_i:]):
-        for k in range(n - 1, split_i - 1, -1):
-            if messages[k]["role"] == "assistant":
-                split_i = k
-                break
-
-    return split_i
+    return last_ok
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,12 +100,84 @@ def find_split_point(tokenizer, messages: List[Dict], target_length: int) -> int
 # ─────────────────────────────────────────────────────────────────────────────
 
 CONDENSE_NUDGE = (
-    "Your context has been long so far"
-    "Please summarize your progress for better perform in the following turn. "
-    "Report what tools you used, your key findings with docid references, "
-    "your reasoning strategy, and what remains to be found. "
-    "You should call submit_condensed_summary to submit your summary."
+    "Your context is getting long. Before continuing, please summarize your progress so far. "
+    "Report: (1) which tools you used and which documents you retrieved, "
+    "(2) your current reasoning strategy, "
+    "(3) key findings with docid references, "
+    "(4) what still needs to be found. "
+    "Call submit_condensed_summary to submit your summary."
 )
+
+
+def _trim_front_to_budget(
+    tokenizer,
+    front_messages: List[Dict],
+    budget: int,
+) -> List[Dict]:
+    """
+    把前半段从头部截断，确保总 token ≤ budget。
+    始终保留 system 消息（index=0）和最新的若干条消息（尾部优先）。
+    """
+    if count_tokens(tokenizer, front_messages) <= budget:
+        return front_messages
+
+    system_msg = front_messages[0]
+    system_tok = count_tokens(tokenizer, [system_msg])
+    remaining   = budget - system_tok
+
+    kept = []
+    for m in reversed(front_messages[1:]):
+        t = count_tokens(tokenizer, [m])
+        if t <= remaining:
+            kept.insert(0, m)
+            remaining -= t
+        else:
+            break  # 从头部截掉放不下的部分
+
+    return [system_msg] + kept
+
+
+CONDENSE_RETRY_NUDGE = (
+    "Please call the submit_condensed_summary tool now to submit your summary. "
+    "Fill in all required fields: tool_summary, key_thoughts, key_findings, and remaining_to_find."
+)
+
+_CONDENSE_LABELS = [
+    ("key_thoughts",      "### Reasoning"),
+    ("tool_summary",      "### Tools & Documents"),
+    ("key_findings",      "### Key Findings"),
+    ("remaining_to_find", "### Remaining"),
+]
+
+MAX_CONDENSE_RETRIES = 3
+
+
+def _parse_condense_response(resp: Dict) -> str:
+    """从 API 响应中解析 submit_condensed_summary 的结构化摘要。"""
+    for tc in (resp.get("tool_calls") or []):
+        fn = tc.get("function", {})
+        if fn.get("name") == "submit_condensed_summary":
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+                parts = [
+                    f"{label}\n{args[k].strip()}"
+                    for k, label in _CONDENSE_LABELS
+                    if args.get(k, "").strip()
+                ]
+                if parts:
+                    return "\n\n".join(parts)
+            except Exception:
+                pass
+    return ""
+
+
+def _build_assistant_msg(resp: Dict) -> Dict:
+    msg: Dict = {"role": "assistant"}
+    if resp.get("content"):
+        msg["content"] = resp["content"]
+    if resp.get("tool_calls"):
+        msg["tool_calls"] = resp["tool_calls"]
+    return msg
 
 
 async def self_condense_front(
@@ -130,77 +187,81 @@ async def self_condense_front(
     front_messages: List[Dict],
     max_tokens: int,
     semaphore: asyncio.Semaphore,
+    api_context_limit: int = 40960,
 ) -> tuple[str, Dict | None]:
     """
     把前半段消息发给模型，追加 condense nudge，让模型调用
     submit_condensed_summary 提交结构化摘要。
-    完全复用 Agent.condense() 的提示和 tool spec。
+
+    若模型未调用工具，追加提醒消息重试（最多 MAX_CONDENSE_RETRIES 次）。
+    重试的上下文仅用于引导本次 API 调用，不会保存到训练样本中。
 
     返回：
-      (summary_text, assistant_resp_msg)
-      - summary_text      : 拼好的摘要字符串，失败时为空串
-      - assistant_resp_msg: 模型原始 assistant 消息（含 tool_calls），
-                            用于构建 condense 过程的 SFT 训练样本
+      (summary_text, first_assistant_msg)
+      - summary_text       : 结构化摘要字符串，失败时为空串
+      - first_assistant_msg: 第一次响应的 assistant 消息（含 tool_calls），
+                             用于构建 condense process 训练样本
     """
     condense_nudge_msg = {"role": "user", "content": CONDENSE_NUDGE}
-    condense_msgs = list(front_messages) + [condense_nudge_msg]
-    condense_tools = [submit_condensed_summary_tool_spec()]
+    nudge_tok      = count_tokens(tokenizer, [condense_nudge_msg])
+    front_budget   = api_context_limit - max_tokens - nudge_tok - 512
+    front_messages = _trim_front_to_budget(tokenizer, front_messages, front_budget)
 
-    async with semaphore:
-        try:
-            raw = await client.simple_chat(
-                model=model,
-                messages=condense_msgs,
-                temperature=0.0,
-                max_tokens=max_tokens,
-                tools=condense_tools,
-                tool_choice="auto",
-            )
-        except Exception as e:
-            logger.warning(f"Condense API call failed: {e}")
+    condense_tools = [submit_condensed_summary_tool_spec()]
+    # 初始对话：front + condense nudge
+    working_msgs   = list(front_messages) + [condense_nudge_msg]
+
+    first_assistant_msg: Dict | None = None  # 保存第一次响应，用于训练样本
+
+    for attempt in range(1, MAX_CONDENSE_RETRIES + 1):
+        async with semaphore:
+            try:
+                raw = await client.simple_chat(
+                    model=model,
+                    messages=working_msgs,
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                    tools=condense_tools,
+                    tool_choice="auto",
+                )
+            except Exception as e:
+                logger.warning(f"Condense API call failed (attempt {attempt}): {e}")
+                return "", None
+
+        choices = raw.get("choices") or []
+        if not choices:
+            logger.warning(f"Condense API returned empty choices (attempt {attempt})")
             return "", None
 
-    choices = raw.get("choices") or []
-    if not choices:
-        return "", None
-    resp = choices[0].get("message") or {}
+        resp = choices[0].get("message") or {}
+        assistant_msg = _build_assistant_msg(resp)
 
-    # 解析 submit_condensed_summary 工具调用（与 agent.py 格式完全一致）
-    _LABELS = [
-        ("tool_summary",      "### Tools & Documents"),
-        ("key_thoughts",      "### Reasoning"),
-        ("key_findings",      "### Key Findings"),
-        ("remaining_to_find", "### Remaining"),
-    ]
-    analysis = ""
-    for tc in (resp.get("tool_calls") or []):
-        fn = tc.get("function", {})
-        if fn.get("name") == "submit_condensed_summary":
-            try:
-                args = json.loads(fn.get("arguments", "{}"))
-                parts = [
-                    f"{label}\n{args[k].strip()}"
-                    for k, label in _LABELS
-                    if args.get(k, "").strip()
-                ]
-                analysis = "\n\n".join(parts)
-            except Exception:
-                pass
+        # 保存第一次响应（用于训练样本，反映模型真实的首次尝试）
+        if first_assistant_msg is None:
+            first_assistant_msg = assistant_msg
 
-    # fallback：取 content（去掉 think blocks）
-    if not analysis:
-        raw_content = resp.get("content", "") or ""
-        raw_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
-        analysis = raw_content or "(progress summary unavailable)"
+        analysis = _parse_condense_response(resp)
+        if analysis:
+            # 成功：模型正确调用了 submit_condensed_summary
+            if attempt > 1:
+                logger.debug(f"Condense succeeded on retry attempt {attempt}")
+            return analysis, first_assistant_msg
 
-    # 构建 assistant 消息（与框架消息格式一致）
-    assistant_msg: Dict = {"role": "assistant"}
-    if resp.get("content"):
-        assistant_msg["content"] = resp["content"]
-    if resp.get("tool_calls"):
-        assistant_msg["tool_calls"] = resp["tool_calls"]
+        # 模型未调用工具：追加提醒，重试（重试上下文不进入训练样本）
+        logger.debug(
+            f"Condense attempt {attempt}: model did not call tool, "
+            f"appending retry nudge."
+        )
+        working_msgs = working_msgs + [
+            assistant_msg,
+            {"role": "user", "content": CONDENSE_RETRY_NUDGE},
+        ]
 
-    return analysis, assistant_msg
+    logger.warning(
+        f"Condense failed after {MAX_CONDENSE_RETRIES} attempts "
+        f"(model never called submit_condensed_summary)."
+    )
+    return "", None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -209,19 +270,16 @@ async def self_condense_front(
 
 def extract_question(messages: List[Dict]) -> str:
     """
-    提取原始问题。SFT 数据的 user message 通常以原始问题开头（第一行），
-    与框架中 self._current_question 保持一致。
+    提取原始问题（完整内容，不截断）。
+    SFT 数据的第一条 user message 即为原始问题，与框架中 self._current_question 一致。
     """
     for m in messages:
         if m["role"] == "user":
-            content = (m.get("content") or "").strip()
-            # 取第一个空行之前的内容作为问题（避免带上 context 注释等）
-            first_para = content.split("\n\n")[0].strip()
-            return first_para[:600]
+            return (m.get("content") or "").strip()
     return ""
 
 
-MAX_CONDENSE_ROUNDS = 5  # 最多压缩轮数，防止死循环
+MAX_CONDENSE_ROUNDS = 20  # 防止死循环的上限
 
 
 async def process_sample(
@@ -232,98 +290,116 @@ async def process_sample(
     target_length: int,
     condense_max_tokens: int,
     semaphore: asyncio.Semaphore,
+    api_context_limit: int = 40960,
 ) -> List[List[Dict]]:
     """
-    循环压缩超长样本，收集所有中间压缩结果作为独立训练样本。
+    从前往后滑动压缩，直到剩余对话 ≤ target_length：
 
-    每轮产生一个新的 [system, 摘要_user, 后半段]，即使仍超长也记录下来
-    （后续训练时截断处理）。最后一轮产生满足 target_length 的结果。
+    每轮：
+      1. 从 remaining 开头，取最大能放进 target_length 的前缀 front
+         → 直接存为训练样本①（完整可学，包含这段所有 tool-use）
+      2. 把 front 送去压缩（condense nudge → submit_condensed_summary）
+         → 若成功调用工具，存训练样本②（condense process）
+      3. remaining = [sys, summary_user] + back（front 之后的消息）
+      4. 重复，直到 remaining ≤ target_length
+         → 存为最终训练样本（含最终 answer），不再压缩
 
-    返回：所有中间/最终压缩版本的列表，每个元素都是一份独立的训练样本。
+    返回：所有训练样本的列表（每个元素 ≤ target_length）。
     """
-    total    = count_tokens(tokenizer, messages)
-    question = extract_question(messages)
-    all_versions: List[List[Dict]] = []  # 收集每轮压缩结果
+    question  = extract_question(messages)
+    sys_msg   = messages[0]
+    remaining = list(messages)
+    all_versions: List[List[Dict]] = []
 
     for round_idx in range(MAX_CONDENSE_ROUNDS):
+        total = count_tokens(tokenizer, remaining)
+
         if total <= target_length:
+            # remaining 已足够短，直接存为最终训练样本（含最终 answer）
+            all_versions.append(remaining)
+            logger.debug(
+                f"Round {round_idx + 1}: remaining fits ({total} tokens), "
+                f"saved as final sample."
+            )
             break
 
-        split_i = find_split_point(tokenizer, messages, target_length)
-        front   = messages[:split_i]   # 含 system
-        back    = messages[split_i:]   # 后半段（无 system）
+        # ── 从开头取最大前缀（≤ target_length，末尾必须是 assistant 消息） ─
+        end_i = find_front_chunk(tokenizer, remaining, target_length)
 
+        if end_i <= 1:
+            # 连 system + 一条消息都超 target_length，无法处理
+            logger.warning(
+                f"Round {round_idx + 1}: single message exceeds target_length; "
+                f"saving remaining as-is and stopping."
+            )
+            all_versions.append(remaining)
+            break
+
+        front = remaining[:end_i]   # [sys, m1...mk]，token ≤ target_length
+        back  = remaining[end_i:]   # [m_{k+1}, ...]，不含 system
+
+        front_tok = count_tokens(tokenizer, front)
         logger.debug(
-            f"Round {round_idx + 1}: total={total} tokens, split_i={split_i}, "
-            f"front={len(front)} msgs, back={len(back)} msgs"
+            f"Round {round_idx + 1}: total={total}, "
+            f"front={len(front)} msgs ({front_tok} tok), back={len(back)} msgs"
         )
 
-        # 若前半段只剩 system（无法再切），从后半段尾部贪心保留后退出
-        if len(front) <= 1:
-            logger.debug("Front has only system msg; hard-truncating back half.")
-            kept_back: List[Dict] = []
-            budget = target_length
-            for m in reversed(back):
-                t = count_tokens(tokenizer, [m])
-                if t <= budget:
-                    kept_back.insert(0, m)
-                    budget -= t
-                else:
-                    break
-            messages = [messages[0]] + kept_back
-            all_versions.append(messages)
-            break
+        # ── 训练样本①：front 直接存 ──────────────────────────────────────
+        all_versions.append(front)
 
+        # ── 压缩 front → summary ──────────────────────────────────────────
         summary, assistant_msg = await self_condense_front(
             client, model, tokenizer,
             front, condense_max_tokens, semaphore,
+            api_context_limit=api_context_limit,
         )
 
         if not summary or assistant_msg is None:
-            logger.debug(f"Round {round_idx + 1}: condense returned empty; dropping front.")
-            messages = [messages[0]] + back
-            total    = count_tokens(tokenizer, messages)
-            continue
+            # condense 失败：无法构造合法的下一轮对话（back 以 assistant 开头，
+            # 没有 summary_user 就缺少上下文），直接停止本样本的处理。
+            # front 已作为 sample① 保存，后续片段本轮无法产出。
+            logger.debug(
+                f"Round {round_idx + 1}: condense failed; "
+                f"cannot build valid continuation without summary. Stopping."
+            )
+            break
 
-        # ── 训练样本 A：前半段 + condense nudge + assistant(submit_condensed_summary)
-        # 教模型「如何在上下文过长时做自我压缩」
-        # system 保持原样，训练信号来自 nudge→tool_call 的对话 pattern
-        # 仅当模型确实调用了 submit_condensed_summary（有 tool_calls）才保存，
-        # 纯文本 fallback 的响应不具备工具调用训练价值
+        # ── 训练样本②：condense process（仅当模型实际调用了工具时保存） ───
         if assistant_msg.get("tool_calls"):
-            condense_process_sample: List[Dict] = list(front) + [
+            condense_process: List[Dict] = list(front) + [
                 {"role": "user", "content": CONDENSE_NUDGE},
                 assistant_msg,
             ]
-            all_versions.append(condense_process_sample)
+            all_versions.append(condense_process)
         else:
-            logger.debug(f"Round {round_idx + 1}: model used plain text fallback, skipping Sample A.")
+            logger.debug(
+                f"Round {round_idx + 1}: model used plain-text fallback, "
+                f"skipping condense process sample."
+            )
 
-        # ── 训练样本 B：system + summary_user + 后半段
-        # 教模型「在 condensed context 下继续工作」
-        # summary_user 格式与 agent.py condense() 完全一致
+        # ── 构建下一轮 remaining ──────────────────────────────────────────
         summary_user: Dict[str, Any] = {
             "role": "user",
             "content": (
                 f"{question}\n\n"
-                f"Following is your previous progress:\n\n{summary}"
+                f"[Research Progress Summary]\n"
+                f"Your earlier context has been compressed into the following structured summary. "
+                f"Use it to continue your research efficiently without repeating work already done.\n\n"
+                f"{summary}\n\n"
+                f"Continue your research from where you left off."
             ),
         }
-        messages = [messages[0], summary_user] + back
-        total    = count_tokens(tokenizer, messages)
-        all_versions.append(messages)
-
+        remaining = [sys_msg, summary_user] + back
+        new_total = count_tokens(tokenizer, remaining)
         logger.debug(
-            f"Round {round_idx + 1}: saved 2 samples "
-            f"(condense_process + condensed_continuation), "
-            f"continuation={total} tokens, {len(messages)} msgs"
+            f"  → new remaining: {new_total} tokens, {len(remaining)} msgs"
         )
-
-    if total > target_length:
+    else:
         logger.warning(
-            f"Sample still {total} > {target_length} tokens after "
-            f"{MAX_CONDENSE_ROUNDS} rounds; last version kept (train.py will truncate)."
+            f"Reached MAX_CONDENSE_ROUNDS={MAX_CONDENSE_ROUNDS}; "
+            f"saving remaining as-is ({count_tokens(tokenizer, remaining)} tokens)."
         )
+        all_versions.append(remaining)
 
     return all_versions
 
@@ -347,19 +423,49 @@ async def main(args: argparse.Namespace) -> None:
             samples.append(json.loads(line))
     logger.info(f"Total samples: {len(samples)}")
 
-    # 统计超长样本
-    token_counts = [count_tokens(tokenizer, s["messages"]) for s in samples]
+    # ── token 数缓存：避免每次重新 tokenize ────────────────────────────────
+    cache_path = Path(args.input).with_suffix(".token_counts.json")
+    if cache_path.exists():
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if len(cached) == len(samples):
+            token_counts = cached
+            logger.info(f"Loaded token counts from cache: {cache_path}")
+        else:
+            logger.info(
+                f"Cache size mismatch ({len(cached)} vs {len(samples)}), recomputing ..."
+            )
+            token_counts = None
+    else:
+        token_counts = None
+
+    if token_counts is None:
+        logger.info("Counting tokens for all samples (this may take a while) ...")
+        token_counts = [count_tokens(tokenizer, s["messages"]) for s in samples]
+        cache_path.write_text(json.dumps(token_counts), encoding="utf-8")
+        logger.info(f"Token counts saved to cache: {cache_path}")
+
+    # 超过 max_input_tokens 的样本本轮跳过（留待后续批次处理）
+    if args.max_input_tokens > 0:
+        pairs        = [(s, t) for s, t in zip(samples, token_counts) if t <= args.max_input_tokens]
+        n_skipped    = len(samples) - len(pairs)
+        samples      = [p[0] for p in pairs]
+        token_counts = [p[1] for p in pairs]
+        if n_skipped:
+            logger.info(
+                f"Skipped {n_skipped} samples exceeding max_input_tokens={args.max_input_tokens} "
+                f"(not included in output; process separately)"
+            )
+
     long_indices = [i for i, t in enumerate(token_counts) if t > args.target_length]
     logger.info(
-        f"Samples exceeding {args.target_length} tokens: "
-        f"{len(long_indices)} / {len(samples)} "
-        f"({100 * len(long_indices) / len(samples):.1f}%)"
+        f"Samples to process: {len(samples)} total  |  "
+        f"need condense: {len(long_indices)}  |  "
+        f"already short: {len(samples) - len(long_indices)}"
     )
-
-    extra_samples: List[Dict] = []
 
     if not long_indices:
         logger.info("Nothing to condense, writing output as-is.")
+        all_output = samples
     else:
         client    = VLLMClientAsync(
             base_url=args.base_url,
@@ -376,41 +482,44 @@ async def main(args: argparse.Namespace) -> None:
                 args.target_length,
                 args.condense_max_tokens,
                 semaphore,
+                api_context_limit=args.api_context_limit,
             )
             return i, versions, orig_tokens
 
         tasks   = [_process(i) for i in long_indices]
         results = await tqdm_asyncio.gather(*tasks, desc="Condensing", unit="sample")
 
-        # 用所有压缩版本替换/扩展原始样本
-        extra_samples: List[Dict] = []
-        total_new = 0
+        long_set = set(long_indices)
+        # 短样本直接保留
+        all_output: List[Dict] = [s for i, s in enumerate(samples) if i not in long_set]
+        n_short = len(all_output)
+
+        # 长样本：用所有 versions 完全替换原始样本（不保留原始超长版本）
+        total_condensed = 0
         for i, versions, orig_tok in results:
             if not versions:
                 continue
-            # 用最终版本（最短）替换原样本
-            samples[i]["messages"] = versions[-1]
-            # 其余中间版本作为新样本追加
-            for v in versions[:-1]:
-                meta = {k: samples[i][k] for k in samples[i] if k != "messages"}
-                extra_samples.append({"messages": v, **meta})
-                total_new += 1
+            meta = {k: samples[i][k] for k in samples[i] if k != "messages"}
+            for v in versions:
+                all_output.append({"messages": v, **meta})
+                total_condensed += 1
 
         logger.info(
             f"Condense complete: {len(long_indices)} long samples → "
-            f"{len(long_indices)} final(continuation) + {total_new} others"
-            f"(condense_process + intermediate_continuation) = "
-            f"{len(long_indices) + total_new} condensed training samples total"
+            f"{total_condensed} training samples "
+            f"(front slices + condense process + final continuations)"
+        )
+        logger.info(
+            f"Output composition: {n_short} short (kept as-is) + "
+            f"{total_condensed} condensed = {len(all_output)} total"
         )
 
-    # 写出：原始短样本 + 压缩后样本（含所有中间版本）
-    all_output = samples + extra_samples
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         for s in all_output:
             f.write(json.dumps(s, ensure_ascii=False) + "\n")
-    logger.info(f"Written {len(all_output)} samples to {out_path} (was {len(samples)})")
+    logger.info(f"Written {len(all_output)} samples to {out_path}")
 
     # 压缩后统计
     still_long = sum(
@@ -439,6 +548,11 @@ if __name__ == "__main__":
     parser.add_argument("--concurrency",         type=int, default=8, help="并发请求数")
     parser.add_argument("--condense_max_tokens", type=int, default=1024,
                         help="condense 摘要的最大输出 token 数")
+    parser.add_argument("--api_context_limit",   type=int, default=40960,
+                        help="condense 模型的最大 context 长度（用于截断前半段）")
+    parser.add_argument("--max_input_tokens",    type=int, default=0,
+                        help="跳过原始 token 数超过此值的样本（0=不过滤）。"
+                             "用于分批处理，先处理较短样本")
     args = parser.parse_args()
 
     asyncio.run(main(args))

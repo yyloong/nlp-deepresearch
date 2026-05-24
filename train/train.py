@@ -16,11 +16,9 @@ NPU 注意事项:
     5. PEFT LoRA 通过 peft 库实现，与 torch_npu 兼容
 """
 
-import hashlib
 import json
 import logging
 import os
-import pickle
 import sys
 from dataclasses import dataclass, field
 from functools import partial
@@ -159,29 +157,15 @@ class SFTDataset(Dataset):
         logger.info(f"Loading data from {data_path} ...")
         logger.info(f"max_length={max_length}, drop_long={drop_long}")
 
-        # ── 缓存路径：根据数据文件 mtime + max_length + drop_long 生成唯一 key ──
-        cache_key = hashlib.md5(
-            f"{data_path}|{os.path.getmtime(data_path)}|{max_length}|{drop_long}".encode()
-        ).hexdigest()[:12]
-        cache_path = os.path.join(os.path.dirname(data_path), f".cache_{cache_key}.pkl")
-
-        if os.path.exists(cache_path):
-            logger.info(f"Cache hit, loading from {cache_path} ...")
-            with open(cache_path, "rb") as f:
-                self.samples = pickle.load(f)
-            logger.info(f"Loaded {len(self.samples)} samples from cache.")
-            return
-
-        # ── 无缓存，重新 tokenize ──────────────────────────────────────────────
         raw: list[list[dict]] = []
         with open(data_path, encoding="utf-8") as f:
             for line in f:
                 raw.append(json.loads(line)["messages"])
         logger.info(f"Raw samples: {len(raw)}")
 
-        n_truncated    = 0  # 超长但被截断保留
-        n_dropped_long = 0  # 超长被直接丢弃（drop_long=True）
-        n_no_label     = 0  # 截断后无可学习 token 被丢弃
+        n_truncated    = 0
+        n_dropped_long = 0
+        n_no_label     = 0
 
         num_threads = min(os.cpu_count() or 1, 16)
         logger.info(f"Tokenizing with {num_threads} threads ...")
@@ -219,12 +203,6 @@ class SFTDataset(Dataset):
             f"  Dropped (no lbl): {n_no_label}\n"
             f"  Final samples   : {len(self.samples)}"
         )
-
-        # ── 写入缓存 ──────────────────────────────────────────────────────────
-        logger.info(f"Saving cache to {cache_path} ...")
-        with open(cache_path, "wb") as f:
-            pickle.dump(self.samples, f, protocol=pickle.HIGHEST_PROTOCOL)
-        logger.info("Cache saved.")
 
     def __len__(self) -> int:
         return len(self.samples)

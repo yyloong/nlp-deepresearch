@@ -11,6 +11,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# vLLM 监听本地端口，代理会导致连接失败
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -32,6 +35,10 @@ CONCURRENCY=16                                # 并发请求数
 # 保证 [system, summary_user(≤4096 tok), back(≤12288 tok)] 总计 ≤ 16384
 CONDENSE_MAX_TOKENS=4096
 TARGET_LENGTH=12288
+
+# 本批次只处理原始 token 数 ≤ MAX_INPUT_TOKENS 的样本（0=不过滤）
+# 先跑较短的样本可以快速产出训练数据，超长样本留待后续批次
+MAX_INPUT_TOKENS=100000
 
 # 是否强制重新处理
 FORCE=false
@@ -84,6 +91,7 @@ echo "  API base_url  : ${BASE_URL}"
 echo "  Model         : ${MODEL}"
 echo "  Concurrency   : ${CONCURRENCY}"
 echo "  Max tokens    : ${CONDENSE_MAX_TOKENS}"
+echo "  Max input tok : ${MAX_INPUT_TOKENS} (0=no filter)"
 echo "=================================================="
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,7 +99,7 @@ echo "=================================================="
 # ─────────────────────────────────────────────────────────────────────────────
 cd "$ROOT_DIR"
 
-python train/condense_long.py \
+conda run -n server python train/condense_long.py \
     --input               "$INPUT"               \
     --output              "$OUTPUT"              \
     --tokenizer           "$TOKENIZER"           \
@@ -100,7 +108,8 @@ python train/condense_long.py \
     --api_key             "$API_KEY"             \
     --model               "$MODEL"               \
     --concurrency         "$CONCURRENCY"         \
-    --condense_max_tokens "$CONDENSE_MAX_TOKENS"
+    --condense_max_tokens "$CONDENSE_MAX_TOKENS" \
+    --max_input_tokens    "$MAX_INPUT_TOKENS"
 
 echo ""
 echo "=================================================="
