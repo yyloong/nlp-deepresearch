@@ -440,7 +440,11 @@ async def main(args: argparse.Namespace) -> None:
 
     if token_counts is None:
         logger.info("Counting tokens for all samples (this may take a while) ...")
-        token_counts = [count_tokens(tokenizer, s["messages"]) for s in samples]
+        from tqdm import tqdm
+        token_counts = [
+            count_tokens(tokenizer, s["messages"])
+            for s in tqdm(samples, desc="Counting tokens", unit="sample", dynamic_ncols=True)
+        ]
         cache_path.write_text(json.dumps(token_counts), encoding="utf-8")
         logger.info(f"Token counts saved to cache: {cache_path}")
 
