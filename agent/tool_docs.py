@@ -263,42 +263,6 @@ def smart_search_tool_spec(search_k: int = 5) -> Dict[str, Any]:
     }
 
 
-def build_main_agent_smart_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
-    """Tool specs for main agent (smart): smart_search, get_document, submit_answer."""
-    return [
-        smart_search_tool_spec(search_k),
-        get_document_tool_spec(),
-        submit_answer_tool_spec(),
-    ]
-
-
-def build_main_agent_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
-    """Tool specs for main agent: search (query only), call_subagents, submit_answer."""
-    return [
-        search_tool_spec(search_k),
-        call_subagents_tool_spec(),
-        submit_answer_tool_spec(),
-    ]
-
-
-def build_search_agent_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
-    """Tool specs for search agent: search (query only), get_document, submit_answer."""
-    return [
-        search_tool_spec(search_k),
-        get_document_tool_spec(),
-        submit_answer_tool_spec(),
-    ]
-
-
-def build_verify_agent_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
-    """Tool specs for verify agent: search (simple), get_document, give_feedback."""
-    return [
-        search_tool_spec(search_k),
-        get_document_tool_spec(),
-        give_feedback_tool_spec(),
-    ]
-
-
 def report_surrender_verdict_tool_spec() -> Dict[str, Any]:
     """Surrender check agent end_tool — report PASS or SURRENDER verdict."""
     return {
@@ -322,27 +286,3 @@ def report_surrender_verdict_tool_spec() -> Dict[str, Any]:
             },
         },
     }
-
-
-def build_sub_summary_tool_specs() -> List[Dict[str, Any]]:
-    """Tool specs for sub-summary agent: submit_summary only."""
-    return [submit_summary_tool_spec()]
-
-
-def build_relevance_judge_tool_specs(search_k: int = 5) -> List[Dict[str, Any]]:
-    """Tool specs for relevance judge agent: search, get_document, judge_relevance."""
-    return [
-        search_tool_spec(search_k),
-        get_document_tool_spec(),
-        judge_relevance_tool_spec(),
-    ]
-
-
-def build_surrender_check_tool_specs() -> List[Dict[str, Any]]:
-    """Tool specs for surrender check agent: report_surrender_verdict only."""
-    return [report_surrender_verdict_tool_spec()]
-
-
-def build_condense_tool_specs() -> List[Dict[str, Any]]:
-    """Tool specs for condense: submit_condensed_summary only."""
-    return [submit_condensed_summary_tool_spec()]

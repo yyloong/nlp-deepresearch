@@ -25,18 +25,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import yaml
 
 from .tool_docs import (
-    build_condense_tool_specs,
-    build_main_agent_tool_specs,
-    build_relevance_judge_tool_specs,
-    build_search_agent_tool_specs,
-    build_sub_summary_tool_specs,
-    build_surrender_check_tool_specs,
-    build_verify_agent_tool_specs,
     call_subagents_tool_spec,
     get_document_tool_spec,
+    give_feedback_tool_spec,
+    judge_relevance_tool_spec,
+    report_surrender_verdict_tool_spec,
     search_tool_spec,
     smart_search_tool_spec,
     submit_answer_tool_spec,
+    submit_condensed_summary_tool_spec,
+    submit_summary_tool_spec,
 )
 from .utils import count_tokens_messages, hard_truncate_tail_tool_messages
 
@@ -113,46 +111,30 @@ class Agent:
 
     # ── Tool spec builder ─────────────────────────
 
-    def _build_main_tool_specs(self, search_k: int, tool_names: set) -> List[Dict[str, Any]]:
-        """Build tool specs for main agent dynamically from its tool list."""
+    def _build_tool_specs(self) -> List[Dict[str, Any]]:
+        """Build OpenAI-format tool specs from the agent's YAML tool list."""
+        _map: Dict[str, Any] = {
+            "search": search_tool_spec,
+            "smart_search": smart_search_tool_spec,
+            "get_document": get_document_tool_spec,
+            "submit_answer": submit_answer_tool_spec,
+            "call_subagents": call_subagents_tool_spec,
+            "give_feedback": give_feedback_tool_spec,
+            "judge_relevance": judge_relevance_tool_spec,
+            "submit_summary": submit_summary_tool_spec,
+            "submit_condensed_summary": submit_condensed_summary_tool_spec,
+            "report_surrender_verdict": report_surrender_verdict_tool_spec,
+        }
         specs = []
         for name in self._tool_names:
-            if name == "search":
-                specs.append(search_tool_spec(search_k))
-            elif name == "smart_search":
-                specs.append(smart_search_tool_spec(search_k))
-            elif name == "get_document":
-                specs.append(get_document_tool_spec())
-            elif name == "call_subagents":
-                specs.append(call_subagents_tool_spec())
-            elif name == "submit_answer":
-                specs.append(submit_answer_tool_spec())
+            fn = _map.get(name)
+            if fn is None:
+                raise KeyError(f"Unknown tool: {name}")
+            try:
+                specs.append(fn(self.search_k))
+            except TypeError:
+                specs.append(fn())
         return specs
-
-    def _build_tool_specs(self) -> List[Dict[str, Any]]:
-        """Build OpenAI-format tool specs based on the agent's tool list."""
-        search_k = self.search_k  # use the already-resolved search_k
-        tool_names = set(self._tool_names)
-
-        if self.agent_type == "main":
-            return self._build_main_tool_specs(search_k, tool_names)
-        elif self.agent_type == "search":
-            return build_search_agent_tool_specs(search_k)
-        elif self.agent_type == "verify":
-            return build_verify_agent_tool_specs(search_k)
-        elif self.agent_type == "sub_summary":
-            return build_sub_summary_tool_specs()
-        elif self.agent_type == "relevance_judge":
-            return build_relevance_judge_tool_specs(search_k)
-        elif self.agent_type == "surrender_check":
-            return build_surrender_check_tool_specs()
-        else:
-            # Generic: build from tool names
-            specs = []
-            for name in self._tool_names:
-                if name == "submit_condensed_summary":
-                    specs.extend(build_condense_tool_specs())
-            return specs
 
     # ═══════════════════════════════════════════════════════════════
     # Model calling
@@ -342,7 +324,7 @@ class Agent:
             ),
         }
         condense_msgs = list(messages) + [condense_nudge]
-        condense_tools = build_condense_tool_specs()
+        condense_tools = [submit_condensed_summary_tool_spec()]
 
         print(f"  [condense] self-condense (context~{before} tokens)...", flush=True)
 
