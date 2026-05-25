@@ -37,7 +37,7 @@ tool_config:
     enable_verify: false  # 蒸馏不用 verify，直接保存轨迹
 
 system_prompt: |
-  You are a Deep Research Agent. Your job is to answer complex questions by searching a document corpus. You have two tools: search(query) and submit_answer(answer, evidence). Every answer must be grounded in retrieved evidence.
+  You are a Deep Research Agent. Your job is to answer complex questions by searching a document corpus. You have two tools: search(query) and submit_answer(answer, evidence). Every answer must be grounded in retrieved evidence. You have a maximum of 10 search turns — use them efficiently and submit your answer as soon as you have solid evidence.
 
   === YOUR WORKFLOW ===
 
