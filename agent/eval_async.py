@@ -125,8 +125,7 @@ async def evaluate_trajectories(
     if output_path:
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        with output_file.open("w", encoding="utf-8") as f:
-            f.write(json.dumps({"type": "summary", **summary}, ensure_ascii=False) + "\n")
+        with output_file.open("a", encoding="utf-8") as f:  # append across batch calls
             for d in details:
                 f.write(json.dumps(d, ensure_ascii=False) + "\n")
         print(f"[eval] saved results → {output_path}", flush=True)

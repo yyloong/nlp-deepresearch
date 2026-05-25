@@ -32,7 +32,7 @@ LOCAL_VLLM_URL="${LOCAL_VLLM_URL:-http://127.0.0.1:8000/v1}"
 DATASET="${ROOT}/distill/browsecomp_plus_train780.jsonl"
 INDEX_PATH="${ROOT}/indexes/browsecomp_plus_bm25.sqlite"
 OUTPUT_DIR="${ROOT}/runs_distill"
-CONCURRENCY="${CONCURRENCY:-4}"   # 同时处理的样本数
+CONCURRENCY="${CONCURRENCY:-25}"   # 同时处理的样本数
 
 # ── 代理（DeepSeek 公网 API 需要时取消注释）──────────────────────────────────
 # export https_proxy="http://pc.zinyy.tech:7899"

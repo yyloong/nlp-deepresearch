@@ -96,11 +96,13 @@ async def _main_async(args: argparse.Namespace) -> None:
         print(f"Loaded {len(records)} records from {args.eval_only}", flush=True)
         if not args.dataset:
             sys.exit("ERROR: --dataset is required for eval")
-        eval_model = args.eval_model or args.model
+        eval_model    = args.eval_model or os.environ.get("SUMMARY_AGENT_MODEL") or args.model
+        eval_base_url = os.environ.get("SUMMARY_AGENT_BASE_URL") or args.base_url
+        eval_api_key  = os.environ.get("SUMMARY_AGENT_API_KEY") or args.api_key
         eval_path = str(Path(args.eval_only).parent / "eval.jsonl")
         summary, details = await evaluate_trajectories(
             records=records, dataset_path=args.dataset, model=eval_model,
-            base_url=args.base_url, api_key=args.api_key,
+            base_url=eval_base_url, api_key=eval_api_key,
             eval_batch_size=args.eval_batch_size, temperature=0.0, max_tokens=8192,
             output_path=eval_path,
         )
@@ -255,16 +257,69 @@ async def _main_async(args: argparse.Namespace) -> None:
                   f"  ├{'─'*76}┤\n  | status: {finish_reason}\n"
                   f"  └{'─'*76}┘\n", flush=True)
 
-    # ── Run with concurrency limit ────────────────────────────────────────────
-    sem = asyncio.Semaphore(args.concurrency)
+    # ── Run in batches; eval after each batch ────────────────────────────────
+    # Eval uses local vLLM (SUMMARY_AGENT config) to avoid charging remote API
+    eval_base_url = os.environ.get("SUMMARY_AGENT_BASE_URL") or args.base_url
+    eval_api_key  = os.environ.get("SUMMARY_AGENT_API_KEY") or args.api_key
+    eval_model    = args.eval_model or os.environ.get("SUMMARY_AGENT_MODEL") or args.model
+    eval_path = str(Path(output_dir) / "eval.jsonl")
+    all_eval_details: List[Dict[str, Any]] = []
+    cumulative_correct = 0
 
-    async def _bounded(row: Dict[str, Any], idx: int) -> None:
-        async with sem:
-            await _process_one(row, idx)
+    def _write_jsonl(path: Path, recs: List[Dict[str, Any]]) -> None:
+        with path.open("w", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    batch_size = args.concurrency
+    batches = [rows[i:i + batch_size] for i in range(0, len(rows), batch_size)]
 
     try:
-        await asyncio.gather(*[_bounded(row, i) for i, row in enumerate(rows)])
-        print(f"[generate] {len(records)}/{total} queries done", flush=True)
+        for batch_idx, batch in enumerate(batches):
+            batch_start_idx = batch_idx * batch_size
+            await asyncio.gather(*[
+                _process_one(row, batch_start_idx + i)
+                for i, row in enumerate(batch)
+            ])
+
+            # Save submission so far
+            with open(submission_path, "w", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+            if args.no_eval:
+                print(f"[batch {batch_idx+1}/{len(batches)}] {len(records)}/{total} done", flush=True)
+                continue
+
+            # Eval only the new records from this batch
+            batch_qids = {row["query_id"] for row in batch}
+            batch_records = [r for r in records if r["query_id"] in batch_qids]
+            if not batch_records:
+                continue
+
+            print(f"\n[eval] batch {batch_idx+1}/{len(batches)} — evaluating {len(batch_records)} new records…", flush=True)
+            try:
+                _, batch_details = await evaluate_trajectories(
+                    records=batch_records, dataset_path=args.dataset, model=eval_model,
+                    base_url=eval_base_url, api_key=eval_api_key,
+                    eval_batch_size=args.eval_batch_size, temperature=0.0, max_tokens=8192,
+                    output_path=eval_path,
+                )
+                all_eval_details.extend(batch_details)
+                batch_correct = sum(1 for d in batch_details if d["eval_judgment"] == "CORRECT")
+                cumulative_correct += batch_correct
+                print(
+                    f"  Batch accuracy:      {batch_correct}/{len(batch_records)} "
+                    f"({batch_correct/max(len(batch_records),1):.1%})\n"
+                    f"  Cumulative accuracy: {cumulative_correct}/{len(records)} "
+                    f"({cumulative_correct/max(len(records),1):.1%})  "
+                    f"[{len(records)}/{total} total done]",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[eval] batch {batch_idx+1} eval failed: {e}", flush=True)
+
+        print(f"\n[generate] {len(records)}/{total} queries done", flush=True)
     finally:
         searcher.connection.close()
         for c in _client_cache.values():
@@ -272,46 +327,27 @@ async def _main_async(args: argparse.Namespace) -> None:
         if not _client_cache:
             await _global_client._client.close()
 
-    with open(submission_path, "w", encoding="utf-8") as f:
-        for rec in records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     print(f"[generate] saved {len(records)} trajectories -> {submission_path}", flush=True)
 
-    if args.no_eval:
+    if args.no_eval or not all_eval_details:
         return
 
-    eval_model = args.eval_model or args.model
-    eval_path = str(Path(output_dir) / "eval.jsonl")
-    summary, details = await evaluate_trajectories(
-        records=records, dataset_path=args.dataset, model=eval_model,
-        base_url=args.base_url, api_key=args.api_key,
-        eval_batch_size=args.eval_batch_size, temperature=0.0, max_tokens=8192,
-        output_path=eval_path,
-    )
-
-    print(f"\n{'=' * 50}")
-    print(f"Accuracy: {summary['accuracy']:.2%} ({summary['correct']}/{summary['total_queries']})")
-    print(f"Avg tool calls/query: {summary['avg_tool_calls_per_query']}")
-    print(f"Avg retrieved docs/query: {summary['avg_retrieved_docs_per_query']}")
-    print(f"{'=' * 50}")
-
-    eval_map = {d["query_id"]: d["eval_judgment"] for d in details}
-    correct_recs = [r for r in records if eval_map.get(r["query_id"]) == "CORRECT"]
+    # Final summary
+    eval_map = {d["query_id"]: d["eval_judgment"] for d in all_eval_details}
+    correct_recs   = [r for r in records if eval_map.get(r["query_id"]) == "CORRECT"]
     incorrect_recs = [r for r in records if eval_map.get(r["query_id"]) == "INCORRECT"]
 
-    def _write_jsonl(path: Path, recs: List[Dict[str, Any]]) -> None:
-        with path.open("w", encoding="utf-8") as f:
-            for r in recs:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"\n{'=' * 50}")
+    print(f"Final Accuracy: {len(correct_recs)}/{len(records)} ({len(correct_recs)/max(len(records),1):.2%})")
+    print(f"{'=' * 50}")
 
     _write_jsonl(Path(output_dir) / "correct.json", correct_recs)
     _write_jsonl(Path(output_dir) / "incorrect.json", incorrect_recs)
     _write_jsonl(Path(output_dir) / "eval_correct.json",
-                 [d for d in details if d["eval_judgment"] == "CORRECT"])
+                 [d for d in all_eval_details if d["eval_judgment"] == "CORRECT"])
     _write_jsonl(Path(output_dir) / "eval_incorrect.json",
-                 [d for d in details if d["eval_judgment"] == "INCORRECT"])
-
-    print(f"\nSaved: {len(correct_recs)} correct, {len(incorrect_recs)} incorrect -> {output_dir}")
+                 [d for d in all_eval_details if d["eval_judgment"] == "INCORRECT"])
+    print(f"Saved: {len(correct_recs)} correct, {len(incorrect_recs)} incorrect -> {output_dir}")
 
 
 def main() -> None:

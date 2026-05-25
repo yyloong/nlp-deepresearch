@@ -20,7 +20,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import yaml
 
@@ -146,7 +146,7 @@ class Agent:
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: str = "auto",
+        tool_choice: Union[str, Dict[str, Any]] = "auto",
     ) -> Dict[str, Any]:
         """Single async model call. Returns the full raw response dict (includes usage)."""
         return await self.client.simple_chat(
@@ -167,7 +167,7 @@ class Agent:
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: str = "auto",
+        tool_choice: Union[str, Dict[str, Any]] = "auto",
     ) -> Dict[str, Any]:
         """Call chat() with retry logic for format / no-tool-call errors.
 
@@ -632,6 +632,9 @@ class Agent:
                 f"FINAL WARNING: call {self.end_tool} with whatever answer you have. This is your last chance.",
             ]
             print(f"  ⚑ [{self.name}] max_turns reached — forcing final {self.end_tool} call", flush=True)
+            # Only expose the end_tool so the model cannot call anything else
+            end_tool_specs = [s for s in self.tool_specs if s.get("function", {}).get("name") == self.end_tool]
+            end_tool_choice = {"type": "function", "function": {"name": self.end_tool}}
             force_messages = list(messages)
             for attempt in range(_FORCE_MAX_RETRIES):
                 nudge = force_nudges[min(attempt, len(force_nudges) - 1)]
@@ -639,7 +642,7 @@ class Agent:
                 if attempt == 0:
                     self._trajectory.append({"role": "user", "content": nudge})
                 try:
-                    forced = await self.chat_with_tool_retry(force_messages)
+                    forced = await self.chat_with_tool_retry(force_messages, end_tool_specs, end_tool_choice)
                     self._trajectory.append(forced)
                     called_end = any(
                         tc["function"]["name"] == self.end_tool
