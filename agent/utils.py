@@ -408,7 +408,7 @@ def extract_final_answer(messages: List[Dict[str, Any]]) -> Optional[str]:
     import re
 
     # ── Priority 1: submit_answer tool call (proper function calling) ──
-    for msg in reversed(messages):
+    for msg in messages:
         if msg.get("role") != "assistant":
             continue
         for tc in (msg.get("tool_calls") or []):
@@ -422,7 +422,7 @@ def extract_final_answer(messages: List[Dict[str, Any]]) -> Optional[str]:
                     pass
 
     # ── Priority 2: [TOOL_CALL: submit_answer(...)] in text content ──
-    for msg in reversed(messages):
+    for msg in messages:
         if msg.get("role") != "assistant":
             continue
         content = msg.get("content", "")
@@ -441,7 +441,7 @@ def extract_final_answer(messages: List[Dict[str, Any]]) -> Optional[str]:
                 pass
 
     # ── Priority 3: text-based "Exact Answer:" extraction (legacy) ──
-    for msg in reversed(messages):
+    for msg in messages:
         if msg.get("role") != "assistant":
             continue
         content = msg.get("content", "")

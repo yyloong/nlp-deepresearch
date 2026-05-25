@@ -218,32 +218,21 @@ async def _main_async(args: argparse.Namespace) -> None:
             traj = await main_agent.run(question)
             answer = extract_final_answer(traj) or ""
 
+            # Determine finish_reason from trajectory
             finish_reason = "max_turns"
-            first_submit_answer = ""
-            last_submit_was_accepted = False
             for i, msg in enumerate(traj):
                 if msg.get("role") == "assistant":
                     for t in (msg.get("tool_calls") or []):
                         if t["function"]["name"] == "submit_answer":
-                            if not first_submit_answer:
-                                try:
-                                    _sa = json.loads(t["function"].get("arguments", "{}"))
-                                    first_submit_answer = _sa.get("answer", "")
-                                except Exception:
-                                    pass
                             for j in range(i + 1, min(i + 3, len(traj))):
-                                tm = traj[j]
-                                if tm.get("role") == "tool":
+                                if traj[j].get("role") == "tool":
                                     try:
-                                        fb = json.loads(tm.get("content", "{}"))
+                                        fb = json.loads(traj[j].get("content", "{}"))
                                         if fb.get("is_correct"):
-                                            last_submit_was_accepted = True
+                                            finish_reason = "submit_answer_confirmed"
                                     except Exception:
                                         pass
-            if last_submit_was_accepted:
-                finish_reason = "submit_answer_confirmed"
-            if finish_reason == "max_turns" and first_submit_answer:
-                answer = first_submit_answer
+                                    break
 
             elapsed = time.time() - t0
             rec = {

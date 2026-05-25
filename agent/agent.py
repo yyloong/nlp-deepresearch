@@ -437,21 +437,6 @@ class Agent:
                 flush=True,
             )
 
-            # ── Last-turn nudge: force end_tool ──
-            if turn == self.max_turn - 1:
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"STOP SEARCHING. You have reached the turn limit. "
-                        f"Based on the evidence you have gathered so far, call {self.end_tool} NOW "
-                        f"with your best answer or assessment."
-                    ),
-                })
-                self._trajectory.append({
-                    "role": "user",
-                    "content": f"You have reached your max turn,now you need to call {self.end_tool} to submit your answer immediately.",
-                })
-
             # ── Pre-call condense ──
             condense_threshold_tokens = int(self.max_context * self.condense_token_threshold)
             safe_limit = self.max_context - self.max_tokens - 2000
@@ -634,6 +619,47 @@ class Agent:
 
             print()
 
+        # ── Force-submit if max_turns reached without end_tool ──────────────
+        if finish_reason == "max_turns":
+            _FORCE_MAX_RETRIES = 3
+            force_nudges = [
+                (
+                    f"You have used all {self.max_turn} turns without submitting an answer. "
+                    f"Based on everything you have found so far, call {self.end_tool} NOW "
+                    f"with your best answer. Do not search anymore."
+                ),
+                f"You MUST call {self.end_tool} right now. Stop everything else and submit your best answer immediately.",
+                f"FINAL WARNING: call {self.end_tool} with whatever answer you have. This is your last chance.",
+            ]
+            print(f"  ⚑ [{self.name}] max_turns reached — forcing final {self.end_tool} call", flush=True)
+            force_messages = list(messages)
+            for attempt in range(_FORCE_MAX_RETRIES):
+                nudge = force_nudges[min(attempt, len(force_nudges) - 1)]
+                force_messages.append({"role": "user", "content": nudge})
+                if attempt == 0:
+                    self._trajectory.append({"role": "user", "content": nudge})
+                try:
+                    forced = await self.chat_with_tool_retry(force_messages)
+                    self._trajectory.append(forced)
+                    called_end = any(
+                        tc["function"]["name"] == self.end_tool
+                        for tc in (forced.get("tool_calls") or [])
+                    )
+                    if called_end:
+                        finish_reason = f"{self.end_tool}_confirmed"
+                        print(f"  ✓ [{self.name}] force-submit succeeded (attempt {attempt + 1})", flush=True)
+                        break
+                    print(f"  ↻ [{self.name}] force-submit attempt {attempt + 1}: {self.end_tool} not called, retrying…", flush=True)
+                    force_messages.append({"role": "assistant", "content": forced.get("content") or ""})
+                except Exception as e:
+                    print(f"  ✗ [{self.name}] force-submit attempt {attempt + 1} error: {e}", flush=True)
+                    break
+
+        total_turns = len(turn_stats)
+        total_tokens = count_tokens_messages(self.tokenizer, self._trajectory)
+        self._run_stats = {"total_turns": total_turns, "total_tokens": total_tokens, "finish_reason": finish_reason}
+        print(f"  [{self.name}] done | turns={total_turns} tokens={total_tokens} reason={finish_reason}", flush=True)
+
         self._save_trajectory()
         return list(self._trajectory)
 
@@ -650,8 +676,11 @@ class Agent:
 
             traj_file = Path(self.trajectory_dir, f"{self.name}.json")
             with open(traj_file, "w", encoding="utf-8") as f:
-                json.dump({"name": self.name, "agent_type": self.agent_type,
-                           "messages": self._trajectory}, f, ensure_ascii=False, indent=2)
+                json.dump({
+                    "name": self.name, "agent_type": self.agent_type,
+                    **getattr(self, "_run_stats", {}),
+                    "messages": self._trajectory,
+                }, f, ensure_ascii=False, indent=2)
             print(f"    [{self.name}] trajectory saved -> {traj_file}", flush=True)
 
             if self._condense_sessions:
