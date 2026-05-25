@@ -390,7 +390,7 @@ class Agent:
     # Main agent loop
     # ═══════════════════════════════════════════════════════════════
 
-    async def run(self, user_prompt: str) -> List[Dict[str, Any]]:
+    async def _run_inner(self, user_prompt: str) -> List[Dict[str, Any]]:
         """Execute the full agent loop.
 
         1. Initialize messages with system prompt + user prompt
@@ -660,8 +660,14 @@ class Agent:
         self._run_stats = {"total_turns": total_turns, "total_tokens": total_tokens, "finish_reason": finish_reason}
         print(f"  [{self.name}] done | turns={total_turns} tokens={total_tokens} reason={finish_reason}", flush=True)
 
-        self._save_trajectory()
         return list(self._trajectory)
+
+    async def run(self, question: str) -> List[Dict[str, Any]]:
+        """Public entry point — wraps _run_inner with guaranteed trajectory save."""
+        try:
+            return await self._run_inner(question)
+        finally:
+            self._save_trajectory()
 
     # ═══════════════════════════════════════════════════════════════
     # Trajectory helpers
