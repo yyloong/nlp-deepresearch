@@ -11,6 +11,18 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2.0  # seconds
 
+# Global per-base_url semaphores — shared across all client instances for the same endpoint.
+# Limits total in-flight requests to any given address regardless of how many Agent instances exist.
+_URL_SEMAPHORES: Dict[str, asyncio.Semaphore] = {}
+_URL_SEMAPHORES_LOCK = asyncio.Lock()
+
+
+async def _get_url_semaphore(base_url: str, limit: int) -> asyncio.Semaphore:
+    async with _URL_SEMAPHORES_LOCK:
+        if base_url not in _URL_SEMAPHORES:
+            _URL_SEMAPHORES[base_url] = asyncio.Semaphore(limit)
+        return _URL_SEMAPHORES[base_url]
+
 
 def _resolve_api_key(api_key: str) -> str:
     if api_key and api_key != "dummy":
@@ -27,12 +39,19 @@ class VLLMClientAsync:
         self,
         base_url: str,
         api_key: str = "dummy",
-        max_concurrent: int = 5,
+        max_concurrent: int = 5,       # per-instance limit (legacy, kept for compat)
+        max_concurrent_url: int = 0,   # per-address global limit; 0 = read from env or use max_concurrent
     ) -> None:
         api_key = _resolve_api_key(api_key)
 
         is_local = "127.0.0.1" in base_url or "localhost" in base_url
         self._is_local = is_local
+        self._base_url_key = base_url.rstrip("/")
+
+        # Effective per-address limit: explicit arg > env var > max_concurrent
+        env_key = "LOCAL_MAX_CONCURRENT" if is_local else "REMOTE_MAX_CONCURRENT"
+        env_val = int(os.environ.get(env_key, 0))
+        self._url_limit = max_concurrent_url or env_val or max_concurrent
 
         # Proxy: read from REMOTE_API_PROXY env var (set via secrets.json), only for remote APIs
         proxy = None if is_local else (os.environ.get("REMOTE_API_PROXY") or None)
@@ -42,8 +61,8 @@ class VLLMClientAsync:
             trust_env=False,
             proxy=proxy,
             limits=httpx.Limits(
-                max_keepalive_connections=0 if is_local else 10,
-                max_connections=max_concurrent + 10,
+                max_keepalive_connections=0 if is_local else 20,
+                max_connections=self._url_limit + 20,
             ),
         )
         self._client = AsyncOpenAI(
@@ -51,12 +70,18 @@ class VLLMClientAsync:
             api_key=api_key,
             http_client=http_client,
         )
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._url_semaphore: Optional[asyncio.Semaphore] = None  # lazy-init (needs event loop)
+
+    async def _get_semaphore(self) -> asyncio.Semaphore:
+        if self._url_semaphore is None:
+            self._url_semaphore = await _get_url_semaphore(self._base_url_key, self._url_limit)
+        return self._url_semaphore
 
     async def chat_completions(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        sem = await self._get_semaphore()
         last_exc = None
         for attempt in range(MAX_RETRIES):
-            async with self._semaphore:
+            async with sem:
                 try:
                     response = await self._client.chat.completions.create(**payload)
                     return response.model_dump()

@@ -32,6 +32,7 @@ LOCAL_VLLM_URL="${LOCAL_VLLM_URL:-http://127.0.0.1:8000/v1}"
 DATASET="${ROOT}/distill/browsecomp_plus_train780.jsonl"
 INDEX_PATH="${ROOT}/indexes/browsecomp_plus_bm25.sqlite"
 OUTPUT_DIR="${ROOT}/runs_distill"
+CONCURRENCY="${CONCURRENCY:-4}"   # 同时处理的样本数
 
 # ── 代理（DeepSeek 公网 API 需要时取消注释）──────────────────────────────────
 # export https_proxy="http://pc.zinyy.tech:7899"
@@ -83,8 +84,9 @@ fi
 
 exec python -u run_serial.py \
     --agent-config configs/main_agent_deepseek.yaml \
-    --dataset    "${DATASET}"    \
-    --index-path "${INDEX_PATH}" \
-    --output-dir "${OUTPUT_DIR}" \
+    --dataset     "${DATASET}"      \
+    --index-path  "${INDEX_PATH}"   \
+    --output-dir  "${OUTPUT_DIR}"   \
+    --concurrency "${CONCURRENCY}"  \
     --no-eval \
     "$@"

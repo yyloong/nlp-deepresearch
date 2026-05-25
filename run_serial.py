@@ -70,6 +70,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Only eval existing submission.jsonl")
     p.add_argument("--agent-config", default="configs/main_agent_smart.yaml",
                    help="Path to main agent YAML config")
+    p.add_argument("--concurrency", type=int, default=1,
+                   help="Number of samples to process in parallel (default: 1)")
     return p
 
 
@@ -175,12 +177,6 @@ async def _main_async(args: argparse.Namespace) -> None:
     def agent_factory(config_path: str) -> Agent:
         return _make_agent(config_path, override_model=True)
 
-    # ── ToolRegistry with agent_factory ──
-    # ── Main agent — created first so ToolRegistry can reference it ──
-    main_agent = _make_agent(args.agent_config)
-    tool_registry = ToolRegistry(searcher=searcher, agent_factory=agent_factory, main_agent=main_agent)
-    main_agent.tool_registry = tool_registry.build_registry(main_agent._tool_names, main_agent._tool_config)
-
     # ── Output setup ──
     ts = time.strftime("%Y%m%d_%H%M%S")
     output_dir = str(Path(args.output_dir) / f"run_{ts}")
@@ -189,59 +185,64 @@ async def _main_async(args: argparse.Namespace) -> None:
     traj_dir = str(Path(output_dir) / "trajectories")
     Path(traj_dir).mkdir(parents=True, exist_ok=True)
 
-    # ── Process each question ──
+    # ── Per-sample worker ─────────────────────────────────────────────────────
     records: List[Dict[str, Any]] = []
-    try:
-        for i, row in enumerate(rows):
-            qid = row["query_id"]
-            question = row.get("question") or row["query"]
-            gold_answer = row.get("answer", "") or row.get("gold_answer", "") or ""
+    write_lock = asyncio.Lock()
+    done_count = 0
 
-            t0 = time.time()
-            q_preview = question[:200].replace("\n", " ")
-            if len(question) > 200:
-                q_preview += "..."
-            print(f"┌{'─'*78}┐\n│ [{i+1}/{total}]  qid={qid}\n├{'─'*78}┤\n│ Question: {q_preview}")
-            if gold_answer:
-                gold_preview = gold_answer[:150].replace("\n", " ")
-                if len(gold_answer) > 150:
-                    gold_preview += "..."
-                print(f"│ Gold Ans: {gold_preview}")
-            print(f"└{'─'*78}┘\n  Running...", flush=True)
+    async def _process_one(row: Dict[str, Any], idx: int) -> None:
+        nonlocal done_count
+        qid = row["query_id"]
+        question = row.get("question") or row["query"]
+        gold_answer = row.get("answer", "") or row.get("gold_answer", "") or ""
 
-            main_agent.trajectory_dir = traj_dir
-            main_agent.name = qid
-            if tool_registry._verify_agent is not None:
-                tool_registry._verify_agent.trajectory_dir = traj_dir
-                tool_registry._verify_agent.name = f"{qid}_verify"
+        t0 = time.time()
+        q_preview = question[:200].replace("\n", " ")
+        if len(question) > 200:
+            q_preview += "..."
+        print(f"┌{'─'*78}┐\n│ [{idx+1}/{total}]  qid={qid}\n├{'─'*78}┤\n│ Question: {q_preview}")
+        if gold_answer:
+            gold_preview = gold_answer[:150].replace("\n", " ")
+            if len(gold_answer) > 150:
+                gold_preview += "..."
+            print(f"│ Gold Ans: {gold_preview}")
+        print(f"└{'─'*78}┘\n  Running...", flush=True)
 
-            traj = await main_agent.run(question)
-            answer = extract_final_answer(traj) or ""
+        # Each sample gets its own agent & registry instances
+        agent = _make_agent(args.agent_config)
+        registry = ToolRegistry(searcher=searcher, agent_factory=agent_factory, main_agent=agent)
+        agent.tool_registry = registry.build_registry(agent._tool_names, agent._tool_config)
+        agent.trajectory_dir = traj_dir
+        agent.name = qid
+        if registry._verify_agent is not None:
+            registry._verify_agent.trajectory_dir = traj_dir
+            registry._verify_agent.name = f"{qid}_verify"
 
-            # Determine finish_reason from trajectory
-            finish_reason = "max_turns"
-            for i, msg in enumerate(traj):
-                if msg.get("role") == "assistant":
-                    for t in (msg.get("tool_calls") or []):
-                        if t["function"]["name"] == "submit_answer":
-                            for j in range(i + 1, min(i + 3, len(traj))):
-                                if traj[j].get("role") == "tool":
-                                    try:
-                                        fb = json.loads(traj[j].get("content", "{}"))
-                                        if fb.get("is_correct"):
-                                            finish_reason = "submit_answer_confirmed"
-                                    except Exception:
-                                        pass
-                                    break
+        traj = await agent.run(question)
+        answer = extract_final_answer(traj) or ""
 
-            elapsed = time.time() - t0
-            rec = {
-                "query_id": qid, "status": finish_reason,
-                "predicted_answer": answer, "messages": traj,
-            }
+        finish_reason = "max_turns"
+        for mi, msg in enumerate(traj):
+            if msg.get("role") == "assistant":
+                for t in (msg.get("tool_calls") or []):
+                    if t["function"]["name"] == "submit_answer":
+                        for j in range(mi + 1, min(mi + 3, len(traj))):
+                            if traj[j].get("role") == "tool":
+                                try:
+                                    fb = json.loads(traj[j].get("content", "{}"))
+                                    if fb.get("is_correct"):
+                                        finish_reason = "submit_answer_confirmed"
+                                except Exception:
+                                    pass
+                                break
+
+        elapsed = time.time() - t0
+        rec = {"query_id": qid, "status": finish_reason, "predicted_answer": answer, "messages": traj}
+
+        async with write_lock:
             records.append(rec)
-
-            # Update trajectory file with predicted answer
+            done_count += 1
+            # Update trajectory file with final answer & status
             traj_path = Path(traj_dir) / f"{qid}.json"
             if traj_path.exists():
                 with open(traj_path) as f:
@@ -250,18 +251,19 @@ async def _main_async(args: argparse.Namespace) -> None:
                 traj_data["status"] = finish_reason
                 with open(traj_path, "w") as f:
                     json.dump(traj_data, f, ensure_ascii=False, indent=2)
-
-            main_agent.reset_state()
-            if tool_registry._verify_agent is not None:
-                tool_registry._verify_agent.reset_state()
-
-            ans_preview = answer[:200].replace("\n", " ")
-            if len(answer) > 200:
-                ans_preview += "..."
-            print(f"  ┌{'─'*76}┐\n  | ✓ [{i+1}/{total}] qid={qid}  {elapsed:.1f}s\n"
+            print(f"  ┌{'─'*76}┐\n  | ✓ [{done_count}/{total}] qid={qid}  {elapsed:.1f}s\n"
                   f"  ├{'─'*76}┤\n  | status: {finish_reason}\n"
                   f"  └{'─'*76}┘\n", flush=True)
 
+    # ── Run with concurrency limit ────────────────────────────────────────────
+    sem = asyncio.Semaphore(args.concurrency)
+
+    async def _bounded(row: Dict[str, Any], idx: int) -> None:
+        async with sem:
+            await _process_one(row, idx)
+
+    try:
+        await asyncio.gather(*[_bounded(row, i) for i, row in enumerate(rows)])
         print(f"[generate] {len(records)}/{total} queries done", flush=True)
     finally:
         searcher.connection.close()
