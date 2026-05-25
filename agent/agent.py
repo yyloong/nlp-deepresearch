@@ -632,9 +632,11 @@ class Agent:
                 f"FINAL WARNING: call {self.end_tool} with whatever answer you have. This is your last chance.",
             ]
             print(f"  ⚑ [{self.name}] max_turns reached — forcing final {self.end_tool} call", flush=True)
-            # Only expose the end_tool so the model cannot call anything else
+            # Only expose the end_tool so the model cannot call anything else.
+            # Do NOT use dict-form tool_choice — some APIs (e.g. DeepSeek) reject it
+            # and return an error, causing the force-submit to silently fail.
+            # Restricting the tool list to [end_tool] is sufficient.
             end_tool_specs = [s for s in self.tool_specs if s.get("function", {}).get("name") == self.end_tool]
-            end_tool_choice = {"type": "function", "function": {"name": self.end_tool}}
             force_messages = list(messages)
             for attempt in range(_FORCE_MAX_RETRIES):
                 nudge = force_nudges[min(attempt, len(force_nudges) - 1)]
@@ -642,7 +644,7 @@ class Agent:
                 if attempt == 0:
                     self._trajectory.append({"role": "user", "content": nudge})
                 try:
-                    forced = await self.chat_with_tool_retry(force_messages, end_tool_specs, end_tool_choice)
+                    forced = await self.chat_with_tool_retry(force_messages, end_tool_specs)
                     self._trajectory.append(forced)
                     called_end = any(
                         tc["function"]["name"] == self.end_tool

@@ -14,7 +14,7 @@ api_key:  "${DEEPSEEK_API_KEY}"
 model:    "${DEEPSEEK_MODEL}"
 
 # ── Generation params ────────────────────────────────────────────────────────
-temperature: 0.6          # 蒸馏时适当多样性
+temperature: 1.0          # 蒸馏时最大多样性
 max_tokens: 4096
 max_context: 40960        # DeepSeek 支持 64k 上下文
 max_turn: 10

@@ -308,6 +308,15 @@ async def _main_async(args: argparse.Namespace) -> None:
                 all_eval_details.extend(batch_details)
                 batch_correct = sum(1 for d in batch_details if d["eval_judgment"] == "CORRECT")
                 cumulative_correct += batch_correct
+
+                # 追加写本 batch 答对的记录到 eval_correct.json（持久化，中断也不丢）
+                batch_correct_details = [d for d in batch_details if d["eval_judgment"] == "CORRECT"]
+                if batch_correct_details:
+                    eval_correct_path = Path(output_dir) / "eval_correct.json"
+                    with eval_correct_path.open("a", encoding="utf-8") as ef:
+                        for d in batch_correct_details:
+                            ef.write(json.dumps(d, ensure_ascii=False) + "\n")
+
                 print(
                     f"  Batch accuracy:      {batch_correct}/{len(batch_records)} "
                     f"({batch_correct/max(len(batch_records),1):.1%})\n"

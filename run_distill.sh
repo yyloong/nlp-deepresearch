@@ -33,6 +33,7 @@ DATASET="${ROOT}/distill/browsecomp_plus_train780.jsonl"
 INDEX_PATH="${ROOT}/indexes/browsecomp_plus_bm25.sqlite"
 OUTPUT_DIR="${ROOT}/runs_distill"
 CONCURRENCY="${CONCURRENCY:-25}"   # 同时处理的样本数
+REPEAT="${REPEAT:-2}"              # 数据集重复跑的轮次
 
 # ── 代理（DeepSeek 公网 API 需要时取消注释）──────────────────────────────────
 # export https_proxy="http://pc.zinyy.tech:7899"
@@ -70,6 +71,7 @@ echo "  Summary Agent:  本地 vLLM (${SUMMARY_MODEL_DISPLAY} @ ${LOCAL_VLLM_URL
 echo "  数据集:         ${DATASET}"
 echo "  索引:           ${INDEX_PATH}"
 echo "  输出目录:       ${OUTPUT_DIR}/"
+echo "  重复轮次:       ${REPEAT}"
 echo "=================================================="
 echo ""
 
@@ -82,11 +84,17 @@ if command -v conda &>/dev/null; then
     conda activate "${CONDA_ENV}" 2>/dev/null || true
 fi
 
-exec python -u run_serial.py \
-    --agent-config configs/main_agent_deepseek.yaml \
-    --dataset     "${DATASET}"      \
-    --index-path  "${INDEX_PATH}"   \
-    --output-dir  "${OUTPUT_DIR}"   \
-    --concurrency "${CONCURRENCY}"  \
-    --no-eval \
-    "$@"
+for i in $(seq 1 "${REPEAT}"); do
+    echo ""
+    echo "[INFO] ===== 第 ${i}/${REPEAT} 轮 ====="
+    python -u run_serial.py \
+        --agent-config configs/main_agent_deepseek.yaml \
+        --dataset     "${DATASET}"      \
+        --index-path  "${INDEX_PATH}"   \
+        --output-dir  "${OUTPUT_DIR}"   \
+        --concurrency "${CONCURRENCY}"  \
+        "$@"
+    echo "[INFO] 第 ${i}/${REPEAT} 轮完成"
+done
+echo ""
+echo "[INFO] 全部 ${REPEAT} 轮运行完毕，数据保存在 ${OUTPUT_DIR}/"
