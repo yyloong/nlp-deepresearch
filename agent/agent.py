@@ -100,8 +100,10 @@ class Agent:
         self.system_prompt = self.system_prompt.replace("{search_k}", str(self.search_k))
 
         # Extra payload for model calls
-        self.extra_payload: Dict[str, Any] = {}
-        if not self.enable_thinking:
+        # chat_template_kwargs only applies to local Qwen3 via vLLM; remote APIs (DeepSeek etc.) ignore it.
+        self.extra_payload: Dict[str, Any] = dict(cfg.get("extra_payload", {}))
+        is_local = cfg.get("_is_local_model", True)  # set False by run_serial when using remote API
+        if is_local and not self.enable_thinking:
             self.extra_payload["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
         # ── Per-run state ──

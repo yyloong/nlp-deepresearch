@@ -1,4 +1,5 @@
 runs/
+runs_distill/
 distill/
 
 # Local BM25 / SQLite indexes (often >100MB; do not push to GitHub)
@@ -13,5 +14,6 @@ agent/__pycache__/
 # SFT 训练数据（原始 + 清洗后 + 压缩后）
 train/sft_data.jsonl
 train/sft_data_condensed*.jsonl
+train/sft_data_distill.jsonl
 train/*.token_counts.json
 train/sample_condensed*.json

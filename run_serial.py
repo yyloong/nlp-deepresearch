@@ -121,20 +121,47 @@ async def _main_async(args: argparse.Namespace) -> None:
     total = len(rows)
 
     # ── Shared client & searcher ──
-    client = VLLMClientAsync(base_url=args.base_url, api_key=args.api_key, max_concurrent=10)
+    _global_client = VLLMClientAsync(base_url=args.base_url, api_key=args.api_key, max_concurrent=10)
+    _client_cache: Dict[str, VLLMClientAsync] = {}  # (base_url, api_key) → client
     searcher = build_searcher(args.index_path)
 
-    # ── Agent factory (only model override for API switching) ──
+    def _resolve_env(val: str) -> str:
+        """Expand ${ENV_VAR} placeholders. Unset vars resolve to empty string."""
+        import re
+        return re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), val)
+
+    def _get_client(base_url: str, api_key: str) -> VLLMClientAsync:
+        key = (base_url, api_key)
+        if key not in _client_cache:
+            _client_cache[key] = VLLMClientAsync(
+                base_url=base_url, api_key=api_key, max_concurrent=10
+            )
+        return _client_cache[key]
+
+    # ── Agent factory — supports per-agent base_url/api_key/model in YAML ──
     def _make_agent(config_path: str, override_model: bool = True) -> Agent:
         with open(config_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
-        if override_model:
-            cfg["model"] = args.model
+
+        # Per-agent API config (YAML keys: base_url, api_key)
+        agent_base_url = _resolve_env(str(cfg.pop("base_url", ""))) or args.base_url
+        agent_api_key  = _resolve_env(str(cfg.pop("api_key",  ""))) or args.api_key
+
+        # Determine if using local model (vLLM) or remote API
+        is_local = "127.0.0.1" in agent_base_url or "localhost" in agent_base_url
+        cfg["_is_local_model"] = is_local
+
+        # Model: YAML wins if it has its own base_url; otherwise CLI --model overrides
+        if override_model and is_local:
+            cfg["model"] = args.model  # only override for local agents
+
+        agent_client = _get_client(agent_base_url, agent_api_key)
+
         import uuid, tempfile
         patched_path = os.path.join(tempfile.gettempdir(), f"agent_{uuid.uuid4().hex}.yaml")
         with open(patched_path, "w", encoding="utf-8") as f:
             yaml.dump(cfg, f)
-        return Agent(patched_path, client=client, tokenizer=_tok)
+        return Agent(patched_path, client=agent_client, tokenizer=_tok)
 
     def agent_factory(config_path: str) -> Agent:
         return _make_agent(config_path, override_model=True)
@@ -240,7 +267,10 @@ async def _main_async(args: argparse.Namespace) -> None:
         print(f"[generate] {len(records)}/{total} queries done", flush=True)
     finally:
         searcher.connection.close()
-        await client._client.close()
+        for c in _client_cache.values():
+            await c._client.aclose()
+        if not _client_cache:
+            await _global_client._client.aclose()
 
     with open(submission_path, "w", encoding="utf-8") as f:
         for rec in records:

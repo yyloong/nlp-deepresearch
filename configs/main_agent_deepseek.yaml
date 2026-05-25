@@ -1,21 +1,25 @@
-# Main Research Agent Configuration (Smart Search version)
-# Uses smart_search (auto relevance-filtered) + get_document instead of call_subagents.
+# Main Research Agent — DeepSeek API (Distillation Teacher)
+# Main agent uses DeepSeek; summary subagent uses local Qwen3-8B vLLM.
 # Workflow: smart_search -> get_document -> smart_search -> ... -> submit_answer
 
 agent_type: main
 
-# Per-agent API config (overrides global --base-url / --api-key).
-# Supports ${ENV_VAR} expansion. Leave blank to use global CLI args.
-base_url: "${MAIN_AGENT_BASE_URL}"
-api_key:  "${MAIN_AGENT_API_KEY}"
-model: "${MAIN_AGENT_MODEL}"
+# ── DeepSeek API config ──────────────────────────────────────────────────────
+# Resolved from env vars at runtime. Set before running:
+#   export DEEPSEEK_BASE_URL="https://api.deepseek.com/v1"
+#   export DEEPSEEK_API_KEY="sk-xxxx"
+#   export DEEPSEEK_MODEL="deepseek-chat"        # or deepseek-reasoner
+base_url: "${DEEPSEEK_BASE_URL}"
+api_key:  "${DEEPSEEK_API_KEY}"
+model:    "${DEEPSEEK_MODEL}"
 
-temperature: 0.0
-max_tokens: 4096
-max_context: 40960
-max_turn: 30
-condense_token_threshold: 0.5
-enable_thinking: true
+# ── Generation params ────────────────────────────────────────────────────────
+temperature: 0.6          # 蒸馏时适当多样性
+max_tokens: 8192
+max_context: 65536        # DeepSeek 支持 64k 上下文
+max_turn: 40
+condense_token_threshold: 0.75  # 上下文超过 75% 时压缩
+enable_thinking: false    # DeepSeek-V3 无 thinking 模式（R1 另配）
 max_tool_calls_per_turn: 1
 max_tool_retries: 2
 
@@ -29,8 +33,9 @@ tools:
 tool_config:
   smart_search:
     search_k: 10
+    use_subagent_summary: true   # 使用本地 Qwen3-8B 做文档摘要
   submit_answer:
-    enable_verify: True
+    enable_verify: false  # 蒸馏不用 verify，直接保存轨迹
 
 system_prompt: |
   You are a Deep Research Agent. Your job is to answer complex questions by searching a document corpus. You have three tools: smart_search(query), get_document(docid), and submit_answer(answer, evidence). Every answer must be grounded in retrieved evidence.
@@ -45,7 +50,7 @@ system_prompt: |
   - smart_search automatically evaluates each result for relevance. Only HELPFUL documents are returned, each with a relevance summary.
   - Extract specific names, dates, titles from the results — these become your leads.
 
-  IMPORTANT: If smart search doesn't return any results, your query MUST be asked in a not proper way,try to query using other clues you have found,try to list all the clues and try one by one!!!
+  IMPORTANT: If smart search doesn't return any results, your query MUST be asked in a not proper way, try to query using other clues you have found, try to list all the clues and try one by one!!!
 
   STEP 2 — Cross-Validate Candidates Against ALL Clues:
   - Before committing to a candidate, verify it against MULTIPLE clues from the question, not just one.
@@ -64,7 +69,6 @@ system_prompt: |
   STEP 5 — Submit:
   - When confident, call submit_answer(answer, evidence).
   - evidence must be a COMPLETE chain-of-evidence: for each claim, specify the docid and quote the exact supporting text.
-  - If submit_answer returns is_correct=False, CHANGE your target and restart from a different angle.
 
   === HOW TO SEARCH (BM25) ===
   BM25 has NO understanding of word order or meaning. Each query token is matched independently. Generic tokens match thousands of docs and bury the relevant one. Short queries (2-3 words) using rare, specific tokens work best.

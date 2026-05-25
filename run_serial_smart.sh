@@ -9,10 +9,26 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 DATASET="${ROOT}/browsecomp_plus_hard50.jsonl"
 INDEX_PATH="${ROOT}/indexes/browsecomp_plus_bm25.sqlite"
-MODEL="${MODEL:-qwen_auto}"
-BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
 OUTPUT_DIR="${ROOT}/runs"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
+
+# ── 全局 fallback（当 YAML 里未配置 per-agent API 时使用）──
+MODEL="${MODEL:-qwen_auto}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
+
+# ── Main Agent（DeepSeek API 蒸馏模式）──────────────────────────────────────
+# 设置后 main agent 使用 DeepSeek，summary subagent 仍用本地 vLLM
+# export MAIN_AGENT_BASE_URL="https://api.deepseek.com/v1"
+# export MAIN_AGENT_API_KEY="sk-xxxx"
+# export MAIN_AGENT_MODEL="deepseek-chat"
+
+# ── Summary Subagent（本地 Qwen3-8B）────────────────────────────────────────
+# export SUMMARY_AGENT_BASE_URL="http://127.0.0.1:8000/v1"
+# export SUMMARY_AGENT_API_KEY="dummy"
+# export SUMMARY_AGENT_MODEL="qwen_auto"
+
+# ── Relevance Judge / Verify Agent（默认本地）───────────────────────────────
+# export JUDGE_AGENT_BASE_URL=...  (relevance_judge_agent.yaml 如需覆盖)
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
 
