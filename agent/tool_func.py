@@ -220,13 +220,13 @@ class ToolRegistry:
                                     relevance = args.get("relevance", "IRRELEVANT")
                                     summary = args.get("summary", "")
                                     print(f"    [smart_search] docid={doc['docid']}: {relevance}", flush=True)
-                                    if relevance == "CONFUSING":
-                                        print(f"    [smart_search] docid={doc['docid']}: BLOCKED (confusing look-alike)", flush=True)
-                                        return None  # ONLY block CONFUSING
-                                    # HELPFUL or IRRELEVANT both pass through
+                                    if relevance in ("CONFUSING", "IRRELEVANT"):
+                                        print(f"    [smart_search] docid={doc['docid']}: BLOCKED ({relevance})", flush=True)
+                                        return None  # block both CONFUSING and IRRELEVANT
+                                    # Only HELPFUL passes through
                                     return {
                                         "docid": doc["docid"],
-                                        "summary": summary if summary else "(passed through)",
+                                        "summary": summary if summary else self._snippet(doc["text"]),
                                         "url": doc.get("url", ""),
                                     }
                                 except (json.JSONDecodeError, TypeError):
@@ -247,8 +247,9 @@ class ToolRegistry:
         print(f"    [smart_search] {len(docs)} raw -> {len(filtered)} helpful docs", flush=True)
         result: Dict[str, Any] = {"results": filtered}
         if not filtered:
-            hint = (f"ALL {len(docs)} search results were judged IRRELEVANT or CONFUSING. "
-                    f"PAY ATTENTION!!! it is not the limitation of the search tool but your query way or entity or your search direction has been away from the answer!!!Try to list all the clues you have and try one by one or reflect if your search entity is right for the question.Don't use similar query again!!!")
+            hint = (f"No documents passed the relevance filter for this query ({len(docs)} retrieved, "
+                    f"all judged IRRELEVANT or CONFUSING). "
+                    f"Try a different query using other rare clue words from the question.")
             result["hint"] = hint
             print(f"    [smart_search] {hint}", flush=True)
         for r in filtered:
