@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from openai import AsyncOpenAI
@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2.0  # seconds
 
-# API key from environment (checked in order)
+
 def _resolve_api_key(api_key: str) -> str:
     if api_key and api_key != "dummy":
         return api_key
@@ -31,8 +31,8 @@ class VLLMClientAsync:
     ) -> None:
         api_key = _resolve_api_key(api_key)
 
-        # Use trust_env for remote APIs (proxy support), skip for local vLLM
         is_local = "127.0.0.1" in base_url or "localhost" in base_url
+        self._is_local = is_local
 
         http_client = httpx.AsyncClient(
             http2=False,
@@ -48,7 +48,6 @@ class VLLMClientAsync:
             http_client=http_client,
         )
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._is_local = is_local
 
     async def chat_completions(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         last_exc = None
@@ -61,7 +60,6 @@ class VLLMClientAsync:
                     last_exc = exc
                     msg = str(exc)
                     status = getattr(exc, "status_code", None)
-                    # Retry on transient errors: rate limits, server errors, vLLM race conditions
                     is_transient = (
                         status in (429, 500, 502, 503, 504)
                         or "Already borrowed" in msg
@@ -78,43 +76,13 @@ class VLLMClientAsync:
                     await asyncio.sleep(delay)
         raise last_exc  # type: ignore[misc]
 
-    @staticmethod
-    def _fix_litellm_tool_names(response: Dict[str, Any], tools: Optional[list[dict[str, Any]]]) -> None:
-        """Litellm proxies may rename all tools to litellm_unnamed_tool_0.
-        Match back by comparing the called parameters against each tool spec's parameters."""
-        if not tools:
-            return
-        tool_names = {t["function"]["name"] for t in tools}
-        for choice in response.get("choices", []):
-            for tc in (choice.get("message", {}).get("tool_calls", []) or []):
-                fn = tc.get("function", {})
-                name = fn.get("name", "")
-                if name not in tool_names:
-                    try:
-                        import json as _json
-                        called_params = set(_json.loads(fn.get("arguments", "{}")).keys())
-                    except Exception:
-                        called_params = set()
-                    # Find the tool with the most matching parameter names
-                    best_match, best_score = None, -1
-                    for t in tools:
-                        spec_params = set(t["function"].get("parameters", {}).get("properties", {}).keys())
-                        if called_params:
-                            score = len(called_params & spec_params)
-                            if score > best_score:
-                                best_score = score
-                                best_match = t["function"]["name"]
-                    if best_match:
-                        fn["name"] = best_match
-                        print(f"    [vllm_client] fixed litellm tool: {name} -> {best_match} (params={called_params})", flush=True)
-
     async def simple_chat(
         self,
         model: str,
-        messages: list[dict[str, Any]],
+        messages: List[Dict[str, Any]],
         temperature: float = 0.0,
         max_tokens: int = 512,
-        tools: Optional[list[dict[str, Any]]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
         extra_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -132,6 +100,5 @@ class VLLMClientAsync:
             payload["tool_choice"] = tool_choice
         if extra_payload:
             payload.update(extra_payload)
-        resp = await self.chat_completions(payload)
-        self._fix_litellm_tool_names(resp, tools)
-        return resp
+
+        return await self.chat_completions(payload)

@@ -140,7 +140,7 @@ async def _main_async(args: argparse.Namespace) -> None:
         key = (base_url, api_key)
         if key not in _client_cache:
             _client_cache[key] = VLLMClientAsync(
-                base_url=base_url, api_key=api_key, max_concurrent=10
+                base_url=base_url, api_key=api_key, max_concurrent=10,
             )
         return _client_cache[key]
 

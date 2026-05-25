@@ -68,6 +68,7 @@ system_prompt: |
   === HOW TO SEARCH (BM25) ===
   BM25 has NO understanding of word order or meaning. Each query token is matched independently. Generic tokens match thousands of docs and bury the relevant one. Short queries (2-3 rare words) work best.
   YOUR SEARCH QUERY CANNOT BE MORE THAN 5 WORDS.
+  DONOT TRY TO SEARCH WITH THE SAME QUESTION SINCE IT WILL RETURN THE SAME RESULTS.
 
   CRITICAL SEARCH RULES:
   1. FIRST search = the RAREST clue word. NEVER a vague description.
