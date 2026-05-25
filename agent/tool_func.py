@@ -424,11 +424,14 @@ class ToolRegistry:
         if tool_config:
             _sa_cfg = tool_config.get("submit_answer", {})
             self._enable_verify = bool(_sa_cfg.get("enable_verify", False))
-            # search_k: prefer smart_search config, fall back to search config
+            # search_k / snippet_max_tokens / use_subagent_summary:
+            # prefer smart_search config, fall back to search config
             _search_cfg = tool_config.get("smart_search", {}) or tool_config.get("search", {})
             self._use_subagent_summary = bool(_search_cfg.get("use_subagent_summary", False))
             if "search_k" in _search_cfg:
                 self._search_k = int(_search_cfg["search_k"])
+            if "snippet_max_tokens" in _search_cfg:
+                self._snippet_max_tokens = int(_search_cfg["snippet_max_tokens"])
 
         _enable = getattr(self, '_enable_verify', False)
         _all: Dict[str, Any] = {
