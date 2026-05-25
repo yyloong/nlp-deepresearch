@@ -149,17 +149,20 @@ async def _main_async(args: argparse.Namespace) -> None:
         with open(config_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
 
-        # Per-agent API config (YAML keys: base_url, api_key)
+        # Per-agent API config (YAML keys: base_url, api_key, model)
         agent_base_url = _resolve_env(str(cfg.pop("base_url", ""))) or args.base_url
         agent_api_key  = _resolve_env(str(cfg.pop("api_key",  ""))) or args.api_key
+        agent_model    = _resolve_env(str(cfg.get("model",    "")))
 
         # Determine if using local model (vLLM) or remote API
         is_local = "127.0.0.1" in agent_base_url or "localhost" in agent_base_url
         cfg["_is_local_model"] = is_local
 
-        # Model: YAML wins if it has its own base_url; otherwise CLI --model overrides
-        if override_model and is_local:
-            cfg["model"] = args.model  # only override for local agents
+        # Resolve model: env-expanded YAML value wins; fallback to CLI --model for local agents
+        if agent_model:
+            cfg["model"] = agent_model
+        elif override_model and is_local:
+            cfg["model"] = args.model
 
         agent_client = _get_client(agent_base_url, agent_api_key)
 
