@@ -34,9 +34,13 @@ class VLLMClientAsync:
         is_local = "127.0.0.1" in base_url or "localhost" in base_url
         self._is_local = is_local
 
+        # Proxy: read from REMOTE_API_PROXY env var (set via secrets.json), only for remote APIs
+        proxy = None if is_local else (os.environ.get("REMOTE_API_PROXY") or None)
+
         http_client = httpx.AsyncClient(
             http2=False,
-            trust_env=not is_local,
+            trust_env=False,
+            proxy=proxy,
             limits=httpx.Limits(
                 max_keepalive_connections=0 if is_local else 10,
                 max_connections=max_concurrent + 10,
