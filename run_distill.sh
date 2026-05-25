@@ -25,9 +25,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "${ROOT}"
 
-# ── 本地 vLLM 配置（summary subagent）───────────────────────────────────────
+# ── 本地 vLLM 地址（仅用于启动前健康检查，实际配置从 secrets.json 读取）────────
 LOCAL_VLLM_URL="${LOCAL_VLLM_URL:-http://127.0.0.1:8000/v1}"
-LOCAL_VLLM_MODEL="${LOCAL_VLLM_MODEL:-qwen_auto}"
 
 # ── 数据集与索引 ──────────────────────────────────────────────────────────────
 DATASET="${ROOT}/distill/browsecomp_plus_train780.jsonl"
@@ -57,16 +56,16 @@ fi
 echo "[INFO] 本地 vLLM 正常"
 
 # ── 打印配置 ──────────────────────────────────────────────────────────────────
-DEEPSEEK_MODEL_DISPLAY=$(python3 -c "
-import json, sys
+read DEEPSEEK_MODEL_DISPLAY SUMMARY_MODEL_DISPLAY < <(python3 -c "
+import json
 s = json.load(open('secrets.json'))
-print(s.get('DEEPSEEK_MODEL', 'deepseek-chat'))
-" 2>/dev/null || echo "deepseek-chat")
+print(s.get('DEEPSEEK_MODEL','deepseek-chat'), s.get('SUMMARY_AGENT_MODEL','qwen_auto'))
+" 2>/dev/null || echo "deepseek-chat qwen_auto")
 
 echo ""
 echo "=================================================="
 echo "  Main Agent:     DeepSeek (${DEEPSEEK_MODEL_DISPLAY})"
-echo "  Summary Agent:  本地 vLLM (${LOCAL_VLLM_MODEL} @ ${LOCAL_VLLM_URL})"
+echo "  Summary Agent:  本地 vLLM (${SUMMARY_MODEL_DISPLAY} @ ${LOCAL_VLLM_URL})"
 echo "  数据集:         ${DATASET}"
 echo "  索引:           ${INDEX_PATH}"
 echo "  输出目录:       ${OUTPUT_DIR}/"
@@ -84,10 +83,8 @@ fi
 
 exec python -u run_serial.py \
     --agent-config configs/main_agent_deepseek.yaml \
-    --dataset      "${DATASET}"        \
-    --index-path   "${INDEX_PATH}"     \
-    --base-url     "${LOCAL_VLLM_URL}" \
-    --model        "${LOCAL_VLLM_MODEL}" \
-    --output-dir   "${OUTPUT_DIR}"     \
+    --dataset    "${DATASET}"    \
+    --index-path "${INDEX_PATH}" \
+    --output-dir "${OUTPUT_DIR}" \
     --no-eval \
     "$@"

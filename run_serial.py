@@ -112,13 +112,11 @@ async def _main_async(args: argparse.Namespace) -> None:
     if not args.index_path:
         sys.exit("ERROR: --index-path is required")
 
-    print(f"=== Serial Agent (refactored) ===")
+    print(f"=== Serial Agent ===")
     print(f"Dataset:    {args.dataset}")
     print(f"Index:      {args.index_path}")
-    print(f"Model:      {args.model}")
-    print(f"Base URL:   {args.base_url}")
     print(f"Output:     {args.output_dir}/")
-    print(f"================================")
+    print(f"===================")
     print()
 
     rows = load_jsonl(args.dataset, limit=args.limit)
@@ -193,7 +191,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     try:
         for i, row in enumerate(rows):
             qid = row["query_id"]
-            question = row["query"]
+            question = row.get("question") or row["query"]
             gold_answer = row.get("answer", "") or row.get("gold_answer", "") or ""
 
             t0 = time.time()
@@ -276,9 +274,9 @@ async def _main_async(args: argparse.Namespace) -> None:
     finally:
         searcher.connection.close()
         for c in _client_cache.values():
-            await c._client.aclose()
+            await c._client.close()
         if not _client_cache:
-            await _global_client._client.aclose()
+            await _global_client._client.close()
 
     with open(submission_path, "w", encoding="utf-8") as f:
         for rec in records:
