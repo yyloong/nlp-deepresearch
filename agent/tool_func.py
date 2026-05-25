@@ -256,12 +256,28 @@ class ToolRegistry:
         return result
 
     def get_document(self, docid: str) -> Dict[str, Any]:
-        """Retrieve full document by docid."""
+        """Retrieve document by docid, truncated to fit the main agent's remaining context budget."""
         doc = self._searcher.get_document(docid)
         if doc is None:
             return {"docid": docid, "error": "document not found"}
-        print(f"    [get_document] docid={docid} title={doc.get('url','?')[:80]} text={len(doc.get('text',''))} chars", flush=True)
-        return doc
+
+        text = doc.get("text", "")
+        agent = self._main_agent
+        if agent is not None:
+            tok = getattr(agent, "tokenizer", None)
+            if tok is not None:
+                # Budget: max_context - max_tokens - already used tokens - 1000 safety margin
+                used = count_tokens_messages(tok, getattr(agent, "_trajectory", []))
+                budget = max(1024, agent.max_context - agent.max_tokens - used - 1000)
+                original_len = len(text)
+                text = truncate_utf8_prefix_to_token_budget(tok, text, budget)
+                if len(text) < original_len:
+                    print(f"    [get_document] docid={docid}: truncated to {budget} tokens "
+                          f"(original {original_len} chars)", flush=True)
+
+        print(f"    [get_document] docid={docid} url={doc.get('url','?')[:80]} "
+              f"text={len(text)} chars", flush=True)
+        return {"docid": docid, "url": doc.get("url", ""), "text": text}
 
     async def call_subagents(self, questions: List[str]) -> List[Dict[str, Any]]:
         """Spawn search agents in parallel for each question. No concurrency limit.
