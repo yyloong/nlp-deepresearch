@@ -31,6 +31,14 @@ from agent.vllm_client_async import VLLMClientAsync
 
 logger = logging.getLogger(__name__)
 
+# ── Load secrets.json (if present) into os.environ ───────────────────────────
+_SECRETS_FILE = Path(__file__).parent / "secrets.json"
+if _SECRETS_FILE.exists():
+    _secrets = json.loads(_SECRETS_FILE.read_text(encoding="utf-8"))
+    for _k, _v in _secrets.items():
+        os.environ.setdefault(_k, str(_v))
+    print(f"[secrets] Loaded {len(_secrets)} keys from {_SECRETS_FILE}", flush=True)
+
 _TOKENIZER_PATH = "Qwen/Qwen3-8B"
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 from transformers import AutoTokenizer

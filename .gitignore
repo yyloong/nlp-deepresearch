@@ -2,6 +2,9 @@ runs/
 runs_distill/
 distill/
 
+# API secrets — copy secrets.json.example -> secrets.json and fill in
+secrets.json
+
 # Local BM25 / SQLite indexes (often >100MB; do not push to GitHub)
 indexes/*.sqlite
 indexes/*.sqlite-shm

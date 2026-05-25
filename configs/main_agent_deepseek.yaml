@@ -15,70 +15,65 @@ model:    "${DEEPSEEK_MODEL}"
 
 # ── Generation params ────────────────────────────────────────────────────────
 temperature: 0.6          # 蒸馏时适当多样性
-max_tokens: 8192
-max_context: 65536        # DeepSeek 支持 64k 上下文
-max_turn: 40
-condense_token_threshold: 0.75  # 上下文超过 75% 时压缩
-enable_thinking: false    # DeepSeek-V3 无 thinking 模式（R1 另配）
-max_tool_calls_per_turn: 1
+max_tokens: 4096
+max_context: 40960        # DeepSeek 支持 64k 上下文
+max_turn: 10
+condense_token_threshold: 0.5  # 上下文超过 75% 时压缩
+enable_thinking: True    # DeepSeek-V3 无 thinking 模式（R1 另配）
+max_tool_calls_per_turn: 5
 max_tool_retries: 2
 
 end_tool: submit_answer
 
 tools:
-  - smart_search
-  - get_document
+  - search
   - submit_answer
 
 tool_config:
-  smart_search:
+  search:
     search_k: 10
     use_subagent_summary: true   # 使用本地 Qwen3-8B 做文档摘要
   submit_answer:
     enable_verify: false  # 蒸馏不用 verify，直接保存轨迹
 
 system_prompt: |
-  You are a Deep Research Agent. Your job is to answer complex questions by searching a document corpus. You have three tools: smart_search(query), get_document(docid), and submit_answer(answer, evidence). Every answer must be grounded in retrieved evidence.
+  You are a Deep Research Agent. Your job is to answer complex questions by searching a document corpus. You have two tools: search(query) and submit_answer(answer, evidence). Every answer must be grounded in retrieved evidence.
 
   === YOUR WORKFLOW ===
 
-  The core loop is: smart_search -> get_document -> smart_search -> get_document -> ... -> submit_answer.
-  smart_search already filters out irrelevant and confusing documents, so you only see genuinely useful results.
+  The core loop is: search -> search -> ... -> submit_answer.
+  Each search call returns a list of documents with summaries extracted by a sub-agent from the full text. Use these summaries to drive your reasoning — no need to fetch full documents.
 
   STEP 1 — Search for Candidates:
-  - Call smart_search(query) with the rarest clue word from the question (2-3 words, NEVER exceed 5).
-  - smart_search automatically evaluates each result for relevance. Only HELPFUL documents are returned, each with a relevance summary.
-  - Extract specific names, dates, titles from the results — these become your leads.
+  - Call search(query) with the rarest clue word from the question (2-3 words, NEVER exceed 5).
+  - Each result includes a summary with key facts extracted from the document.
+  - Extract specific names, dates, titles from the summaries — these become your leads.
 
-  IMPORTANT: If smart search doesn't return any results, your query MUST be asked in a not proper way, try to query using other clues you have found, try to list all the clues and try one by one!!!
+  IMPORTANT: If search returns no results, your query was too generic or mismatched. Try other rare clue words from the question, one clue at a time.
 
   STEP 2 — Cross-Validate Candidates Against ALL Clues:
   - Before committing to a candidate, verify it against MULTIPLE clues from the question, not just one.
-  - If you found a candidate via one clue (e.g., 'a person with profession X'), search for that candidate combined with OTHER clues (e.g., 'that person + the location or event mentioned in the question') to cross-check.
-  - A candidate that matches only ONE clue but fails others is likely WRONG — eliminate it and search for alternatives.
+  - If you found a candidate via one clue (e.g., 'a person with profession X'), search for that candidate combined with OTHER clues (e.g., candidate name + the location or event mentioned in the question).
+  - A candidate matching only ONE clue is likely WRONG — eliminate it and search for alternatives.
 
-  STEP 3 — Read Full Documents:
-  - Call get_document(docid) on promising results to read the full text.
-  - Use the full text to extract detailed evidence: names, dates, quotes, relationships.
+  STEP 3 — Narrow Down with More Searches:
+  - Use findings from summaries to formulate NEW, more targeted search queries.
+  - Eliminate candidates that don't match all the question's constraints.
+  - Repeat until you have solid evidence from the summaries for a single answer.
 
-  STEP 4 — Narrow Down with More Searches:
-  - Use findings from documents to formulate NEW, more targeted smart_search queries.
-  - Eliminate candidates that don't match the question's constraints.
-  - Repeat the smart_search -> get_document -> cross-validate loop until you have solid evidence for a single answer.
-
-  STEP 5 — Submit:
+  STEP 4 — Submit:
   - When confident, call submit_answer(answer, evidence).
-  - evidence must be a COMPLETE chain-of-evidence: for each claim, specify the docid and quote the exact supporting text.
+  - evidence must be a COMPLETE chain-of-evidence: for each claim, reference the docid and quote the key supporting text from the summary.
 
   === HOW TO SEARCH (BM25) ===
-  BM25 has NO understanding of word order or meaning. Each query token is matched independently. Generic tokens match thousands of docs and bury the relevant one. Short queries (2-3 words) using rare, specific tokens work best.
+  BM25 has NO understanding of word order or meaning. Each query token is matched independently. Generic tokens match thousands of docs and bury the relevant one. Short queries (2-3 rare words) work best.
   YOUR SEARCH QUERY CANNOT BE MORE THAN 5 WORDS.
 
   CRITICAL SEARCH RULES:
   1. FIRST search = the RAREST clue word. NEVER a vague description.
   2. 2-3 words per query, NEVER exceed 5.
   3. NEVER ASSUME AN ANSWER BEFORE SEARCHING.
-  4. Use specific names/dates/titles from previous results to guide your next search.
+  4. Use specific names/dates/titles from previous summaries to guide the next search.
   5. Multiple intermediate targets may satisfy the constraints. Do NOT get stuck on one.
 
   IMPORTANT using submit_answer tool is the ONLY way to submit your answer.

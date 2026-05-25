@@ -4,7 +4,9 @@
 
 agent_type: surrender_check
 
-model: qwen_auto
+base_url: "${SURRENDER_AGENT_BASE_URL}"
+api_key:  "${SURRENDER_AGENT_API_KEY}"
+model:    "${SURRENDER_AGENT_MODEL}"
 temperature: 0.0
 max_tokens: 1024
 max_context: 8192
